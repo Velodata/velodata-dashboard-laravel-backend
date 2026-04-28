@@ -1,0 +1,72 @@
+
+  GET|HEAD        / ........................................................................................................................................................................ 
+  GET|POST|HEAD   api/v2/VMD-ban-user ..................................................................................................................... CustomController@F0_VMD_ban_user
+  GET|POST|HEAD   api/v2/VMD-delete-user ............................................................................................................... CustomController@F0_VMD_delete_user
+  GET|POST|HEAD   api/v2/VMD-get-audit-history ................................................................................................... CustomController@F0_VMD_get_audit_history
+  GET|POST|HEAD   api/v2/VMD-get-login-history ................................................................................................... CustomController@F0_VMD_get_login_history
+  GET|POST|HEAD   api/v2/VMD-get-user-data ........................................................................................................... CustomController@F0_PFS_get_user_data
+  GET|POST|HEAD   api/v2/VMD-get-user-permissions ................................................................................................ CustomController@VMD_get_user_permissions
+  GET|POST|HEAD   api/v2/VMD-login-user ................................................................................................................. CustomController@F0_VMD_login_user
+  GET|POST|HEAD   api/v2/VMD-resend-2fa ................................................................................................................. CustomController@F0_VMD_resend_2fa
+  GET|POST|HEAD   api/v2/VMD-updateUser ................................................................................................................. CustomController@F0_VMD_updateUser
+  GET|POST|HEAD   api/v2/VMD-verify-2fa ............................................................................................................ CustomController@F0_VMD_verify_2fa_code
+  GET|HEAD        api/v2/categories ............................................................................................................ categories.index › CategoryController@index
+  POST            api/v2/categories ............................................................................................................ categories.store › CategoryController@store
+  GET|HEAD        api/v2/categories/{category} ................................................................................................... categories.show › CategoryController@show
+  PUT|PATCH       api/v2/categories/{category} ............................................................................................... categories.update › CategoryController@update
+  DELETE          api/v2/categories/{category} ............................................................................................. categories.destroy › CategoryController@destroy
+  GET|HEAD        api/v2/items .......................................................................................................................... items.index › ItemController@index
+  POST            api/v2/items .......................................................................................................................... items.store › ItemController@store
+  GET|HEAD        api/v2/items/{item} ..................................................................................................................... items.show › ItemController@show
+  PUT|PATCH       api/v2/items/{item} ................................................................................................................. items.update › ItemController@update
+  DELETE          api/v2/items/{item} ............................................................................................................... items.destroy › ItemController@destroy
+  GET|HEAD        api/v2/permissions ........................................................................................................ permissions.index › PermissionController@index
+  POST            api/v2/permissions ........................................................................................................ permissions.store › PermissionController@store
+  GET|HEAD        api/v2/permissions/{permission} ............................................................................................. permissions.show › PermissionController@show
+  PUT|PATCH       api/v2/permissions/{permission} ......................................................................................... permissions.update › PermissionController@update
+  DELETE          api/v2/permissions/{permission} ....................................................................................... permissions.destroy › PermissionController@destroy
+  GET|HEAD        api/v2/permissions/{permission}/roles ..................................................................................... permissions.roles › PermissionController@roles
+  GET|HEAD        api/v2/roles .......................................................................................................................... roles.index › RoleController@index
+  POST            api/v2/roles .......................................................................................................................... roles.store › RoleController@store
+  GET|HEAD        api/v2/roles/{role} ..................................................................................................................... roles.show › RoleController@show
+  PUT|PATCH       api/v2/roles/{role} ................................................................................................................. roles.update › RoleController@update
+  DELETE          api/v2/roles/{role} ............................................................................................................... roles.destroy › RoleController@destroy
+  GET|HEAD        api/v2/roles/{role}/permissions ........................................................................................... roles.permissions › RoleController@permissions
+  GET|HEAD        api/v2/roles/{role}/relationships/permissions ............................................................... roles.relationships.permissions › RoleController@permissions
+  GET|HEAD        api/v2/roles/{role}/relationships/users ................................................................................. roles.relationships.users › RoleController@users
+  GET|HEAD        api/v2/roles/{role}/users ............................................................................................................. roles.users › RoleController@users
+  GET|HEAD        api/v2/tags ............................................................................................................................. tags.index › TagController@index
+  POST            api/v2/tags ............................................................................................................................. tags.store › TagController@store
+  GET|HEAD        api/v2/tags/{tag} ......................................................................................................................... tags.show › TagController@show
+  PUT|PATCH       api/v2/tags/{tag} ..................................................................................................................... tags.update › TagController@update
+  DELETE          api/v2/tags/{tag} ................................................................................................................... tags.destroy › TagController@destroy
+  GET|HEAD        api/v2/tasks ........................................................................................................................................ TaskController@index
+  POST            api/v2/tasks ........................................................................................................................................ TaskController@store
+  PATCH           api/v2/tasks/complete/{id} ................................................................................................................... TaskController@markComplete
+  PATCH           api/v2/tasks/notComplete/{id} .............................................................................................................. TaskController@markIncomplete
+  PUT             api/v2/tasks/{id} .................................................................................................................................. TaskController@update
+  DELETE          api/v2/tasks/{id} ................................................................................................................................. TaskController@destroy
+  POST            api/v2/teach/randomise-users ............................................................................................................... RestController@randomiseUsers
+  GET|HEAD        api/v2/teach/users ............................................................................................................................ RestController@getAllUsers
+  POST            api/v2/teach/users .......................................................................................................................... RestController@createNewUser
+  GET|HEAD        api/v2/teach/users/{id} ....................................................................................................................... RestController@getUserById
+  PUT             api/v2/teach/users/{id} .................................................................................................................... RestController@updateUserById
+  PATCH           api/v2/teach/users/{id} ........................................................................................................................ RestController@updateUser
+  DELETE          api/v2/teach/users/{id} .................................................................................................................... RestController@deleteUserById
+  POST            api/v2/teach/users/{id}/upload-image ............................................................................................... RestController@uploadUserProfileImage
+  POST            api/v2/uploads/items/{id}/image ........................................................................................................... ItemController@uploadItemImage
+  POST            api/v2/uploads/users/{id}/profile-image ................................................................................................ UserController@uploadProfileImage
+  GET|HEAD        api/v2/users .......................................................................................................................... users.index › UserController@index
+  POST            api/v2/users .......................................................................................................................... users.store › UserController@store
+  GET|HEAD        api/v2/users/{user} ..................................................................................................................... users.show › UserController@show
+  PUT|PATCH       api/v2/users/{user} ................................................................................................................. users.update › UserController@update
+  DELETE          api/v2/users/{user} ............................................................................................................... users.destroy › UserController@destroy
+  GET|HEAD        api/v2/users/{user}/relationships/roles ..................................................................... users.relationships.roles › UserController@rolesRelationship
+  GET|HEAD        api/v2/users/{user}/roles .......................................................................................................... users.roles › UserController@getRoles
+  GET|HEAD        sse-profile-updates ...................................................................................................................................................... 
+  GET|HEAD        sse-test ................................................................................................................................................................. 
+  GET|HEAD        storage/{path} ............................................................................................................................................. storage.local
+  GET|HEAD        up ....................................................................................................................................................................... 
+
+                                                                                                                                                                         Showing [68] routes
+

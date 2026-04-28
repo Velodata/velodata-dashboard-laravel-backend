@@ -1,0 +1,19 @@
+<?php
+
+namespace App\JsonApi\V2;
+
+use LaravelJsonApi\Laravel\Http\Controllers\JsonApiController;
+use LaravelJsonApi\Routing\RouteRegistrar;
+use LaravelJsonApi\Laravel\JsonApi as JsonApi;
+
+class Server extends JsonApi
+{
+    protected function routes(RouteRegistrar $routes)
+    {
+        $routes->prefix('v2')->group(function () {
+            $routes->resources(function ($server) {
+                $server->resource('roles'); // Register your roles resource here
+            });
+        });
+    }
+}
