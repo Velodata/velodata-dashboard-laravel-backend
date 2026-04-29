@@ -24,6 +24,7 @@ Route::prefix('v2')->group(function () {
     Route::match(['get', 'post'], '/VMD-get-audit-history', [CustomController::class, 'F0_VMD_get_audit_history']);
     Route::match(['get', 'post'], '/VMD-updateUser', [CustomController::class, 'F0_VMD_updateUser']);
     Route::match(['get', 'post'], '/VMD-ban-user', [CustomController::class, 'F0_VMD_ban_user']);
+    Route::post('/VMD-unbanUser', [CustomController::class, 'F0_VMD_unbanUser']);
     Route::match(['get', 'post'], '/VMD-delete-user', [CustomController::class, 'F0_VMD_delete_user']);
     Route::match(['get', 'post'], '/VMD-verify-2fa', [CustomController::class, 'F0_VMD_verify_2fa_code']);
     Route::match(['get', 'post'], '/VMD-resend-2fa', [CustomController::class, 'F0_VMD_resend_2fa']);

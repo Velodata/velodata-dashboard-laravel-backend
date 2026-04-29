@@ -206,18 +206,30 @@ class CustomController extends Controller
         // IJV - 2025.03.01 - Get the geolocation data
         $realIp = $request->header('X-Forwarded-For');
         $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
-        $accessToken = '4af1c2308a696c';
-        $apiUrl = "http://ipinfo.io/{$realIp}/json?token={$accessToken}";
-        $pageContent = file_get_contents($apiUrl);
-        if ($pageContent === false) {
-            return response()->json(['errors' => 'Failed to fetch geolocation data during F0_VMD_login_user().'], 500);
+        $realIp = trim($realIp);
+        $isLoopbackIp = in_array($realIp, ['127.0.0.1', '::1', '0:0:0:0:0:0:0:1'], true);
+
+        if ($isLoopbackIp) {
+            $realIp = '127.0.0.1';
+            $lxCountry = 'AU';
+            $lxRegion = 'Queensland';
+            $lxCity = 'Gold Coast';
+            $lxZipCode = null;
+            $lxTimezone = null;
+        } else {
+            $accessToken = '4af1c2308a696c';
+            $apiUrl = "http://ipinfo.io/{$realIp}/json?token={$accessToken}";
+            $pageContent = file_get_contents($apiUrl);
+            if ($pageContent === false) {
+                return response()->json(['errors' => 'Failed to fetch geolocation data during F0_VMD_login_user().'], 500);
+            }
+            $parsedJson = json_decode($pageContent);
+            $lxCountry     = $parsedJson->country ?? null;
+            $lxRegion      = $parsedJson->region ?? null;
+            $lxCity        = $parsedJson->city ?? null;
+            $lxZipCode     = $parsedJson->postal ?? null;
+            $lxTimezone    = $parsedJson->timezone ?? null;
         }
-        $parsedJson = json_decode($pageContent);
-        $lxCountry     = $parsedJson->country ?? null;
-        $lxRegion      = $parsedJson->region ?? null;
-        $lxCity        = $parsedJson->city ?? null;
-        $lxZipCode     = $parsedJson->postal ?? null;
-        $lxTimezone    = $parsedJson->timezone ?? null;
 
         // Extract request data
         $email     = $request->input('email');
@@ -307,6 +319,12 @@ class CustomController extends Controller
             // Manual login password validation
             if (! is_null($password) && is_null($google_id) && ! Hash::check($request->password, $user->password)) {
                 return response()->json(['error' => 'Invalid password'], 401);
+            }
+
+            if ($user->status === 'BANNED') {
+                return response()->json([
+                    'errors' => 'Your account has been banned.'
+                ], 403);
             }
 
             // ✅ Send 2FA test email for manual login
@@ -519,6 +537,82 @@ class CustomController extends Controller
             $response['message'] = "User not found.";
             return response()->json($response, 404);
         }
+
+        return response()->json($response, 200);
+    }
+
+
+    public function F0_VMD_unbanUser(Request $request)
+    {
+        $response = [];
+
+        $validator = Validator::make($request->all(), [
+            'id'           => 'required|integer',
+            'updated_by'   => 'required|string|max:255',
+            'vmd_audit_reason' => 'required|string|max:255',
+            'vmd_user_name' => 'required|string|max:255',
+            'vmd_user_email' => 'required|string|max:255',
+        ]);
+
+        if ($validator->fails()) {
+            $response['outcome'] = "FAIL";
+            $response['message'] = "The updated_by field is required.";
+            return response()->json($response, 422);
+        }
+
+        $data = $validator->validated();
+        $user = User::where('id', $data['id'])->first();
+
+        if (!$user) {
+            $response['outcome'] = false;
+            $response['message'] = "User not found.";
+            return response()->json($response, 404);
+        }
+
+        if ($user->status === 'BANNED') {
+            $user->status = 'Active';
+            $user->updated_by = $data['updated_by'] ?? $user->updated_by;
+            $user->save();
+
+            $realIp = $request->header('X-Forwarded-For');
+            $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
+
+            DB::table('user_audit_history')->insert([
+                'custno' => $data['id'] + 100000,
+                'dteprfmd' => now(),
+                'comments' => $data['vmd_audit_reason'],
+                'clerk_id' => $data['vmd_user_name'],
+                'created_by_email' => $data['vmd_user_email'],
+                'created_by_ip_address' => $realIp,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
+
+        $response['outcome'] = "SUCCESS";
+        $response['message'] = "User Unbanned successfully.";
+        $response['updated_details'] = [
+            "id"            => intval($user->id),
+            "custno"        => intval($user->custno),
+            "email"         => $user->email,
+            "name"          => $user->name,
+            "company_name"  => $user->company_name,
+            "gender"        => $user->gender,
+            "location"      => $user->location,
+            "address_1"     => $user->address_1,
+            "address_2"     => $user->address_2,
+            "address_3"     => $user->address_3,
+            "city"          => $user->city,
+            "role_id"       => intval($user->role_id),
+            "role_name"     => $user->role_name,
+            "postcode"      => $user->postcode,
+            "phone_no"      => $user->phone_no,
+            "profile_image" => $user->profile_image,
+            "state"         => $user->state,
+            "status"        => $user->status,
+            "updated_at"    => $user->updated_at,
+            "updated_by"    => $user->updated_by,
+        ];
 
         return response()->json($response, 200);
     }
