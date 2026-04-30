@@ -17,6 +17,8 @@ Route::prefix('v2')->group(function () {
     // --- Custom routes ---
     Route::match(['get', 'post'], '/VMD-get-user-data', [CustomController::class, 'F0_PFS_get_user_data']);
     Route::match(['get', 'post'], '/VMD-login-user', [CustomController::class, 'F0_VMD_login_user']);
+    Route::post('/VMD-user-heartbeat', [CustomController::class, 'F0_VMD_user_heartbeat']);
+    Route::post('/VMD-get-online-users', [CustomController::class, 'F0_VMD_get_online_users']);
 
     Route::match(['get', 'post'], '/VMD-get-user-permissions', [CustomController::class, 'VMD_get_user_permissions']);
 

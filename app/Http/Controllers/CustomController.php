@@ -268,7 +268,15 @@ class CustomController extends Controller
             ]);
 
             if ($inserted) {
-                $custno = DB::getPdo()->lastInsertId();
+                $userId = DB::getPdo()->lastInsertId();
+                $custno = $userId + 100000;
+
+                DB::table($table_name)
+                    ->where('id', $userId)
+                    ->update([
+                        'custno' => $custno,
+                        'updated_at' => $currentDate,
+                    ]);
 
                 DB::table($login_log_table)->insert([
                     'email'         => $email,
@@ -1206,4 +1214,134 @@ if ($validator->fails()) {
 
 
     // ***** end of PHP file  ****
+
+
+    public function F0_VMD_user_heartbeat(Request $request)
+    {
+        $validated = $request->validate([
+            'vmd_user.id' => 'required|integer',
+            'vmd_user.email' => 'required|email',
+            'vmd_user.name' => 'nullable|string|max:255',
+            'current_path' => 'nullable|string|max:500',
+            'client_sent_at' => 'nullable|string|max:80',
+        ]);
+
+        $userPayload = $validated['vmd_user'];
+        $email = $userPayload['email'];
+
+        if ($email === 'member@jsonapi.com') {
+            return response()->json([
+                'ok' => true,
+                'recorded' => false,
+                'reason' => 'guest_user_ignored',
+            ], 200);
+        }
+
+        $user = DB::table('users')
+            ->where('id', $userPayload['id'])
+            ->where('email', $email)
+            ->first();
+
+        if (!$user) {
+            return response()->json([
+                'ok' => false,
+                'recorded' => false,
+                'reason' => 'user_not_found',
+            ], 404);
+        }
+
+        if (in_array($user->status, ['BANNED', 'DELETED'], true)) {
+            return response()->json([
+                'ok' => true,
+                'recorded' => false,
+                'reason' => 'inactive_user_ignored',
+            ], 200);
+        }
+
+        $realIp = $request->header('X-Forwarded-For');
+        $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
+        $realIp = trim($realIp);
+
+        if (in_array($realIp, ['::1', '0:0:0:0:0:0:0:1'], true)) {
+            $realIp = '127.0.0.1';
+        }
+
+        $clientSentAt = null;
+        if (!empty($validated['client_sent_at'])) {
+            try {
+                $clientSentAt = Carbon::parse($validated['client_sent_at']);
+            } catch (\Throwable $error) {
+                $clientSentAt = null;
+            }
+        }
+
+        $now = Carbon::now();
+        $presence = DB::table('user_presence')->where('user_id', $user->id)->first();
+
+        $presenceData = [
+            'email' => $user->email,
+            'name' => $user->name,
+            'ip_address' => $realIp,
+            'user_agent' => $request->header('User-Agent'),
+            'current_path' => $validated['current_path'] ?? null,
+            'last_seen_at' => $now,
+            'last_client_sent_at' => $clientSentAt,
+            'updated_at' => $now,
+        ];
+
+        if ($presence) {
+            $presenceData['heartbeat_count'] = DB::raw('heartbeat_count + 1');
+            DB::table('user_presence')->where('user_id', $user->id)->update($presenceData);
+        } else {
+            $presenceData['user_id'] = $user->id;
+            $presenceData['heartbeat_count'] = 1;
+            $presenceData['created_at'] = $now;
+            DB::table('user_presence')->insert($presenceData);
+        }
+
+        return response()->json([
+            'ok' => true,
+            'recorded' => true,
+            'user_id' => $user->id,
+            'email' => $user->email,
+            'online_window_seconds' => 120,
+            'server_seen_at' => $now->toDateTimeString(),
+        ], 200);
+    }
+
+
+    public function F0_VMD_get_online_users(Request $request)
+    {
+        $onlineWindowSeconds = 120;
+        $cutoff = Carbon::now()->subSeconds($onlineWindowSeconds);
+        $serverTime = Carbon::now();
+
+        $onlineUsers = DB::table('user_presence')
+            ->join('users', 'user_presence.user_id', '=', 'users.id')
+            ->where('user_presence.last_seen_at', '>=', $cutoff)
+            ->where(function ($query) {
+                $query->whereNull('users.status')
+                    ->orWhereNotIn('users.status', ['BANNED', 'DELETED']);
+            })
+            ->where('users.email', '<>', 'member@jsonapi.com')
+            ->select(
+                'user_presence.user_id',
+                'user_presence.email',
+                'user_presence.name',
+                'user_presence.current_path',
+                'user_presence.ip_address',
+                'user_presence.last_seen_at',
+                'user_presence.last_client_sent_at',
+                'user_presence.heartbeat_count'
+            )
+            ->orderBy('user_presence.last_seen_at', 'DESC')
+            ->get();
+
+        return response()->json([
+            'ok' => true,
+            'online_window_seconds' => $onlineWindowSeconds,
+            'server_time' => $serverTime->toDateTimeString(),
+            'data' => $onlineUsers,
+        ], 200);
+    }
 }

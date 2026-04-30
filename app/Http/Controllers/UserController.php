@@ -278,9 +278,11 @@ class UserController extends Controller
 
             // Update user profile_image URL in the database
             $user = User::findOrFail($userId);
-            // $user->profile_image = "https://mx.velodata.org/" . $fileUrl;  //  we'll put a global variable in the .env file
-            $appURL = config('app.url');
-            $user->profile_image = $appURL . $fileUrl;  //  we'll put a global variable in the .env file
+            $user->ensureCustno();
+            // Use the current request host so local uploads resolve via laravel.localhost
+            // and production uploads resolve via the production API host.
+            $profileImageUrl = $request->getSchemeAndHttpHost() . $fileUrl;
+            $user->profile_image = $profileImageUrl;
             $user->save();
 
 
@@ -314,7 +316,7 @@ class UserController extends Controller
                     'type' => 'profile',
                     'id' => $userId,
                     'attributes' => [
-                        'profile_image' => $appURL . $fileUrl,
+                        'profile_image' => $profileImageUrl,
                     ]
                 ]
             ], 201);

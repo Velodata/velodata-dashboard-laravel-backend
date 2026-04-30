@@ -10,6 +10,23 @@ class User extends Authenticatable
 {
     use HasFactory, Notifiable;
 
+    protected static function booted()
+    {
+        static::created(function ($user) {
+            $user->ensureCustno();
+        });
+    }
+
+    public function ensureCustno()
+    {
+        if (empty($this->custno)) {
+            $this->custno = $this->id + 100000;
+            $this->saveQuietly();
+        }
+
+        return $this->custno;
+    }
+
     protected $table = 'users'; // Optional, if your table name is 'users'
 
     protected $fillable = [

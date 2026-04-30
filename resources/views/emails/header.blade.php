@@ -1,5 +1,5 @@
 @php
-  $brandLogoUrl = 'https://dashboard.velodata.org/static/media/logo-velodata.2c4d4d787141d8bd5a20.png';
+  $brandLogoUrl = asset('images/logo-velodata.png');
   $appName = $context['app_name'] ?? config('app.name', 'Velodata Dashboard');
 @endphp
 
