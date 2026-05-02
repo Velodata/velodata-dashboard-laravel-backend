@@ -1,66 +1,212 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Velodata Dashboard Laravel Backend
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+This repository contains the Laravel backend API for the Velodata Dashboard React application.
 
-## About Laravel
+It replaces the older `material-dashboard-laravel-api` / `laravel-json-api-pro` repository history. The current project source of truth is the production-derived Laravel code that was recovered and verified locally on `2026-05-02`.
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## Purpose
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+This backend supports:
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+- Manual and Google-assisted dashboard login
+- Email 2FA for manual login
+- User profile lookup and permission lookup
+- User heartbeat and online-user tracking
+- User management actions including update, ban, unban, delete, login history, and audit history
+- CRUD endpoints for users, roles, permissions, items, categories, and tags
+- Teaching/demo REST endpoints used by the dashboard project
+- Server-sent events for profile/session state updates
 
-## Learning Laravel
+The matching React frontend uses `REACT_APP_API_URL`, commonly:
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+```env
+REACT_APP_API_URL=http://laravel.localhost/api/v2
+```
 
-You may also try the [Laravel Bootcamp](https://bootcamp.laravel.com), where you will be guided through building a modern Laravel application from scratch.
+## Important History
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+This repo was created as a clean backup target because the older GitHub repository had unrelated history from an earlier version of the project.
 
-## Laravel Sponsors
+Do not merge the old repository history into this repo unless there is a very specific reason.
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
+The branch that was verified as the good Laravel backend was:
 
-### Premium Partners
+```text
+initial-import-last-two-years
+```
 
-- **[Vehikl](https://vehikl.com/)**
-- **[Tighten Co.](https://tighten.co)**
-- **[WebReinvent](https://webreinvent.com/)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel/)**
-- **[Cyber-Duck](https://cyber-duck.co.uk)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Jump24](https://jump24.co.uk)**
-- **[Redberry](https://redberry.international/laravel/)**
-- **[Active Logic](https://activelogic.com)**
-- **[byte5](https://byte5.de)**
-- **[OP.GG](https://op.gg)**
+It was pushed to this repository as:
 
-## Contributing
+```text
+main
+```
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+## Key Endpoints
 
-## Code of Conduct
+Primary custom dashboard endpoints live under:
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+```text
+/api/v2
+```
 
-## Security Vulnerabilities
+`routes/api.php` is loaded by `App\Providers\RouteServiceProvider`, which is registered in `bootstrap/providers.php`. Preserve that wiring when refactoring or upgrading Laravel, because the React dashboard depends on these `/api/v2` routes.
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+Important routes include:
 
-## License
+```text
+POST /api/v2/VMD-login-user
+POST /api/v2/VMD-verify-2fa
+POST /api/v2/VMD-resend-2fa
+POST /api/v2/VMD-get-user-data
+POST /api/v2/VMD-get-user-permissions
+POST /api/v2/VMD-user-heartbeat
+POST /api/v2/VMD-get-online-users
+POST /api/v2/VMD-get-login-history
+POST /api/v2/VMD-get-audit-history
+POST /api/v2/VMD-updateUser
+POST /api/v2/VMD-ban-user
+POST /api/v2/VMD-unbanUser
+POST /api/v2/VMD-delete-user
+```
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+Resource routes include:
+
+```text
+/api/v2/users
+/api/v2/roles
+/api/v2/permissions
+/api/v2/items
+/api/v2/categories
+/api/v2/tags
+```
+
+SSE endpoint:
+
+```text
+GET /sse-profile-updates
+```
+
+## Local Development
+
+Expected local Apache host:
+
+```text
+http://laravel.localhost
+```
+
+Expected XAMPP document root:
+
+```text
+C:\xampp\htdocs\laravel-json-api-pro\public
+```
+
+The `.htaccess` file in `public/` is required. Without it, Apache may answer `/api/...` requests itself instead of routing them through Laravel, which can look like a CORS problem.
+
+Install dependencies:
+
+```bash
+composer install
+```
+
+If Composer fails on Windows/XAMPP because zip support is missing, enable this in `C:\xampp\php\php.ini`:
+
+```ini
+extension=zip
+```
+
+Then rerun:
+
+```bash
+composer install --prefer-dist
+```
+
+## Environment
+
+The real `.env` file is not committed.
+
+Important local values include:
+
+```env
+APP_URL=https://mx.velodata.org
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_DATABASE=laravel-api
+DB_USERNAME=root
+MAIL_MAILER=mailgun
+MAIL_FROM_ADDRESS=no-reply@mg.velodata.org
+MAIL_FROM_NAME="Velodata Security"
+SSE_ALLOWED_ORIGINS=http://localhost:3000
+```
+
+Check `.env.example` before setting up a new machine. It may need to be updated if it drifts from the real development environment.
+
+## Manual Login Verification
+
+The backend was verified locally with:
+
+```text
+POST http://laravel.localhost/api/v2/VMD-login-user
+```
+
+Payload shape:
+
+```json
+{
+  "email": "admin@jsonapi.com",
+  "password": "secret",
+  "google_id": null,
+  "name": null,
+  "picture": null,
+  "username": null,
+  "token": null,
+  "method": "VMD-login-user-manually"
+}
+```
+
+Expected successful manual-login gateway response:
+
+```json
+{
+  "outcome": "2FA_REQUIRED",
+  "user_id": 1,
+  "email": "admin@jsonapi.com"
+}
+```
+
+A working CORS preflight should return `204` with `Access-Control-Allow-Origin`.
+
+## Things You Should Know
+
+- This repository is intended to be the clean backup/source-of-truth repo going forward.
+- Avoid merging unrelated history from the older GitHub repo.
+- The dashboard currently uses custom `VMD-*` endpoints, not only stock Laravel JSON:API auth routes.
+- `routes/api.php` is important even though this is a Laravel 11 app; it is loaded by the custom `RouteServiceProvider`.
+- Manual login intentionally returns `2FA_REQUIRED` before completing the login.
+- Localhost and loopback IPs are treated as Australian/Gold Coast login locations in `CustomController`.
+- `vendor/` is ignored and should be rebuilt with Composer.
+- `.env` is ignored and must stay out of GitHub.
+- The local zip archive `laravel-json-api-pro-initial-import-last-two-years-90484c2.zip` should not be committed.
+- If `/api/v2/VMD-login-user` returns an Apache-looking 404 or a browser CORS error, check branch, `public/.htaccess`, and Composer autoload before changing React.
+
+## Useful Commands
+
+```bash
+php artisan route:list --path=VMD-login-user
+php artisan route:list --path=VMD
+php artisan --version
+composer install --prefer-dist
+```
+
+## Related Project
+
+React frontend repository:
+
+```text
+reactjs-dashboard
+```
+
+Frontend local URL:
+
+```text
+http://localhost:3000
+```
