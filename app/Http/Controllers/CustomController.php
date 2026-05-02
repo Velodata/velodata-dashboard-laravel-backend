@@ -29,7 +29,95 @@ use App\Models\Role;
 
 class CustomController extends Controller
 {
-    // Your custom method
+    private function normalizeIpAddress(?string $ip): ?array
+    {
+        if (! $ip) {
+            return null;
+        }
+
+        $ip = trim($ip);
+        $ip = trim($ip, "[] \t\n\r\0\x0B");
+
+        if ($ip === '::1' || $ip === '0:0:0:0:0:0:0:1') {
+            return [
+                'ip_address' => '127.0.0.1',
+                'ip_address_v4' => '127.0.0.1',
+                'ip_address_v6' => null,
+            ];
+        }
+
+        if (preg_match('/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i', $ip, $matches)) {
+            $ip = $matches[1];
+        }
+
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return [
+                'ip_address' => $ip,
+                'ip_address_v4' => $ip,
+                'ip_address_v6' => null,
+            ];
+        }
+
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            return [
+                'ip_address' => $ip,
+                'ip_address_v4' => null,
+                'ip_address_v6' => $ip,
+            ];
+        }
+
+        return null;
+    }
+
+    private function resolveClientIpAddresses(Request $request): array
+    {
+        $candidates = [];
+
+        foreach (['CF-Connecting-IP', 'X-Real-IP', 'X-Forwarded-For'] as $headerName) {
+            $headerValue = $request->header($headerName);
+            if (! $headerValue) {
+                continue;
+            }
+
+            foreach (explode(',', $headerValue) as $headerIp) {
+                $candidates[] = $headerIp;
+            }
+        }
+
+        $candidates[] = $request->ip();
+
+        $resolved = [
+            'ip_address' => '0.0.0.0',
+            'ip_address_v4' => null,
+            'ip_address_v6' => null,
+        ];
+
+        foreach ($candidates as $candidate) {
+            $normalized = $this->normalizeIpAddress($candidate);
+            if (! $normalized) {
+                continue;
+            }
+
+            if ($resolved['ip_address'] === '0.0.0.0') {
+                $resolved['ip_address'] = $normalized['ip_address'];
+            }
+
+            if (! $resolved['ip_address_v4'] && $normalized['ip_address_v4']) {
+                $resolved['ip_address_v4'] = $normalized['ip_address_v4'];
+            }
+
+            if (! $resolved['ip_address_v6'] && $normalized['ip_address_v6']) {
+                $resolved['ip_address_v6'] = $normalized['ip_address_v6'];
+            }
+        }
+
+        if ($resolved['ip_address_v4']) {
+            $resolved['ip_address'] = $resolved['ip_address_v4'];
+        }
+
+        return $resolved;
+    }
+// Your custom method
     public function yourCustomMethod(Request $request)
     {
         // Call the custom method (as a method, not inside the main method) 
@@ -204,9 +292,10 @@ class CustomController extends Controller
     public function F0_VMD_login_user(Request $request)
     {
         // IJV - 2025.03.01 - Get the geolocation data
-        $realIp = $request->header('X-Forwarded-For');
-        $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
-        $realIp = trim($realIp);
+        $clientIp = $this->resolveClientIpAddresses($request);
+        $realIp = $clientIp['ip_address'];
+        $ipAddressV4 = $clientIp['ip_address_v4'];
+        $ipAddressV6 = $clientIp['ip_address_v6'];
         $isLoopbackIp = in_array($realIp, ['127.0.0.1', '::1', '0:0:0:0:0:0:0:1'], true);
 
         if ($isLoopbackIp) {
@@ -284,6 +373,8 @@ class CustomController extends Controller
                     'name'          => $name,
                     'created_at'    => now(),
                     'ip_address'    => $realIp,
+                    'ip_address_v4' => $ipAddressV4,
+                    'ip_address_v6' => $ipAddressV6,
                     'user_country'  => $lxCountry,
                     'user_region'   => $lxRegion,
                     'user_city'     => $lxCity,
@@ -352,6 +443,8 @@ class CustomController extends Controller
                 'name'          => $name,
                 'created_at'    => now(),
                 'ip_address'    => $realIp,
+                'ip_address_v4' => $ipAddressV4,
+                'ip_address_v6' => $ipAddressV6,
                 'user_country'  => $lxCountry,
                 'user_region'   => $lxRegion,
                 'user_city'     => $lxCity,
@@ -835,6 +928,8 @@ class CustomController extends Controller
                     "email" => $row->email,
                     "name" => $row->name,
                     "ip_address" => $row->ip_address,
+                    "ip_address_v4" => $row->ip_address_v4,
+                    "ip_address_v6" => $row->ip_address_v6,
                     "user_city" => $row->user_city,
                     "user_region" => $row->user_region,
                     "user_country" => $row->user_country,
