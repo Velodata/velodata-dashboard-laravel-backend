@@ -296,6 +296,22 @@ class CustomController extends Controller
         $realIp = $clientIp['ip_address'];
         $ipAddressV4 = $clientIp['ip_address_v4'];
         $ipAddressV6 = $clientIp['ip_address_v6'];
+
+        $clientReportedIpV4 = $this->normalizeIpAddress($request->input('vmd_ip_address_v4'));
+        $clientReportedIpV6 = $this->normalizeIpAddress($request->input('vmd_ip_address_v6'));
+
+        if ($clientReportedIpV4 && $clientReportedIpV4['ip_address_v4']) {
+            $ipAddressV4 = $clientReportedIpV4['ip_address_v4'];
+        }
+
+        if ($clientReportedIpV6 && $clientReportedIpV6['ip_address_v6']) {
+            $ipAddressV6 = $clientReportedIpV6['ip_address_v6'];
+        }
+
+        if ($ipAddressV4 || $ipAddressV6) {
+            $realIp = $ipAddressV4 ?: $ipAddressV6;
+        }
+
         $isLoopbackIp = in_array($realIp, ['127.0.0.1', '::1', '0:0:0:0:0:0:0:1'], true);
 
         if ($isLoopbackIp) {
@@ -307,10 +323,11 @@ class CustomController extends Controller
             $lxTimezone = null;
         } else {
             $accessToken = '4af1c2308a696c';
-            $apiUrl = "http://ipinfo.io/{$realIp}/json?token={$accessToken}";
+            $locationLookupIp = $realIp;
+            $apiUrl = "http://ipinfo.io/{$locationLookupIp}/json?token={$accessToken}";
             $pageContent = file_get_contents($apiUrl);
             if ($pageContent === false) {
-                return response()->json(['errors' => 'Failed to fetch geolocation data during F0_VMD_login_user().'], 500);
+                return response()->json(['errors' => "Failed to fetch geolocation data during F0_VMD_login_user() for {$locationLookupIp}."], 500);
             }
             $parsedJson = json_decode($pageContent);
             $lxCountry     = $parsedJson->country ?? null;
