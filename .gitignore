@@ -3,6 +3,7 @@
 /public/build
 /public/hot
 /public/storage
+/deployment-packages
 /storage/*.key
 /storage/pail
 /vendor
@@ -16,6 +17,7 @@ Homestead.yaml
 auth.json
 npm-debug.log
 yarn-error.log
+*.zip
 /.fleet
 /.idea
 /.vscode

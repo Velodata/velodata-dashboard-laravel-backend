@@ -24,6 +24,10 @@ Route::prefix('v2')->group(function () {
 
     Route::match(['get', 'post'], '/VMD-get-login-history', [CustomController::class, 'F0_VMD_get_login_history']);
     Route::match(['get', 'post'], '/VMD-get-audit-history', [CustomController::class, 'F0_VMD_get_audit_history']);
+    Route::match(['get', 'post'], '/VMD-get-notifications', [CustomController::class, 'F0_VMD_get_notifications']);
+    Route::post('/VMD-create-notification', [CustomController::class, 'F0_VMD_create_notification']);
+    Route::post('/VMD-mark-notifications-read', [CustomController::class, 'F0_VMD_mark_notifications_read']);
+    Route::post('/VMD-clear-notifications', [CustomController::class, 'F0_VMD_clear_notifications']);
     Route::match(['get', 'post'], '/VMD-updateUser', [CustomController::class, 'F0_VMD_updateUser']);
     Route::match(['get', 'post'], '/VMD-ban-user', [CustomController::class, 'F0_VMD_ban_user']);
     Route::post('/VMD-unbanUser', [CustomController::class, 'F0_VMD_unbanUser']);

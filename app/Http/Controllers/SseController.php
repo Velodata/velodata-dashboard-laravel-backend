@@ -7,6 +7,38 @@ use Illuminate\Support\Facades\DB;
 
 class SseController extends Controller
 {
+    private function canReceiveProtectedSecurityEvents(string $email): bool
+    {
+        $user = DB::table('users')->where('email', $email)->first();
+
+        if (! $user) {
+            return false;
+        }
+
+        $roleName = strtolower((string) ($user->role_name ?? ''));
+        $roleId = (int) ($user->role_id ?? 0);
+
+        return in_array($roleName, ['admin', 'protector'], true) || in_array($roleId, [1, 5], true);
+    }
+
+    private function getLatestProtectedSecurityAudit()
+    {
+        return DB::table('user_audit_history')
+            ->leftJoin('users', 'users.id', '=', DB::raw('user_audit_history.custno - 100000'))
+            ->select(
+                'user_audit_history.*',
+                'users.name as target_name',
+                'users.email as target_email'
+            )
+            ->where(function ($query) {
+                $query
+                    ->where('user_audit_history.comments', 'like', 'Protected account edit blocked:%')
+                    ->orWhere('user_audit_history.comments', 'like', 'Protected account warning;%');
+            })
+            ->orderBy('user_audit_history.id', 'DESC')
+            ->first();
+    }
+
     public function profileUpdates(Request $request)
     {
         $email = $request->header('X-User-Email') ?: $request->query('email');
@@ -32,6 +64,8 @@ class SseController extends Controller
         return response()->stream(function () use ($email) {
             set_time_limit(0);
             $lastUpdated = null;
+            $canReceiveSecurityEvents = $this->canReceiveProtectedSecurityEvents($email);
+            $lastSecurityAuditId = $canReceiveSecurityEvents ? optional($this->getLatestProtectedSecurityAudit())->id : null;
 
             while (true) {
                 if (connection_aborted()) {
@@ -57,6 +91,27 @@ class SseController extends Controller
                         ]) . "\n\n";
 
                         $lastUpdated = $user->updated_at;
+                    }
+                }
+
+                if ($canReceiveSecurityEvents) {
+                    $latestSecurityAudit = $this->getLatestProtectedSecurityAudit();
+
+                    if ($latestSecurityAudit && $latestSecurityAudit->id !== $lastSecurityAuditId) {
+                        echo "event: security.protected_edit_blocked\n";
+                        echo 'data: ' . json_encode([
+                            'id' => $latestSecurityAudit->id,
+                            'email' => $email,
+                            'target_email' => $latestSecurityAudit->target_email,
+                            'target_name' => $latestSecurityAudit->target_name,
+                            'actor_email' => $latestSecurityAudit->created_by_email,
+                            'actor_name' => $latestSecurityAudit->clerk_id,
+                            'message' => $latestSecurityAudit->comments,
+                            'created_at' => $latestSecurityAudit->created_at,
+                            'created_by_ip_address' => $latestSecurityAudit->created_by_ip_address,
+                        ]) . "\n\n";
+
+                        $lastSecurityAuditId = $latestSecurityAudit->id;
                     }
                 }
 

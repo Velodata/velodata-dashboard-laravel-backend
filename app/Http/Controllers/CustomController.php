@@ -29,6 +29,174 @@ use App\Models\Role;
 
 class CustomController extends Controller
 {
+    private function getRequestIpAddress(Request $request): string
+    {
+        $realIp = $request->header('X-Forwarded-For');
+        $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
+
+        return trim($realIp ?: 'Unknown');
+    }
+
+    private function logProtectedAccountEditBlocked(Request $request, array $data, string $attemptedAction): void
+    {
+        $targetId = (int) ($data['id'] ?? 1);
+        $targetUser = User::where('id', $targetId)->first();
+        $actorEmail = $data['vmd_user_email'] ?? $data['updated_by'] ?? 'Unknown email';
+        $actorName = $data['vmd_user_name'] ?? $data['updated_by'] ?? 'Unknown actor';
+        $reason = $data['vmd_audit_reason'] ?? $attemptedAction;
+        $targetEmail = $targetUser->email ?? 'unknown target';
+        $targetName = $targetUser->name ?? 'protected account';
+        $targetRole = $targetUser->role_name ?? 'Unknown';
+        $attemptedRole = $data['role_name'] ?? null;
+        $comments = "Protected account warning; {$actorEmail} attempted {$reason} on {$targetName} ({$targetEmail}).";
+
+        if ($attemptedRole && $attemptedRole !== $targetRole) {
+            $comments = "Protected account warning; {$actorEmail} attempted to change the User role for {$targetName} ({$targetEmail}) from {$targetRole} to {$attemptedRole}.";
+        }
+
+        $auditHistoryId = DB::table('user_audit_history')->insertGetId([
+            'custno' => $targetId + 100000,
+            'dteprfmd' => now(),
+            'comments' => $comments,
+            'clerk_id' => $actorName,
+            'created_by_email' => $actorEmail,
+            'created_by_ip_address' => $this->getRequestIpAddress($request),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $this->createProtectedAccountWarningNotifications($auditHistoryId, [
+            'actor_email' => $actorEmail,
+            'actor_name' => $actorName,
+            'target_email' => $targetEmail,
+            'target_name' => $targetName,
+            'message' => $comments,
+            'ip_address' => $this->getRequestIpAddress($request),
+        ]);
+    }
+
+    private function normalizeNotificationMetadata($metadata): array
+    {
+        if (is_array($metadata)) {
+            return $metadata;
+        }
+
+        if (is_string($metadata) && $metadata !== '') {
+            $decoded = json_decode($metadata, true);
+            return is_array($decoded) ? $decoded : [];
+        }
+
+        return [];
+    }
+
+    private function createPersistedNotification(array $notification): ?object
+    {
+        $recipientEmail = $notification['recipient_email'] ?? null;
+        if (! $recipientEmail) {
+            return null;
+        }
+
+        $recipient = DB::table('users')->where('email', $recipientEmail)->first();
+        $actorEmail = $notification['actor_email'] ?? null;
+        $actor = $actorEmail ? DB::table('users')->where('email', $actorEmail)->first() : null;
+        $dedupeKey = $notification['dedupe_key'] ?? null;
+        $now = now();
+
+        if ($dedupeKey) {
+            $existing = DB::table('user_notifications')
+                ->where('recipient_email', $recipientEmail)
+                ->where('dedupe_key', $dedupeKey)
+                ->first();
+
+            if ($existing) {
+                return $existing;
+            }
+        }
+
+        $notificationId = DB::table('user_notifications')->insertGetId([
+            'recipient_user_id' => $recipient->id ?? null,
+            'recipient_email' => $recipientEmail,
+            'actor_user_id' => $actor->id ?? null,
+            'actor_email' => $actorEmail,
+            'type' => $notification['type'] ?? 'info',
+            'title' => $notification['title'] ?? 'Notification',
+            'message' => $notification['message'] ?? null,
+            'source' => $notification['source'] ?? 'system',
+            'related_audit_history_id' => $notification['related_audit_history_id'] ?? null,
+            'dedupe_key' => $dedupeKey,
+            'metadata' => json_encode($notification['metadata'] ?? []),
+            'read_at' => $notification['read_at'] ?? null,
+            'created_at' => $notification['created_at'] ?? $now,
+            'updated_at' => $notification['updated_at'] ?? $now,
+        ]);
+
+        return DB::table('user_notifications')->where('id', $notificationId)->first();
+    }
+
+    private function createProtectedAccountWarningNotifications(int $auditHistoryId, array $event): void
+    {
+        $recipients = DB::table('users')
+            ->where(function ($query) {
+                $query->whereIn(DB::raw('LOWER(role_name)'), ['admin', 'protector'])
+                    ->orWhereIn('role_id', [1, 5]);
+            })
+            ->where(function ($query) {
+                $query->whereNull('status')
+                    ->orWhereNotIn('status', ['BANNED', 'DELETED']);
+            })
+            ->get();
+
+        foreach ($recipients as $recipient) {
+            $this->createPersistedNotification([
+                'recipient_email' => $recipient->email,
+                'actor_email' => $event['actor_email'] ?? null,
+                'type' => 'warning',
+                'title' => 'Protected account warning',
+                'message' => $event['message'] ?? '',
+                'source' => 'security',
+                'related_audit_history_id' => $auditHistoryId,
+                'dedupe_key' => "security-protected-account-warning-{$auditHistoryId}",
+                'metadata' => [
+                    'actorEmail' => $event['actor_email'] ?? null,
+                    'updatedBy' => $event['actor_email'] ?? null,
+                    'targetEmail' => $event['target_email'] ?? null,
+                    'targetName' => $event['target_name'] ?? null,
+                    'auditReason' => $event['message'] ?? null,
+                    'ipAddress' => $event['ip_address'] ?? null,
+                ],
+            ]);
+        }
+    }
+
+    private function transformNotificationRow($row): array
+    {
+        $actor = $row->actor_email
+            ? DB::table('users')->where('email', $row->actor_email)->first()
+            : null;
+        $metadata = $this->normalizeNotificationMetadata($row->metadata);
+
+        if ($actor && empty($metadata['actorImage'])) {
+            $metadata['actorImage'] = $actor->profile_image ?? '';
+        }
+
+        if ($actor && empty($metadata['updatedBy'])) {
+            $metadata['updatedBy'] = $actor->email;
+        }
+
+        return [
+            'id' => (string) $row->id,
+            'type' => $row->type,
+            'title' => $row->title,
+            'message' => $row->message ?? '',
+            'source' => $row->source,
+            'metadata' => $metadata,
+            'read' => $row->read_at !== null,
+            'createdAt' => $row->created_at,
+            'dedupeKey' => $row->dedupe_key,
+            'relatedAuditHistoryId' => $row->related_audit_history_id,
+        ];
+    }
+
     private function normalizeIpAddress(?string $ip): ?array
     {
         if (! $ip) {
@@ -592,6 +760,7 @@ class CustomController extends Controller
         // Extract validated data
         $data = $validator->validated();
         if ($data['id'] === 1) {
+            $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'ban protected account');
             $response['outcome'] = "FAIL";
             $response['message'] = "Permission Denied:  (You can NEVER EVER edit the Admin account.)";
             return response()->json($response, 403);
@@ -777,6 +946,7 @@ class CustomController extends Controller
         // Extract validated data
         $data = $validator->validated();
         if ($data['id'] === 1) {
+            $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'delete protected account');
             $response['outcome'] = "FAIL";
             $response['message'] = "Permission Denied:  (You can NEVER EVER edit the Admin account.)";
             return response()->json($response, 403);
@@ -979,15 +1149,26 @@ class CustomController extends Controller
 
         // Get the total number of records in the table
         $recordsTotal = DB::table('user_audit_history')->count();
+        $requestEmail = $request->input('email') ?: $request->query('email');
+        $viewer = $requestEmail ? DB::table('users')->where('email', $requestEmail)->first() : null;
+        $canViewProtectedSecurityAudits = $viewer && in_array($viewer->role_name, ['Admin', 'Protector'], true);
 
 
-        $audit_history_list = DB::table('user_audit_history')
+        $auditHistoryQuery = DB::table('user_audit_history')
             ->leftJoin('users', 'users.id', '=', DB::raw('user_audit_history.custno - 100000'))
             ->select(
                 'user_audit_history.*',
                 'users.name as target_name',
                 'users.email as target_email'
-            )
+            );
+
+        if (! $canViewProtectedSecurityAudits) {
+            $auditHistoryQuery
+                ->where('user_audit_history.comments', 'not like', 'Protected account edit blocked:%')
+                ->where('user_audit_history.comments', 'not like', 'Protected account warning;%');
+        }
+
+        $audit_history_list = $auditHistoryQuery
             ->orderBy('user_audit_history.created_at', 'DESC')
             ->limit(100)
             ->get();
@@ -1043,6 +1224,127 @@ class CustomController extends Controller
 
 
 
+
+    public function F0_VMD_get_notifications(Request $request)
+    {
+        $email = $request->input('email') ?: $request->query('email');
+
+        if (! $email) {
+            return response()->json(['error' => 'Missing email parameter.'], 400);
+        }
+
+        $notifications = DB::table('user_notifications')
+            ->where('recipient_email', $email)
+            ->whereNull('dismissed_at')
+            ->orderBy('created_at', 'DESC')
+            ->limit(50)
+            ->get()
+            ->map(function ($row) {
+                return $this->transformNotificationRow($row);
+            });
+
+        return response()->json([
+            'data' => $notifications,
+            'recordsFiltered' => $notifications->count(),
+            'recordsTotal' => DB::table('user_notifications')
+                ->where('recipient_email', $email)
+                ->whereNull('dismissed_at')
+                ->count(),
+        ], 200);
+    }
+
+    public function F0_VMD_create_notification(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'recipient_email' => 'required|email',
+            'actor_email' => 'nullable|email',
+            'type' => 'nullable|string|max:50',
+            'title' => 'required|string|max:255',
+            'message' => 'nullable|string',
+            'source' => 'nullable|string|max:100',
+            'related_audit_history_id' => 'nullable|integer',
+            'dedupe_key' => 'nullable|string|max:255',
+            'metadata' => 'nullable',
+            'created_at' => 'nullable|string|max:80',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'errors' => $validator->errors()->toArray(),
+            ], 422);
+        }
+
+        $data = $validator->validated();
+
+        $notification = $this->createPersistedNotification([
+            'recipient_email' => $data['recipient_email'],
+            'actor_email' => $data['actor_email'] ?? null,
+            'type' => $data['type'] ?? 'info',
+            'title' => $data['title'],
+            'message' => $data['message'] ?? '',
+            'source' => $data['source'] ?? 'system',
+            'related_audit_history_id' => $data['related_audit_history_id'] ?? null,
+            'dedupe_key' => $data['dedupe_key'] ?? null,
+            'metadata' => $this->normalizeNotificationMetadata($data['metadata'] ?? []),
+            'created_at' => $data['created_at'] ?? now(),
+        ]);
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'data' => $notification ? $this->transformNotificationRow($notification) : null,
+        ], 200);
+    }
+
+    public function F0_VMD_mark_notifications_read(Request $request)
+    {
+        $email = $request->input('email');
+        $id = $request->input('id');
+
+        if (! $email) {
+            return response()->json(['error' => 'Missing email parameter.'], 400);
+        }
+
+        $query = DB::table('user_notifications')
+            ->where('recipient_email', $email)
+            ->whereNull('read_at');
+
+        if ($id) {
+            $query->where('id', $id);
+        }
+
+        $updated = $query->update([
+            'read_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'updated' => $updated,
+        ], 200);
+    }
+
+    public function F0_VMD_clear_notifications(Request $request)
+    {
+        $email = $request->input('email');
+
+        if (! $email) {
+            return response()->json(['error' => 'Missing email parameter.'], 400);
+        }
+
+        $dismissed = DB::table('user_notifications')
+            ->where('recipient_email', $email)
+            ->whereNull('dismissed_at')
+            ->update([
+                'dismissed_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'dismissed' => $dismissed,
+        ], 200);
+    }
 
     /******************************************************************************************************************************************
      * IJV - 2025.03.06  -  F0_VMD_updateUser()
@@ -1108,6 +1410,7 @@ if ($validator->fails()) {
         $data = $validator->validated();
 
         if ($data['id'] === 1) {
+            $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'update protected account');
             $response['outcome'] = "FAIL";
             $response['message'] = "Permission Denied:  (You can NEVER EVER edit the Admin account.)";
             return response()->json($response, 403);
