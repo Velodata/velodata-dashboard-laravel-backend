@@ -1,12 +1,12 @@
 @php
-  $brandLogoUrl = asset('images/logo-velodata.png');
+  $brandLogoUrl = 'https://laravel.com/img/notification-logo.png';
   $appName = $context['app_name'] ?? config('app.name', 'Velodata Dashboard');
 @endphp
 
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:0 auto 18px auto;max-width:540px;">
   <tr>
     <td align="center" style="padding-bottom:14px;">
-      <img src="{{ $brandLogoUrl }}" alt="Velodata Logo" style="width:72px;height:72px;object-fit:contain;">
+      <img src="{{ $brandLogoUrl }}" alt="Laravel Logo" style="width:72px;height:72px;object-fit:contain;">
     </td>
   </tr>
   <tr>

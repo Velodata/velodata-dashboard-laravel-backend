@@ -32,6 +32,8 @@ Route::prefix('v2')->group(function () {
     Route::match(['get', 'post'], '/VMD-ban-user', [CustomController::class, 'F0_VMD_ban_user']);
     Route::post('/VMD-unbanUser', [CustomController::class, 'F0_VMD_unbanUser']);
     Route::match(['get', 'post'], '/VMD-delete-user', [CustomController::class, 'F0_VMD_delete_user']);
+    Route::post('/VMD-get-dashboard-settings', [CustomController::class, 'F0_VMD_get_dashboard_settings']);
+    Route::post('/VMD-update-dashboard-settings', [CustomController::class, 'F0_VMD_update_dashboard_settings']);
     Route::match(['get', 'post'], '/VMD-verify-2fa', [CustomController::class, 'F0_VMD_verify_2fa_code']);
     Route::match(['get', 'post'], '/VMD-resend-2fa', [CustomController::class, 'F0_VMD_resend_2fa']);
 

@@ -13,6 +13,9 @@
     $appName = 'Velodata Dashboard';
     $recipientName = $context['recipient_name'] ?? 'there';
     $recipientEmail = $context['recipient_email'] ?? null;
+    $displayRecipientEmail = $recipientEmail
+        ? str_replace(['@', '.'], ['&#8203;@&#8203;', '&#8203;.'], e($recipientEmail))
+        : null;
     $expiresInMinutes = $context['expires_in_minutes'] ?? 10;
     @endphp
 
@@ -24,7 +27,7 @@
                 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:540px;background:#ffffff;border-radius:8px;border:1px solid #e0e6f0;">
                     <tr>
                         <td style="padding:26px 28px 8px 28px;font-size:16px;line-height:1.6;">
-                            Hello {{ $recipientName }},
+                            Hello {{ $recipientName }}@if($displayRecipientEmail) {!! ' ' . $displayRecipientEmail !!}@endif,
                         </td>
                     </tr>
                     <tr>

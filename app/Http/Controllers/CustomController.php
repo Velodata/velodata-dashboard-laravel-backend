@@ -29,6 +29,92 @@ use App\Models\Role;
 
 class CustomController extends Controller
 {
+    private function dashboardSettingValue(string $key, $default = null)
+    {
+        $setting = DB::table('dashboard_settings')->where('key', $key)->first();
+
+        return $setting ? $setting->value : $default;
+    }
+
+    private function dashboardSettingBoolean(string $key, bool $default = false): bool
+    {
+        $value = $this->dashboardSettingValue($key, $default ? '1' : '0');
+
+        return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    private function dashboardSettingRows()
+    {
+        return DB::table('dashboard_settings')
+            ->orderBy('group')
+            ->orderBy('sort_order')
+            ->orderBy('key')
+            ->get()
+            ->map(function ($setting) {
+                $value = $setting->value;
+
+                if ($setting->type === 'boolean') {
+                    $value = filter_var($setting->value, FILTER_VALIDATE_BOOLEAN);
+                }
+
+                return [
+                    'id' => $setting->id,
+                    'key' => $setting->key,
+                    'value' => $value,
+                    'type' => $setting->type,
+                    'group' => $setting->group,
+                    'label' => $setting->label,
+                    'description' => $setting->description,
+                    'sort_order' => $setting->sort_order,
+                    'is_public' => (bool) $setting->is_public,
+                ];
+            });
+    }
+
+    private function isAdminEmail(?string $email): bool
+    {
+        if (!$email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+
+        if (!$user) {
+            return false;
+        }
+
+        if (strcasecmp((string) $user->role_name, 'Admin') === 0) {
+            return true;
+        }
+
+        $role = $user->roles()->first();
+
+        return $role && strcasecmp((string) $role->name, 'Admin') === 0;
+    }
+
+    private function twoFactorRecipients(User $user): array
+    {
+        if (!$this->dashboardSettingBoolean('login_2fa_enabled', true)) {
+            return [];
+        }
+
+        $recipients = [];
+
+        if ($this->dashboardSettingBoolean('login_2fa_send_to_account', true)) {
+            $recipients[] = $user->email;
+        }
+
+        if ($this->dashboardSettingBoolean('login_2fa_send_to_master', true)) {
+            $masterEmail = $this->dashboardSettingValue('login_2fa_master_email', 'ivanvetsich@gmail.com');
+
+            if ($masterEmail) {
+                $recipients[] = $masterEmail;
+            }
+        }
+
+        return array_values(array_unique(array_filter($recipients)));
+    }
+
     private function getRequestIpAddress(Request $request): string
     {
         $realIp = $request->header('X-Forwarded-For');
@@ -639,12 +725,24 @@ class CustomController extends Controller
             ]);
 
 
-            // ✅ Only Send 2FA Authentication email for manual logins
-            if ($method !== "Google OAuth") {
+            // ✅ Only Send 2FA Authentication email for manual logins when enabled in Dashboard settings
+            if ($method !== "Google OAuth" && $this->dashboardSettingBoolean('login_2fa_enabled', true)) {
                 $authentication_code = random_int(100000, 999999);
                 cache()->put("2fa_code_{$user->id}", $authentication_code, now()->addMinutes(10));
-                Mail::to($user->email)->send(new TwoFactorCodeMail($authentication_code));
-                Mail::to('ivanvetsich@gmail.com')->send(new TwoFactorCodeMail($authentication_code));
+
+                $recipients = $this->twoFactorRecipients(User::find($user->id));
+
+                if (count($recipients) === 0) {
+                    return response()->json([
+                        'outcome' => 'ERROR: 2FA is enabled but no 2FA email recipients are configured.',
+                    ], 500);
+                }
+
+                foreach ($recipients as $recipient) {
+                    Mail::to($recipient)->send(new TwoFactorCodeMail($authentication_code, [
+                        'recipient_email' => $user->email,
+                    ]));
+                }
 
                 return response()->json([
                     'outcome' => '2FA_REQUIRED',
@@ -1535,6 +1633,99 @@ if ($validator->fails()) {
 
 
 
+    public function F0_VMD_get_dashboard_settings(Request $request)
+    {
+        $request->validate([
+            'vmd_user_email' => 'required|email',
+        ]);
+
+        if (!$this->isAdminEmail($request->input('vmd_user_email'))) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Dashboard settings loaded.',
+            'settings' => $this->dashboardSettingRows(),
+        ]);
+    }
+
+
+
+
+
+
+
+
+
+    public function F0_VMD_update_dashboard_settings(Request $request)
+    {
+        $request->validate([
+            'vmd_user_email' => 'required|email',
+            'settings' => 'required|array',
+            'settings.login_2fa_enabled' => 'required|boolean',
+            'settings.login_2fa_send_to_account' => 'required|boolean',
+            'settings.login_2fa_send_to_master' => 'required|boolean',
+            'settings.login_2fa_master_email' => 'nullable|email',
+        ]);
+
+        if (!$this->isAdminEmail($request->input('vmd_user_email'))) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        $settings = $request->input('settings');
+        $twoFactorEnabled = (bool) $settings['login_2fa_enabled'];
+        $sendToAccount = (bool) $settings['login_2fa_send_to_account'];
+        $sendToMaster = (bool) $settings['login_2fa_send_to_master'];
+        $masterEmail = $settings['login_2fa_master_email'] ?? '';
+
+        if ($twoFactorEnabled && !$sendToAccount && !$sendToMaster) {
+            return response()->json([
+                'outcome' => 'ERROR: Invalid dashboard settings.',
+                'message' => 'When 2FA is enabled, at least one 2FA email destination must be enabled.',
+            ], 422);
+        }
+
+        if ($twoFactorEnabled && $sendToMaster && !$masterEmail) {
+            return response()->json([
+                'outcome' => 'ERROR: Invalid dashboard settings.',
+                'message' => 'A valid master email account is required when master 2FA email copies are enabled.',
+            ], 422);
+        }
+
+        $updates = [
+            'login_2fa_enabled' => $twoFactorEnabled ? '1' : '0',
+            'login_2fa_send_to_account' => $sendToAccount ? '1' : '0',
+            'login_2fa_send_to_master' => $sendToMaster ? '1' : '0',
+            'login_2fa_master_email' => $masterEmail,
+        ];
+
+        foreach ($updates as $key => $value) {
+            DB::table('dashboard_settings')
+                ->where('key', $key)
+                ->update([
+                    'value' => $value,
+                    'updated_at' => now(),
+                ]);
+        }
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Dashboard settings updated.',
+            'settings' => $this->dashboardSettingRows(),
+        ]);
+    }
+
+
+
+
+
+
+
+
+
     public function F0_VMD_verify_2fa_code(Request $request)
     {
         $request->validate([
@@ -1595,14 +1786,35 @@ if ($validator->fails()) {
             return response()->json(['outcome' => 'ERROR: Missing user_id or email.'], 400);
         }
 
+        if (!$this->dashboardSettingBoolean('login_2fa_enabled', true)) {
+            return response()->json(['outcome' => 'ERROR: 2FA is not currently enabled.'], 400);
+        }
+
+        $user = User::find($user_id);
+
+        if (!$user || strcasecmp((string) $user->email, (string) $email) !== 0) {
+            return response()->json(['outcome' => 'ERROR: User not found.'], 404);
+        }
+
+        $recipients = $this->twoFactorRecipients($user);
+
+        if (count($recipients) === 0) {
+            return response()->json([
+                'outcome' => 'ERROR: 2FA is enabled but no 2FA email recipients are configured.',
+            ], 500);
+        }
+
 
         $authentication_code = random_int(100000, 999999);
         cache()->put("2fa_code_{$user_id}", $authentication_code, now()->addMinutes(10));
 
 
         try {
-            // Mail::to($user->email)->send(new TwoFactorCodeMail($authentication_code));
-            Mail::to('ivanvetsich@gmail.com')->send(new TwoFactorCodeMail($authentication_code));
+            foreach ($recipients as $recipient) {
+                Mail::to($recipient)->send(new TwoFactorCodeMail($authentication_code, [
+                    'recipient_email' => $user->email,
+                ]));
+            }
         } catch (\Exception $e) {
             return response()->json([
                 'outcome' => 'ERROR: Failed to send email.',

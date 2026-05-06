@@ -14,15 +14,15 @@ Never create deployment packages, zip files, temporary staging folders, logs, ge
 Use this external scratch area for generated outputs:
 
 ```text
-D:\CodexScratch
+D:\TempFiles\CodexScratch
 ```
 
 Preferred subfolders:
 
 ```text
-D:\CodexScratch\packages
-D:\CodexScratch\logs
-D:\CodexScratch\temp
+D:\TempFiles\CodexScratch\packages
+D:\TempFiles\CodexScratch\logs
+D:\TempFiles\CodexScratch\temp
 ```
 
 If the folder does not exist, ask before creating it. Do not fall back to creating generated-output folders inside `reactjs-dashboard` or `laravel-json-api-pro`.
@@ -32,7 +32,7 @@ If the folder does not exist, ask before creating it. Do not fall back to creati
 Deployment zip files for Laravel or React must be created under:
 
 ```text
-D:\CodexScratch\packages
+D:\TempFiles\CodexScratch\packages
 ```
 
 Never create a `deployment-packages` folder inside either repo.
