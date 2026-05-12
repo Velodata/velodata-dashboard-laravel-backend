@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\GameUser;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
@@ -18,6 +19,8 @@ class UserController extends Controller
     public function index(Request $request)
     {
         $users = User::with('roles')->get(); // Eager load roles
+        $gameIntakeId = $request->query('game_intake_id');
+        $gameIntakeCode = $request->query('game_intake_code');
 
         // Check if the include query parameter is set to roles
         $includeRoles = $request->query('include') === 'roles';
@@ -31,39 +34,116 @@ class UserController extends Controller
             $included = $rolesResponse->getData()->data; // Extract the roles data
         }
 
+        $creatorRole = DB::table('roles')->whereRaw('LOWER(name) = ?', ['creator'])->first();
+        $memberRole = DB::table('roles')->whereRaw('LOWER(name) = ?', ['member'])->first();
+        $gameUserRoleId = (string) ($creatorRole->id ?? $memberRole->id ?? 3);
+        $gameUserRoleName = $creatorRole->name ?? $memberRole->name ?? 'Creator';
+
+        $staffRows = $users->map(function ($user) {
+            return [
+                'type' => 'users',
+                'id' => (string) $user->id,
+                'attributes' => [
+                    'identity_type' => 'staff',
+                    'presence_key' => 'staff:' . $user->id,
+                    'user_id' => $user->id,
+                    'game_user_id' => null,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'profile_image' => $user->profile_image,
+                    'role_name' => $user->roles->name ?? null,
+                    'created_at' => $user->created_at,
+                    'updated_at' => $user->updated_at,
+                    'status' => $user->status,
+                ],
+                'relationships' => [
+                    'roles' => [
+                        'links' => [
+                            'related' => url("api/v2/users/{$user->id}/roles"),
+                            'self' => url("api/v2/users/{$user->id}/relationships/roles"),
+                        ],
+                        'data' => $user->roles ? [
+                            [
+                                'type' => 'roles',
+                                'id' => (string) $user->roles->id,
+                            ]
+                        ] : [],
+                    ],
+                ],
+                'links' => [
+                    'self' => url("api/v2/users/{$user->id}"),
+                ],
+            ];
+        });
+
+        $gameRows = collect();
+
+        if ($gameIntakeId || $gameIntakeCode) {
+            $gameUsersQuery = GameUser::query()
+                ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+                ->select(
+                    'game_users.*',
+                    'game_intakes.code as intake_code',
+                    'game_intakes.name as intake_name'
+                );
+
+            if ($gameIntakeId) {
+                $gameUsersQuery->where('game_users.intake_id', $gameIntakeId);
+            } elseif ($gameIntakeCode) {
+                $gameUsersQuery->where('game_intakes.code', $gameIntakeCode);
+            }
+
+            $gameRows = $gameUsersQuery
+                ->orderBy('game_users.surname')
+                ->orderBy('game_users.first_name')
+                ->get()
+                ->map(function ($gameUser) use ($gameUserRoleId, $gameUserRoleName) {
+                    $displayName = $gameUser->display_name
+                        ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname);
+
+                    return [
+                        'type' => 'game_users',
+                        'id' => 'game-' . $gameUser->id,
+                        'attributes' => [
+                            'identity_type' => 'student',
+                            'presence_key' => 'student:' . $gameUser->id,
+                            'user_id' => null,
+                            'game_user_id' => $gameUser->id,
+                            'name' => $displayName,
+                            'email' => $gameUser->email,
+                            'profile_image' => $gameUser->profile_image,
+                            'role_name' => $gameUserRoleName,
+                            'game_intake_id' => $gameUser->intake_id,
+                            'game_intake_code' => $gameUser->intake_code,
+                            'game_intake_name' => $gameUser->intake_name,
+                            'created_at' => $gameUser->created_at,
+                            'updated_at' => $gameUser->updated_at,
+                            'status' => strtoupper($gameUser->game_status),
+                        ],
+                        'relationships' => [
+                            'roles' => [
+                                'links' => [
+                                    'related' => null,
+                                    'self' => null,
+                                ],
+                                'data' => [
+                                    [
+                                        'type' => 'roles',
+                                        'id' => $gameUserRoleId,
+                                    ],
+                                ],
+                            ],
+                        ],
+                        'links' => [
+                            'self' => null,
+                        ],
+                    ];
+                });
+        }
+
         return response()->json([
             'jsonapi' => ['version' => '2.0'],
-            'data' => $users->map(function ($user) {
-                return [
-                    'type' => 'users',
-                    'id' => (string) $user->id,
-                    'attributes' => [
-                        'name' => $user->name,
-                        'email' => $user->email,
-                        'profile_image' => $user->profile_image,
-                        'created_at' => $user->created_at,
-                        'updated_at' => $user->updated_at,
-                        'status' => $user->status,
-                    ],
-                    'relationships' => [
-                        'roles' => [
-                            'links' => [
-                                'related' => url("api/v2/users/{$user->id}/roles"),
-                                'self' => url("api/v2/users/{$user->id}/relationships/roles"),
-                            ],
-                            'data' => $user->roles ? [
-                                [
-                                    'type' => 'roles',
-                                    'id' => (string) $user->roles->id,
-                                ]
-                            ] : [],
-                        ],
-                    ],
-                    'links' => [
-                        'self' => url("api/v2/users/{$user->id}"),
-                    ],
-                ];
-            }),
+            'data' => $staffRows->concat($gameRows)->values(),
             // Include the included array if roles are requested
             'included' => $includeRoles ? $included : null,
         ]);
@@ -325,6 +405,56 @@ class UserController extends Controller
                 'error' => [
                     'title' => 'Server Error',
                     'detail' => 'An error occurred while uploading the image.',
+                    'status' => 500,
+                    'meta' => ['exception' => $e->getMessage()],
+                ]
+            ], 500);
+        }
+    }
+
+    public function uploadGameUserProfileImage(Request $request, $gameUserId)
+    {
+        $request->validate([
+            'attachment' => 'required|image|max:2048',
+        ]);
+
+        $path = "game-users/{$gameUserId}/profile-image";
+
+        try {
+            $filePath = Storage::disk('public')->put($path, $request->file('attachment'));
+
+            if (!$filePath) {
+                return response()->json([
+                    'error' => [
+                        'title' => 'Upload Error',
+                        'detail' => 'Failed to upload game user profile image',
+                        'status' => 500,
+                    ]
+                ], 500);
+            }
+
+            $fileUrl = Storage::url($filePath);
+            $gameUser = GameUser::findOrFail($gameUserId);
+            $profileImageUrl = $request->getSchemeAndHttpHost() . $fileUrl;
+            $gameUser->profile_image = $profileImageUrl;
+            $gameUser->updated_by = $request->input('vmd_user_email');
+            $gameUser->save();
+
+            return response()->json([
+                'jsonapi' => ['version' => '1.0'],
+                'data' => [
+                    'type' => 'game-user-profile',
+                    'id' => $gameUserId,
+                    'attributes' => [
+                        'profile_image' => $profileImageUrl,
+                    ]
+                ]
+            ], 201);
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => [
+                    'title' => 'Server Error',
+                    'detail' => 'An error occurred while uploading the game user profile image.',
                     'status' => 500,
                     'meta' => ['exception' => $e->getMessage()],
                 ]

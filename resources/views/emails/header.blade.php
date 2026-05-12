@@ -1,4 +1,5 @@
 @php
+  // Velodata logo test reference: https://dashboard.velodata.org/images/logo-velodata.png?v=20260508
   $brandLogoUrl = 'https://laravel.com/img/notification-logo.png';
   $appName = $context['app_name'] ?? config('app.name', 'Velodata Dashboard');
 @endphp

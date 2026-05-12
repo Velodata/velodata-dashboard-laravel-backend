@@ -92,6 +92,23 @@ class CustomController extends Controller
         return $role && strcasecmp((string) $role->name, 'Admin') === 0;
     }
 
+    private function canManageGameUsers(?string $email): bool
+    {
+        if (! $email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+
+        if (! $user) {
+            return false;
+        }
+
+        $roleName = $user->role_name ?: optional($user->roles()->first())->name;
+
+        return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+    }
+
     private function twoFactorRecipients(User $user): array
     {
         if (!$this->dashboardSettingBoolean('login_2fa_enabled', true)) {
@@ -440,6 +457,7 @@ class CustomController extends Controller
             'id' => 'nullable|integer',
             'email' => 'nullable|email',
             'method' => 'nullable|string',
+            'identity_type' => 'nullable|string',
         ]);
 
         if ($validator->fails()) {
@@ -452,6 +470,64 @@ class CustomController extends Controller
         }
         if ($method === 'via User ID' && is_null($id)) {
             $email = 'member@jsonapi.com';
+        }
+
+        if (($method === 'via Game User ID' || $request->input('identity_type') === 'student') && $id) {
+            $gameUser = DB::table('game_users')
+                ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+                ->where('game_users.id', $id)
+                ->select(
+                    'game_users.*',
+                    'game_intakes.code as intake_code',
+                    'game_intakes.name as intake_name',
+                    'game_intakes.active_week as intake_active_week'
+                )
+                ->first();
+
+            if ($gameUser) {
+                $displayName = $gameUser->display_name ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname);
+                $languages = [];
+                if (! empty($gameUser->languages)) {
+                    $decodedLanguages = json_decode($gameUser->languages, true);
+                    $languages = is_array($decodedLanguages) ? $decodedLanguages : [];
+                }
+
+                $creatorRole = DB::table('roles')->whereRaw('LOWER(name) = ?', ['creator'])->first();
+
+                return response()->json([
+                    "outcome" => 'SUCCESS: Existing game user successfully extracted.',
+                    "id" => intval($gameUser->id),
+                    "profile_image" => $gameUser->profile_image,
+                    "custno" => 900000 + intval($gameUser->id),
+                    "role_id" => $creatorRole ? intval($creatorRole->id) : 2,
+                    "role_name" => $gameUser->game_role,
+                    "status" => strtoupper($gameUser->game_status),
+                    "is_system_user" => false,
+                    "is_game_user" => true,
+                    "identity_type" => 'student',
+                    "game_user_id" => intval($gameUser->id),
+                    "game_intake_id" => intval($gameUser->intake_id),
+                    "game_intake_code" => $gameUser->intake_code,
+                    "game_intake_name" => $gameUser->intake_name,
+                    "game_active_week" => $gameUser->intake_active_week,
+                    "email" => $gameUser->email,
+                    "name" => $displayName,
+                    "company_name" => $gameUser->intake_name,
+                    "gender" => $gameUser->gender,
+                    "location" => $gameUser->location,
+                    "languages" => $languages,
+                    "address_1" => null,
+                    "address_2" => null,
+                    "address_3" => null,
+                    "city" => $gameUser->city,
+                    "state" => $gameUser->state,
+                    "postcode" => $gameUser->postcode,
+                    "phone_no" => $gameUser->phone_no,
+                    "updated_at" => $gameUser->updated_at,
+                    "updated_by" => $gameUser->updated_by,
+                    "current_time" => $currentDate,
+                ], 200)->header('Access-Control-Allow-Origin', '*');
+            }
         }
 
         $table_name = 'users';
@@ -499,6 +575,8 @@ class CustomController extends Controller
                     "role_id"       => intval($role_id),
                     "role_name"     => $role_name,
                     "status"        => $userResult->status,
+                    "is_system_user" => (bool) ($userResult->is_system_user ?? false),
+                    "is_game_user"   => (bool) ($userResult->is_game_user ?? false),
                     "email"         => $userResult->email,
                     "name"          => $userResult->name,
                     "company_name"  => $userResult->company_name,
@@ -515,6 +593,62 @@ class CustomController extends Controller
                     "updated_by"    => $userResult->updated_by,
                 ];
                 return response()->json($array, 200)->header('Access-Control-Allow-Origin', '*');
+            }
+        }
+
+        if ($method === 'Google OAuth' && $email) {
+            $gameUser = DB::table('game_users')
+                ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+                ->where('game_users.email', $email)
+                ->select(
+                    'game_users.*',
+                    'game_intakes.code as intake_code',
+                    'game_intakes.name as intake_name',
+                    'game_intakes.active_week as intake_active_week'
+                )
+                ->first();
+
+            if ($gameUser) {
+                $displayName = $gameUser->display_name ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname);
+                $languages = [];
+                if (! empty($gameUser->languages)) {
+                    $decodedLanguages = json_decode($gameUser->languages, true);
+                    $languages = is_array($decodedLanguages) ? $decodedLanguages : [];
+                }
+
+                return response()->json([
+                    "outcome" => 'SUCCESS: Existing game user successfully extracted.',
+                    "id" => intval($gameUser->id),
+                    "profile_image" => $gameUser->profile_image,
+                    "custno" => 900000 + intval($gameUser->id),
+                    "role_id" => null,
+                    "role_name" => $gameUser->game_role,
+                    "status" => $gameUser->game_status,
+                    "is_system_user" => false,
+                    "is_game_user" => true,
+                    "identity_type" => 'student',
+                    "game_user_id" => intval($gameUser->id),
+                    "game_intake_id" => intval($gameUser->intake_id),
+                    "game_intake_code" => $gameUser->intake_code,
+                    "game_intake_name" => $gameUser->intake_name,
+                    "game_active_week" => $gameUser->intake_active_week,
+                    "email" => $gameUser->email,
+                    "name" => $displayName,
+                    "company_name" => $gameUser->intake_name,
+                    "gender" => $gameUser->gender,
+                    "location" => $gameUser->location,
+                    "languages" => $languages,
+                    "address_1" => null,
+                    "address_2" => null,
+                    "address_3" => null,
+                    "city" => $gameUser->city,
+                    "state" => $gameUser->state,
+                    "postcode" => $gameUser->postcode,
+                    "phone_no" => $gameUser->phone_no,
+                    "updated_at" => $gameUser->updated_at,
+                    "updated_by" => $gameUser->updated_by,
+                    "current_time" => $currentDate,
+                ], 200)->header('Access-Control-Allow-Origin', '*');
             }
         }
 
@@ -599,6 +733,7 @@ class CustomController extends Controller
         $username  = $request->input('username');
         $google_id = $request->input('google_id');
         $method    = $request->input('method');
+        $loginContext = $request->input('login_context', 'staff');
         $currentDate = Carbon::now();
         $userAgent = $request->header('User-Agent');
 
@@ -612,59 +747,12 @@ class CustomController extends Controller
 
         $emailExists = DB::table($table_name)->where('email', $email)->exists();
 
-        // --- New Google OAuth user registration ---
+        // Google OAuth is lookup-only. Staff and student records must already exist.
         if (! $emailExists && $method === "Google OAuth") {
-            $password = $google_id;
-            $inserted = DB::table($table_name)->insert([
-                'email' => $email,
-                'password' => bcrypt($google_id),
-                'name' => $name,
-                'profile_image' => $picture,
-                'role_name' => 'creator',
-                'role_id' => 2,
-                'google_id' => $google_id,
-                'created_at' => now(),
-                'updated_at' => $currentDate,
-            ]);
-
-            if ($inserted) {
-                $userId = DB::getPdo()->lastInsertId();
-                $custno = $userId + 100000;
-
-                DB::table($table_name)
-                    ->where('id', $userId)
-                    ->update([
-                        'custno' => $custno,
-                        'updated_at' => $currentDate,
-                    ]);
-
-                DB::table($login_log_table)->insert([
-                    'email'         => $email,
-                    'custno'        => $custno,
-                    'name'          => $name,
-                    'created_at'    => now(),
-                    'ip_address'    => $realIp,
-                    'ip_address_v4' => $ipAddressV4,
-                    'ip_address_v6' => $ipAddressV6,
-                    'user_country'  => $lxCountry,
-                    'user_region'   => $lxRegion,
-                    'user_city'     => $lxCity,
-                    'user_ZipCode'  => $lxZipCode,
-                    'user_timezone' => $lxTimezone,
-                    'user_agent'    => $userAgent,
-                ]);
-
-                return response()->json([
-                    'outcome' => 'SUCCESS: New User successfully added!!!',
-                    'custno' => $custno,
-                    'role_name' => 'creator',
-                    'email' => $email,
-                    'name' => $name,
-                    'google_id' => $google_id,
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ], 200);
-            }
+            return response()->json([
+                'outcome' => 'LOGIN_DENIED',
+                'errors' => 'This Google account is not registered for staff access or a class intake.',
+            ], 403);
         }
 
         // --- Existing user login ---
@@ -691,6 +779,13 @@ class CustomController extends Controller
                 return response()->json(['error' => 'Invalid password'], 401);
             }
 
+            if ($loginContext === 'student') {
+                return response()->json([
+                    'outcome' => 'STAFF_ACCOUNT_USED_ON_STUDENT_LOGIN',
+                    'errors' => 'This is a staff account. Please use Staff Login.',
+                ], 403);
+            }
+
             if ($user->status === 'BANNED') {
                 return response()->json([
                     'errors' => 'Your account has been banned.'
@@ -709,10 +804,11 @@ class CustomController extends Controller
 
             // Log the login
             DB::table($login_log_table)->insert([
-                'email'         => $email,
-                'custno'        => $custno,
-                'name'          => $name,
-                'created_at'    => now(),
+                    'email'         => $email,
+                    'custno'        => $custno,
+                    'name'          => $name,
+                    'login_identity_type' => 'staff',
+                    'created_at'    => now(),
                 'ip_address'    => $realIp,
                 'ip_address_v4' => $ipAddressV4,
                 'ip_address_v6' => $ipAddressV6,
@@ -762,6 +858,88 @@ class CustomController extends Controller
                 'name' => $user->name,
                 'user_agent' => $userAgent,
             ], 200);
+        }
+
+        if ($loginContext === 'student') {
+            $gameUser = DB::table('game_users')
+                ->join('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+                ->where('game_users.email', $email)
+                ->select(
+                    'game_users.*',
+                    'game_intakes.code as intake_code',
+                    'game_intakes.name as intake_name',
+                    'game_intakes.active_week as intake_active_week'
+                )
+                ->first();
+
+            if ($gameUser) {
+                if (! $gameUser->password || ! Hash::check($request->password, $gameUser->password)) {
+                    return response()->json([
+                        'outcome' => 'STUDENT_INVALID_PASSWORD',
+                        'errors' => 'Invalid student email or password.',
+                    ], 401);
+                }
+
+                if ($gameUser->game_status === 'banned') {
+                    return response()->json([
+                        'outcome' => 'STUDENT_LOGIN_DENIED',
+                        'errors' => 'Your class intake account has been banned.',
+                    ], 403);
+                }
+
+                $studentCustno = 900000 + (int) $gameUser->id;
+                $studentName = $gameUser->display_name ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname);
+
+                DB::table('game_users')->where('id', $gameUser->id)->update([
+                    'last_login_at' => now(),
+                    'updated_at' => now(),
+                ]);
+
+                DB::table($login_log_table)->insert([
+                    'email'         => $email,
+                    'custno'        => $studentCustno,
+                    'name'          => $studentName,
+                    'login_identity_type' => 'student',
+                    'created_at'    => now(),
+                    'ip_address'    => $realIp,
+                    'ip_address_v4' => $ipAddressV4,
+                    'ip_address_v6' => $ipAddressV6,
+                    'user_country'  => $lxCountry,
+                    'user_region'   => $lxRegion,
+                    'user_city'     => $lxCity,
+                    'user_ZipCode'  => $lxZipCode,
+                    'user_timezone' => $lxTimezone,
+                    'user_agent'    => $userAgent,
+                ]);
+
+                return response()->json([
+                    'outcome' => 'SUCCESS: Student game user successfully extracted.',
+                    'id' => $gameUser->id,
+                    'custno' => $studentCustno,
+                    'profile_image' => $gameUser->profile_image,
+                    'google_id' => null,
+                    'role' => $gameUser->game_role,
+                    'role_name' => $gameUser->game_role,
+                    'email' => $gameUser->email,
+                    'name' => $studentName,
+                    'username' => $gameUser->email,
+                    'identity_type' => 'student',
+                    'is_system_user' => false,
+                    'is_game_user' => true,
+                    'game_user_id' => $gameUser->id,
+                    'game_intake_id' => $gameUser->intake_id,
+                    'game_intake_code' => $gameUser->intake_code,
+                    'game_intake_name' => $gameUser->intake_name,
+                    'game_active_week' => $gameUser->intake_active_week,
+                    'must_change_password' => (int) $gameUser->must_change_password === 1,
+                    'user_agent' => $userAgent,
+                ], 200);
+            }
+
+            return response()->json([
+                'outcome' => 'STUDENT_ACCOUNT_NOT_FOUND',
+                'errors' => 'No class intake account was found for this email address.',
+            ], 404);
         }
 
         // Catch-all fallback
@@ -909,6 +1087,8 @@ class CustomController extends Controller
                 "city"          => $user->city,
                 "role_id"       => intval($user->role_id),
                 "role_name"     => $user->role_name,
+                "is_system_user" => (bool) $user->is_system_user,
+                "is_game_user"   => (bool) $user->is_game_user,
                 "postcode"      => $user->postcode,
                 "phone_no"      => $user->phone_no,
                 "profile_image" => $user->profile_image,
@@ -990,6 +1170,8 @@ class CustomController extends Controller
             "city"          => $user->city,
             "role_id"       => intval($user->role_id),
             "role_name"     => $user->role_name,
+            "is_system_user" => (bool) $user->is_system_user,
+            "is_game_user"   => (bool) $user->is_game_user,
             "postcode"      => $user->postcode,
             "phone_no"      => $user->phone_no,
             "profile_image" => $user->profile_image,
@@ -1096,6 +1278,8 @@ class CustomController extends Controller
                 "city"          => $user->city,
                 "role_id"       => intval($user->role_id),
                 "role_name"     => $user->role_name,
+                "is_system_user" => (bool) $user->is_system_user,
+                "is_game_user"   => (bool) $user->is_game_user,
                 "postcode"      => $user->postcode,
                 "phone_no"      => $user->phone_no,
                 "profile_image" => $user->profile_image,
@@ -1139,24 +1323,31 @@ class CustomController extends Controller
         switch ($method) {
             case 'single user':
                 $login_history_list = DB::table('user_login_history')
-                    ->join('users', 'user_login_history.email', '=', 'users.email')
+                    ->leftJoin('users', 'user_login_history.email', '=', 'users.email')
+                    ->leftJoin('game_users', 'user_login_history.email', '=', 'game_users.email')
                     ->where('user_login_history.email', $email)
                     ->select(
                         'user_login_history.*',
-                        'users.google_id'
+                        'users.google_id',
+                        DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image')
                     )
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->get();
 
                 break;
 
-            case 'Google Logins Only':
+            case 'Staff Logins':
                 $login_history_list = DB::table('user_login_history')
-                    ->join('users', 'user_login_history.email', '=', 'users.email')
-                    ->whereNotNull('users.google_id')
+                    ->leftJoin('users', 'user_login_history.email', '=', 'users.email')
+                    ->leftJoin('game_users', 'user_login_history.email', '=', 'game_users.email')
+                    ->where(function ($query) {
+                        $query->where('user_login_history.login_identity_type', 'staff')
+                            ->orWhereNull('user_login_history.login_identity_type');
+                    })
                     ->select(
                         'user_login_history.*',
-                        'users.google_id'
+                        'users.google_id',
+                        DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image')
                     )
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->limit(100)
@@ -1164,13 +1355,15 @@ class CustomController extends Controller
 
                 break;
 
-            case 'Manual Logins Only':
+            case 'Student Logins':
                 $login_history_list = DB::table('user_login_history')
-                    ->join('users', 'user_login_history.email', '=', 'users.email')
-                    ->whereNull('users.google_id')
+                    ->leftJoin('users', 'user_login_history.email', '=', 'users.email')
+                    ->leftJoin('game_users', 'user_login_history.email', '=', 'game_users.email')
+                    ->where('user_login_history.login_identity_type', 'student')
                     ->select(
                         'user_login_history.*',
-                        'users.google_id'
+                        'users.google_id',
+                        DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image')
                     )
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->limit(100)
@@ -1180,10 +1373,12 @@ class CustomController extends Controller
 
             default:
                 $login_history_list = DB::table('user_login_history')
-                    ->join('users', 'user_login_history.email', '=', 'users.email')
+                    ->leftJoin('users', 'user_login_history.email', '=', 'users.email')
+                    ->leftJoin('game_users', 'user_login_history.email', '=', 'game_users.email')
                     ->select(
                         'user_login_history.*',
-                        'users.google_id'
+                        'users.google_id',
+                        DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image')
                     )
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->limit(100)
@@ -1212,6 +1407,7 @@ class CustomController extends Controller
                     "custno" => $row->custno,
                     "email" => $row->email,
                     "name" => $row->name,
+                    "login_identity_type" => $row->login_identity_type ?? 'staff',
                     "ip_address" => $row->ip_address,
                     "ip_address_v4" => $row->ip_address_v4,
                     "ip_address_v6" => $row->ip_address_v6,
@@ -1222,6 +1418,7 @@ class CustomController extends Controller
                     "user_agent" => $row->user_agent,
                     "created_at" => $row->created_at,
                     "google_id" => $row->google_id,
+                    "profile_image" => $row->profile_image ?? null,
                 ],
             ];
         });
@@ -1463,6 +1660,8 @@ class CustomController extends Controller
             'name'             => 'nullable|string|max:255',
             'role_id'          => 'nullable|integer',
             'role_name'        => 'nullable|string|max:255',
+            'is_system_user'   => 'nullable|boolean',
+            'is_game_user'     => 'nullable|boolean',
             'company_name'     => 'nullable|string|max:255',
             'gender'           => 'nullable|string|max:50',
             'location'         => 'nullable|string|max:255',
@@ -1555,6 +1754,12 @@ if ($validator->fails()) {
             $user->email        = $data['email'] ?? $user->email;
             $user->role_id      = $data['role_id'] ?? $user->role_id;
             $user->role_name    = $data['role_name'] ?? $user->role_name;
+            if (array_key_exists('is_system_user', $data)) {
+                $user->is_system_user = (bool) $data['is_system_user'];
+            }
+            if (array_key_exists('is_game_user', $data)) {
+                $user->is_game_user = (bool) $data['is_game_user'];
+            }
             $user->company_name = $data['company_name'] ?? $user->company_name;
             $user->gender       = $data['gender'] ?? $user->gender;
             $user->location     = $data['location'] ?? $user->location;
@@ -1607,6 +1812,8 @@ if ($validator->fails()) {
                 "city"          => $user->city,
                 "role_id"       => intval($user->role_id),
                 "role_name"     => $user->role_name,
+                "is_system_user" => (bool) $user->is_system_user,
+                "is_game_user"   => (bool) $user->is_game_user,
                 "postcode"      => $user->postcode,
                 "phone_no"      => $user->phone_no,
                 "profile_image" => $user->profile_image,
@@ -1621,6 +1828,240 @@ if ($validator->fails()) {
         }
 
         return response()->json($response, 200);
+    }
+
+    public function F0_VMD_update_game_user_basic_info(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'id' => 'required|integer',
+            'email' => 'required|email',
+            'name' => 'required|string|max:255',
+            'gender' => 'nullable|string|max:50',
+            'location' => 'nullable|string|max:255',
+            'phone_no' => 'nullable|string|max:50',
+            'languages' => 'nullable|array',
+            'languages.*' => 'string|max:100',
+            'role_name' => 'nullable|string|max:50',
+            'vmd_user_email' => 'required|email',
+            'vmd_user_name' => 'required|string|max:255',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 409);
+        }
+
+        $data = $validator->validated();
+        $gameUser = DB::table('game_users')
+            ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+            ->where('game_users.id', $data['id'])
+            ->select(
+                'game_users.*',
+                'game_intakes.code as intake_code',
+                'game_intakes.name as intake_name',
+                'game_intakes.active_week as intake_active_week'
+            )
+            ->first();
+
+        if (! $gameUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Game user not found.',
+            ], 404);
+        }
+
+        $isSelfUpdate = strcasecmp($gameUser->email, $data['email']) === 0
+            && strcasecmp($gameUser->email, $data['vmd_user_email']) === 0;
+
+        if (strcasecmp($gameUser->email, $data['email']) !== 0 || (! $isSelfUpdate && ! $this->canManageGameUsers($data['vmd_user_email']))) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin or Protector.',
+            ], 403);
+        }
+
+        DB::table('game_users')->where('id', $data['id'])->update([
+            'display_name' => $data['name'],
+            'gender' => $data['gender'] ?? null,
+            'location' => $data['location'] ?? null,
+            'phone_no' => $data['phone_no'] ?? null,
+            'languages' => json_encode($data['languages'] ?? []),
+            'game_role' => $data['role_name'] ?? $gameUser->game_role,
+            'updated_by' => $data['vmd_user_email'],
+            'updated_at' => now(),
+        ]);
+
+        $updatedGameUser = DB::table('game_users')
+            ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+            ->where('game_users.id', $data['id'])
+            ->select(
+                'game_users.*',
+                'game_intakes.code as intake_code',
+                'game_intakes.name as intake_name',
+                'game_intakes.active_week as intake_active_week'
+            )
+            ->first();
+
+        $languages = [];
+        if (! empty($updatedGameUser->languages)) {
+            $decodedLanguages = json_decode($updatedGameUser->languages, true);
+            $languages = is_array($decodedLanguages) ? $decodedLanguages : [];
+        }
+
+        $displayName = $updatedGameUser->display_name
+            ?: trim(($updatedGameUser->preferred_name ?: $updatedGameUser->first_name) . ' ' . $updatedGameUser->surname);
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'message' => 'Student basic info updated successfully.',
+            'updated_details' => [
+                'id' => intval($updatedGameUser->id),
+                'custno' => 900000 + intval($updatedGameUser->id),
+                'profile_image' => $updatedGameUser->profile_image,
+                'role_id' => null,
+                'role_name' => $updatedGameUser->game_role,
+                'status' => $updatedGameUser->game_status,
+                'is_system_user' => false,
+                'is_game_user' => true,
+                'identity_type' => 'student',
+                'game_user_id' => intval($updatedGameUser->id),
+                'game_intake_id' => intval($updatedGameUser->intake_id),
+                'game_intake_code' => $updatedGameUser->intake_code,
+                'game_intake_name' => $updatedGameUser->intake_name,
+                'game_active_week' => $updatedGameUser->intake_active_week,
+                'email' => $updatedGameUser->email,
+                'name' => $displayName,
+                'company_name' => $updatedGameUser->intake_name,
+                'gender' => $updatedGameUser->gender,
+                'location' => $updatedGameUser->location,
+                'languages' => $languages,
+                'address_1' => null,
+                'address_2' => null,
+                'address_3' => null,
+                'city' => $updatedGameUser->city,
+                'state' => $updatedGameUser->state,
+                'postcode' => $updatedGameUser->postcode,
+                'phone_no' => $updatedGameUser->phone_no,
+                'updated_at' => $updatedGameUser->updated_at,
+                'updated_by' => $updatedGameUser->updated_by,
+            ],
+        ], 200);
+    }
+
+    public function F0_VMD_update_game_user_password(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'id' => 'required|integer',
+            'password' => 'required|string|min:8|max:255',
+            'password_confirmation' => 'required|string|same:password',
+            'vmd_user_email' => 'required|email',
+            'vmd_user_name' => 'required|string|max:255',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 409);
+        }
+
+        $data = $validator->validated();
+        $gameUser = DB::table('game_users')->where('id', $data['id'])->first();
+
+        if (! $gameUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Game user not found.',
+            ], 404);
+        }
+
+        if (strcasecmp($gameUser->email, $data['vmd_user_email']) !== 0) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: You can only change your own student password.',
+            ], 403);
+        }
+
+        DB::table('game_users')->where('id', $data['id'])->update([
+            'password' => bcrypt($data['password']),
+            'must_change_password' => false,
+            'updated_by' => $data['vmd_user_email'],
+            'updated_at' => now(),
+        ]);
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'message' => 'Student password updated successfully.',
+            'must_change_password' => false,
+        ], 200);
+    }
+
+    private function updateGameUserStatus(Request $request, string $status, string $message)
+    {
+        $validator = Validator::make($request->all(), [
+            'id' => 'required|integer',
+            'vmd_user_email' => 'required|email',
+            'vmd_user_name' => 'required|string|max:255',
+            'vmd_audit_reason' => 'nullable|string|max:255',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 409);
+        }
+
+        $data = $validator->validated();
+
+        if (! $this->canManageGameUsers($data['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Admin or Protector access required.',
+            ], 403);
+        }
+
+        $gameUser = DB::table('game_users')->where('id', $data['id'])->first();
+
+        if (! $gameUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Game user not found.',
+            ], 404);
+        }
+
+        DB::table('game_users')->where('id', $data['id'])->update([
+            'game_status' => $status,
+            'updated_by' => $data['vmd_user_email'],
+            'updated_at' => now(),
+        ]);
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'message' => $message,
+            'game_user_id' => intval($data['id']),
+            'game_status' => $status,
+        ], 200);
+    }
+
+    public function F0_VMD_ban_game_user(Request $request)
+    {
+        return $this->updateGameUserStatus($request, 'BANNED', 'Game user banned successfully.');
+    }
+
+    public function F0_VMD_unban_game_user(Request $request)
+    {
+        return $this->updateGameUserStatus($request, 'ACTIVE', 'Game user unbanned successfully.');
+    }
+
+    public function F0_VMD_delete_game_user(Request $request)
+    {
+        return $this->updateGameUserStatus($request, 'DELETED', 'Game user deleted successfully.');
     }
 
 
@@ -1716,6 +2157,229 @@ if ($validator->fails()) {
             'outcome' => 'SUCCESS: Dashboard settings updated.',
             'settings' => $this->dashboardSettingRows(),
         ]);
+    }
+
+    public function F0_VMD_get_user_table_baselines(Request $request)
+    {
+        $request->validate([
+            'vmd_user_email' => 'required|email',
+        ]);
+
+        if (!$this->isAdminEmail($request->input('vmd_user_email'))) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        $baselines = DB::table('user_table_baselines')
+            ->leftJoin('users', 'users.id', '=', 'user_table_baselines.created_by_user_id')
+            ->select(
+                'user_table_baselines.*',
+                'users.name as created_by_name',
+                'users.email as created_by_email'
+            )
+            ->orderBy('user_table_baselines.created_at', 'DESC')
+            ->get()
+            ->map(function ($baseline) {
+                $rowCount = DB::table('user_table_baseline_rows')
+                    ->where('baseline_id', $baseline->id)
+                    ->count();
+
+                return [
+                    'id' => $baseline->id,
+                    'name' => $baseline->name,
+                    'description' => $baseline->description,
+                    'is_active' => (bool) $baseline->is_active,
+                    'created_by_user_id' => $baseline->created_by_user_id,
+                    'created_by_name' => $baseline->created_by_name,
+                    'created_by_email' => $baseline->created_by_email,
+                    'row_count' => $rowCount,
+                    'created_at' => $baseline->created_at,
+                    'updated_at' => $baseline->updated_at,
+                ];
+            });
+
+        return response()->json([
+            'outcome' => 'SUCCESS: User table baselines loaded.',
+            'data' => $baselines,
+        ], 200);
+    }
+
+    public function F0_VMD_capture_user_table_baseline(Request $request)
+    {
+        $validated = $request->validate([
+            'vmd_user_email' => 'required|email',
+            'name' => 'nullable|string|max:255',
+            'description' => 'nullable|string|max:1000',
+        ]);
+
+        if (!$this->isAdminEmail($validated['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        $createdBy = DB::table('users')->where('email', $validated['vmd_user_email'])->first();
+        $baselineName = $validated['name'] ?? 'Users table baseline ' . now()->format('Y-m-d H:i:s');
+        $description = $validated['description'] ?? 'Captured from GMUI Users Table Baseline.';
+
+        $baselineId = DB::transaction(function () use ($baselineName, $description, $createdBy) {
+            DB::table('user_table_baselines')->update(['is_active' => false, 'updated_at' => now()]);
+
+            $baselineId = DB::table('user_table_baselines')->insertGetId([
+                'name' => $baselineName,
+                'description' => $description,
+                'is_active' => true,
+                'created_by_user_id' => $createdBy->id ?? null,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+            $users = DB::table('users')->orderBy('id')->get();
+
+            foreach ($users as $user) {
+                DB::table('user_table_baseline_rows')->insert([
+                    'baseline_id' => $baselineId,
+                    'user_id' => $user->id,
+                    'name' => $user->name ?? null,
+                    'email' => $user->email ?? null,
+                    'password' => $user->password ?? null,
+                    'profile_image' => $user->profile_image ?? null,
+                    'google_id' => $user->google_id ?? null,
+                    'custno' => $user->custno ?? null,
+                    'role_id' => $user->role_id ?? null,
+                    'role_name' => $user->role_name ?? null,
+                    'status' => $user->status ?? null,
+                    'updated_by' => $user->updated_by ?? null,
+                    'company_name' => $user->company_name ?? null,
+                    'gender' => $user->gender ?? null,
+                    'location' => $user->location ?? null,
+                    'phone_no' => $user->phone_no ?? null,
+                    'address_1' => $user->address_1 ?? null,
+                    'address_2' => $user->address_2 ?? null,
+                    'address_3' => $user->address_3 ?? null,
+                    'city' => $user->city ?? null,
+                    'state' => $user->state ?? null,
+                    'postcode' => $user->postcode ?? null,
+                    'is_system_user' => (bool) ($user->is_system_user ?? true),
+                    'is_game_user' => (bool) ($user->is_game_user ?? false),
+                    'home_intake_id' => $user->home_intake_id ?? null,
+                    'action_locked_until' => $user->action_locked_until ?? null,
+                    'action_locked_reason' => $user->action_locked_reason ?? null,
+                    'action_locked_by_user_id' => $user->action_locked_by_user_id ?? null,
+                    'snapshot' => json_encode($user),
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            }
+
+            return $baselineId;
+        });
+
+        $rowCount = DB::table('user_table_baseline_rows')->where('baseline_id', $baselineId)->count();
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Users table baseline captured.',
+            'baseline_id' => $baselineId,
+            'row_count' => $rowCount,
+        ], 200);
+    }
+
+    public function F0_VMD_restore_user_table_baseline(Request $request)
+    {
+        $validated = $request->validate([
+            'vmd_user_email' => 'required|email',
+            'baseline_id' => 'nullable|integer',
+        ]);
+
+        if (!$this->isAdminEmail($validated['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        $baseline = null;
+        if (!empty($validated['baseline_id'])) {
+            $baseline = DB::table('user_table_baselines')->where('id', $validated['baseline_id'])->first();
+        } else {
+            $baseline = DB::table('user_table_baselines')
+                ->where('is_active', true)
+                ->orderBy('created_at', 'DESC')
+                ->first();
+        }
+
+        if (!$baseline) {
+            return response()->json([
+                'outcome' => 'ERROR: Users table baseline not found.',
+            ], 404);
+        }
+
+        $result = DB::transaction(function () use ($baseline) {
+            $rows = DB::table('user_table_baseline_rows')->where('baseline_id', $baseline->id)->get();
+            $baselineUserIds = $rows->pluck('user_id')->map(fn ($id) => (int) $id)->all();
+            $deleted = DB::table('users')->whereNotIn('id', $baselineUserIds)->delete();
+            $updated = 0;
+            $created = 0;
+
+            foreach ($rows as $row) {
+                $values = [
+                    'custno' => $row->custno,
+                    'name' => $row->name,
+                    'role_id' => $row->role_id,
+                    'role_name' => $row->role_name,
+                    'status' => $row->status,
+                    'email' => $row->email,
+                    'password' => $row->password,
+                    'is_system_user' => (bool) $row->is_system_user,
+                    'is_game_user' => (bool) $row->is_game_user,
+                    'home_intake_id' => $row->home_intake_id,
+                    'action_locked_until' => $row->action_locked_until,
+                    'action_locked_reason' => $row->action_locked_reason,
+                    'action_locked_by_user_id' => $row->action_locked_by_user_id,
+                    'updated_by' => $row->updated_by,
+                    'google_id' => $row->google_id,
+                    'profile_image' => $row->profile_image,
+                    'company_name' => $row->company_name,
+                    'gender' => $row->gender,
+                    'location' => $row->location,
+                    'address_1' => $row->address_1,
+                    'address_2' => $row->address_2,
+                    'address_3' => $row->address_3,
+                    'city' => $row->city,
+                    'state' => $row->state,
+                    'postcode' => $row->postcode,
+                    'phone_no' => $row->phone_no,
+                ];
+
+                if (DB::table('users')->where('id', $row->user_id)->exists()) {
+                    DB::table('users')->where('id', $row->user_id)->update($values);
+                    $updated += 1;
+                } else {
+                    DB::table('users')->insert(array_merge([
+                        'id' => $row->user_id,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ], $values));
+                    $created += 1;
+                }
+            }
+
+            return [
+                'deleted' => $deleted,
+                'updated' => $updated,
+                'created' => $created,
+                'total' => $rows->count(),
+            ];
+        });
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Users table exactly restored from baseline.',
+            'baseline_id' => $baseline->id,
+            'restored_rows' => $result['total'],
+            'updated_rows' => $result['updated'],
+            'created_rows' => $result['created'],
+            'deleted_extra_rows' => $result['deleted'],
+        ], 200);
     }
 
 
@@ -1849,12 +2513,18 @@ if ($validator->fails()) {
             'vmd_user.id' => 'required|integer',
             'vmd_user.email' => 'required|email',
             'vmd_user.name' => 'nullable|string|max:255',
+            'vmd_user.is_game_user' => 'nullable|boolean',
+            'vmd_user.identity_type' => 'nullable|string|max:30',
+            'vmd_user.game_user_id' => 'nullable|integer',
             'current_path' => 'nullable|string|max:500',
             'client_sent_at' => 'nullable|string|max:80',
         ]);
 
         $userPayload = $validated['vmd_user'];
         $email = $userPayload['email'];
+        $isGameUser = (bool) ($userPayload['is_game_user'] ?? false)
+            || (($userPayload['identity_type'] ?? null) === 'student')
+            || ! empty($userPayload['game_user_id']);
 
         if ($email === 'member@jsonapi.com') {
             return response()->json([
@@ -1864,25 +2534,57 @@ if ($validator->fails()) {
             ], 200);
         }
 
-        $user = DB::table('users')
-            ->where('id', $userPayload['id'])
-            ->where('email', $email)
-            ->first();
+        $identityType = $isGameUser ? 'student' : 'staff';
+        $user = null;
+        $gameUser = null;
 
-        if (!$user) {
-            return response()->json([
-                'ok' => false,
-                'recorded' => false,
-                'reason' => 'user_not_found',
-            ], 404);
-        }
+        if ($isGameUser) {
+            $gameUserQuery = DB::table('game_users')->where('email', $email);
 
-        if (in_array($user->status, ['BANNED', 'DELETED'], true)) {
-            return response()->json([
-                'ok' => true,
-                'recorded' => false,
-                'reason' => 'inactive_user_ignored',
-            ], 200);
+            if (! empty($userPayload['game_user_id'])) {
+                $gameUserQuery->where('id', $userPayload['game_user_id']);
+            } else {
+                $gameUserQuery->where('id', $userPayload['id']);
+            }
+
+            $gameUser = $gameUserQuery->first();
+
+            if (! $gameUser) {
+                return response()->json([
+                    'ok' => false,
+                    'recorded' => false,
+                    'reason' => 'game_user_not_found',
+                ], 404);
+            }
+
+            if (in_array($gameUser->game_status, ['BANNED', 'DELETED'], true)) {
+                return response()->json([
+                    'ok' => true,
+                    'recorded' => false,
+                    'reason' => 'inactive_game_user_ignored',
+                ], 200);
+            }
+        } else {
+            $user = DB::table('users')
+                ->where('id', $userPayload['id'])
+                ->where('email', $email)
+                ->first();
+
+            if (! $user) {
+                return response()->json([
+                    'ok' => false,
+                    'recorded' => false,
+                    'reason' => 'user_not_found',
+                ], 404);
+            }
+
+            if (in_array($user->status, ['BANNED', 'DELETED'], true)) {
+                return response()->json([
+                    'ok' => true,
+                    'recorded' => false,
+                    'reason' => 'inactive_user_ignored',
+                ], 200);
+            }
         }
 
         $realIp = $request->header('X-Forwarded-For');
@@ -1903,11 +2605,19 @@ if ($validator->fails()) {
         }
 
         $now = Carbon::now();
-        $presence = DB::table('user_presence')->where('user_id', $user->id)->first();
+        $presenceKey = $isGameUser ? 'student:' . $gameUser->id : 'staff:' . $user->id;
+        $presence = DB::table('user_presence')->where('presence_key', $presenceKey)->first();
+        $displayName = $isGameUser
+            ? ($gameUser->display_name ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname))
+            : $user->name;
 
         $presenceData = [
-            'email' => $user->email,
-            'name' => $user->name,
+            'identity_type' => $identityType,
+            'user_id' => $isGameUser ? null : $user->id,
+            'game_user_id' => $isGameUser ? $gameUser->id : null,
+            'presence_key' => $presenceKey,
+            'email' => $isGameUser ? $gameUser->email : $user->email,
+            'name' => $displayName,
             'ip_address' => $realIp,
             'user_agent' => $request->header('User-Agent'),
             'current_path' => $validated['current_path'] ?? null,
@@ -1918,9 +2628,8 @@ if ($validator->fails()) {
 
         if ($presence) {
             $presenceData['heartbeat_count'] = DB::raw('heartbeat_count + 1');
-            DB::table('user_presence')->where('user_id', $user->id)->update($presenceData);
+            DB::table('user_presence')->where('presence_key', $presenceKey)->update($presenceData);
         } else {
-            $presenceData['user_id'] = $user->id;
             $presenceData['heartbeat_count'] = 1;
             $presenceData['created_at'] = $now;
             DB::table('user_presence')->insert($presenceData);
@@ -1929,8 +2638,11 @@ if ($validator->fails()) {
         return response()->json([
             'ok' => true,
             'recorded' => true,
-            'user_id' => $user->id,
-            'email' => $user->email,
+            'identity_type' => $identityType,
+            'user_id' => $isGameUser ? null : $user->id,
+            'game_user_id' => $isGameUser ? $gameUser->id : null,
+            'presence_key' => $presenceKey,
+            'email' => $isGameUser ? $gameUser->email : $user->email,
             'online_window_seconds' => 120,
             'server_seen_at' => $now->toDateTimeString(),
         ], 200);
@@ -1944,15 +2656,33 @@ if ($validator->fails()) {
         $serverTime = Carbon::now();
 
         $onlineUsers = DB::table('user_presence')
-            ->join('users', 'user_presence.user_id', '=', 'users.id')
+            ->leftJoin('users', function ($join) {
+                $join->on('user_presence.user_id', '=', 'users.id')
+                    ->where('user_presence.identity_type', '=', 'staff');
+            })
+            ->leftJoin('game_users', function ($join) {
+                $join->on('user_presence.game_user_id', '=', 'game_users.id')
+                    ->where('user_presence.identity_type', '=', 'student');
+            })
             ->where('user_presence.last_seen_at', '>=', $cutoff)
             ->where(function ($query) {
-                $query->whereNull('users.status')
-                    ->orWhereNotIn('users.status', ['BANNED', 'DELETED']);
+                $query->where(function ($staffQuery) {
+                    $staffQuery->where('user_presence.identity_type', 'staff')
+                        ->where('users.email', '<>', 'member@jsonapi.com')
+                        ->where(function ($statusQuery) {
+                            $statusQuery->whereNull('users.status')
+                                ->orWhereNotIn('users.status', ['BANNED', 'DELETED']);
+                        });
+                })->orWhere(function ($studentQuery) {
+                    $studentQuery->where('user_presence.identity_type', 'student')
+                        ->whereNotIn('game_users.game_status', ['BANNED', 'DELETED']);
+                });
             })
-            ->where('users.email', '<>', 'member@jsonapi.com')
             ->select(
+                'user_presence.identity_type',
                 'user_presence.user_id',
+                'user_presence.game_user_id',
+                'user_presence.presence_key',
                 'user_presence.email',
                 'user_presence.name',
                 'user_presence.current_path',

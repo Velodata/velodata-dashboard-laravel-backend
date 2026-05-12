@@ -29,11 +29,19 @@ Route::prefix('v2')->group(function () {
     Route::post('/VMD-mark-notifications-read', [CustomController::class, 'F0_VMD_mark_notifications_read']);
     Route::post('/VMD-clear-notifications', [CustomController::class, 'F0_VMD_clear_notifications']);
     Route::match(['get', 'post'], '/VMD-updateUser', [CustomController::class, 'F0_VMD_updateUser']);
+    Route::post('/VMD-update-game-user-basic-info', [CustomController::class, 'F0_VMD_update_game_user_basic_info']);
+    Route::post('/VMD-update-game-user-password', [CustomController::class, 'F0_VMD_update_game_user_password']);
+    Route::post('/VMD-ban-game-user', [CustomController::class, 'F0_VMD_ban_game_user']);
+    Route::post('/VMD-unban-game-user', [CustomController::class, 'F0_VMD_unban_game_user']);
+    Route::post('/VMD-delete-game-user', [CustomController::class, 'F0_VMD_delete_game_user']);
     Route::match(['get', 'post'], '/VMD-ban-user', [CustomController::class, 'F0_VMD_ban_user']);
     Route::post('/VMD-unbanUser', [CustomController::class, 'F0_VMD_unbanUser']);
     Route::match(['get', 'post'], '/VMD-delete-user', [CustomController::class, 'F0_VMD_delete_user']);
     Route::post('/VMD-get-dashboard-settings', [CustomController::class, 'F0_VMD_get_dashboard_settings']);
     Route::post('/VMD-update-dashboard-settings', [CustomController::class, 'F0_VMD_update_dashboard_settings']);
+    Route::post('/VMD-get-user-table-baselines', [CustomController::class, 'F0_VMD_get_user_table_baselines']);
+    Route::post('/VMD-capture-user-table-baseline', [CustomController::class, 'F0_VMD_capture_user_table_baseline']);
+    Route::post('/VMD-restore-user-table-baseline', [CustomController::class, 'F0_VMD_restore_user_table_baseline']);
     Route::match(['get', 'post'], '/VMD-verify-2fa', [CustomController::class, 'F0_VMD_verify_2fa_code']);
     Route::match(['get', 'post'], '/VMD-resend-2fa', [CustomController::class, 'F0_VMD_resend_2fa']);
 
@@ -52,6 +60,7 @@ Route::prefix('v2')->group(function () {
     Route::get('users/{user}/roles', [UserController::class, 'getRoles'])->name('users.roles');
     Route::get('users/{user}/relationships/roles', [UserController::class, 'rolesRelationship'])->name('users.relationships.roles');
     Route::post('uploads/users/{id}/profile-image', [UserController::class, 'uploadProfileImage']);
+    Route::post('uploads/game-users/{id}/profile-image', [UserController::class, 'uploadGameUserProfileImage']);
 
     // --- Permissions ---
     Route::apiResource('permissions', PermissionController::class);

@@ -34,6 +34,12 @@ class User extends Authenticatable
         'email',
         'profile_image',
         'role_id', // Allow mass assignment for role_id
+        'is_system_user',
+        'is_game_user',
+        'home_intake_id',
+        'action_locked_until',
+        'action_locked_reason',
+        'action_locked_by_user_id',
         // 'role_name', // This may not be needed if you're not directly storing it
     ];
 
@@ -45,7 +51,14 @@ class User extends Authenticatable
     protected $dates = [
         'created_at',
         'updated_at',
+        'action_locked_until',
         // Add any other date fields here
+    ];
+
+    protected $casts = [
+        'is_system_user' => 'boolean',
+        'is_game_user' => 'boolean',
+        'action_locked_until' => 'datetime',
     ];
 
     // Relationships
@@ -56,5 +69,18 @@ class User extends Authenticatable
         return $this->belongsTo(Role::class, 'role_id', 'id');
     }
 
-    // Optionally, if there are other relationships, you can define them here
+    public function homeIntake()
+    {
+        return $this->belongsTo(GameIntake::class, 'home_intake_id');
+    }
+
+    public function actionLockedBy()
+    {
+        return $this->belongsTo(User::class, 'action_locked_by_user_id');
+    }
+
+    public function actionLockedUsers()
+    {
+        return $this->hasMany(User::class, 'action_locked_by_user_id');
+    }
 }
