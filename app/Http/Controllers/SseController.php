@@ -42,6 +42,8 @@ class SseController extends Controller
     public function profileUpdates(Request $request)
     {
         $email = $request->header('X-User-Email') ?: $request->query('email');
+        $identityType = strtolower((string) $request->query('identity_type', 'staff'));
+        $gameUserId = $request->query('game_user_id');
         $origin = $request->headers->get('Origin');
         $allowedOrigins = array_filter(array_map('trim', explode(',', env('SSE_ALLOWED_ORIGINS', ''))));
 
@@ -61,10 +63,11 @@ class SseController extends Controller
             $headers['Access-Control-Allow-Credentials'] = 'true';
         }
 
-        return response()->stream(function () use ($email) {
+        return response()->stream(function () use ($email, $identityType, $gameUserId) {
             set_time_limit(0);
             $lastUpdated = null;
-            $canReceiveSecurityEvents = $this->canReceiveProtectedSecurityEvents($email);
+            $canReceiveSecurityEvents = $identityType !== 'student'
+                && $this->canReceiveProtectedSecurityEvents($email);
             $lastSecurityAuditId = $canReceiveSecurityEvents ? optional($this->getLatestProtectedSecurityAudit())->id : null;
 
             while (true) {
@@ -72,7 +75,10 @@ class SseController extends Controller
                     break;
                 }
 
-                $user = DB::table('users')->where('email', $email)->first();
+                $user = $identityType === 'student'
+                    ? null
+                    : DB::table('users')->where('email', $email)->first();
+                $gameUser = null;
 
                 if ($user) {
                     if ($lastUpdated === null) {
@@ -87,10 +93,57 @@ class SseController extends Controller
                             'status' => $user->status,
                             'role_id' => $user->role_id,
                             'role_name' => $user->role_name,
+                            'profile_image' => $user->profile_image,
                             'updated_by' => $user->updated_by,
+                            'identity_type' => 'staff',
                         ]) . "\n\n";
 
                         $lastUpdated = $user->updated_at;
+                    }
+                } else {
+                    $gameUserQuery = DB::table('game_users')
+                        ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+                        ->select(
+                            'game_users.*',
+                            'game_intakes.code as intake_code',
+                            'game_intakes.name as intake_name',
+                            'game_intakes.active_week as intake_active_week'
+                        );
+
+                    if ($gameUserId) {
+                        $gameUserQuery
+                            ->where('game_users.id', $gameUserId)
+                            ->where('game_users.email', $email);
+                    } else {
+                        $gameUserQuery->where('game_users.email', $email);
+                    }
+
+                    $gameUser = $gameUserQuery->first();
+
+                    if ($gameUser) {
+                        if ($lastUpdated === null) {
+                            $lastUpdated = $gameUser->updated_at;
+                        }
+
+                        if ($gameUser->updated_at !== $lastUpdated) {
+                            echo "event: profile.updated\n";
+                            echo 'data: ' . json_encode([
+                                'email' => $gameUser->email,
+                                'updated_at' => $gameUser->updated_at,
+                                'status' => strtoupper((string) $gameUser->game_status),
+                                'role_name' => $gameUser->game_role,
+                                'profile_image' => $gameUser->profile_image,
+                                'updated_by' => $gameUser->updated_by,
+                                'identity_type' => 'student',
+                                'game_user_id' => $gameUser->id,
+                                'game_intake_id' => $gameUser->intake_id,
+                                'game_intake_code' => $gameUser->intake_code,
+                                'game_intake_name' => $gameUser->intake_name,
+                                'game_active_week' => $gameUser->intake_active_week,
+                            ]) . "\n\n";
+
+                            $lastUpdated = $gameUser->updated_at;
+                        }
                     }
                 }
 

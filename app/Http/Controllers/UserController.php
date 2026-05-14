@@ -15,6 +15,66 @@ use Illuminate\Support\Str;
 
 class UserController extends Controller
 {
+    private function getAuditIpAddress(Request $request): string
+    {
+        $clientIpv4 = $request->input('vmd_ip_address_v4');
+        if ($clientIpv4 && filter_var($clientIpv4, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return $clientIpv4;
+        }
+
+        $clientIpv6 = $request->input('vmd_ip_address_v6');
+        if ($clientIpv6 && filter_var($clientIpv6, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            return $clientIpv6;
+        }
+
+        $headerIp = $request->header('CF-Connecting-IP')
+            ?: $request->header('X-Real-IP')
+            ?: $request->header('X-Forwarded-For');
+
+        if ($headerIp) {
+            foreach (explode(',', $headerIp) as $candidate) {
+                $candidate = trim($candidate);
+                if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                    return $candidate;
+                }
+            }
+
+            foreach (explode(',', $headerIp) as $candidate) {
+                $candidate = trim($candidate);
+                if (filter_var($candidate, FILTER_VALIDATE_IP)) {
+                    return $candidate;
+                }
+            }
+        }
+
+        $requestIp = $request->ip();
+        if ($requestIp === '::1' || $requestIp === '0:0:0:0:0:0:0:1') {
+            return '127.0.0.1';
+        }
+
+        return $requestIp ?: 'Unknown';
+    }
+
+    private function canManageGameUsers(?string $email): bool
+    {
+        if (! $email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+
+        if ($user) {
+            $roleName = $user->role_name ?: optional($user->roles()->first())->name;
+
+            return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+        }
+
+        $gameUser = GameUser::where('email', $email)->first();
+        $roleName = $gameUser?->game_role;
+
+        return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+    }
+
     // Get all users
     public function index(Request $request)
     {
@@ -34,10 +94,10 @@ class UserController extends Controller
             $included = $rolesResponse->getData()->data; // Extract the roles data
         }
 
-        $creatorRole = DB::table('roles')->whereRaw('LOWER(name) = ?', ['creator'])->first();
-        $memberRole = DB::table('roles')->whereRaw('LOWER(name) = ?', ['member'])->first();
-        $gameUserRoleId = (string) ($creatorRole->id ?? $memberRole->id ?? 3);
-        $gameUserRoleName = $creatorRole->name ?? $memberRole->name ?? 'Creator';
+        $rolesByName = DB::table('roles')
+            ->get()
+            ->keyBy(fn ($role) => strtolower($role->name));
+        $fallbackGameUserRole = $rolesByName->get('creator') ?: $rolesByName->get('member');
 
         $staffRows = $users->map(function ($user) {
             return [
@@ -97,9 +157,12 @@ class UserController extends Controller
                 ->orderBy('game_users.surname')
                 ->orderBy('game_users.first_name')
                 ->get()
-                ->map(function ($gameUser) use ($gameUserRoleId, $gameUserRoleName) {
+                ->map(function ($gameUser) use ($rolesByName, $fallbackGameUserRole) {
                     $displayName = $gameUser->display_name
                         ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname);
+                    $gameUserRoleName = $gameUser->game_role ?: ($fallbackGameUserRole->name ?? 'Creator');
+                    $gameUserRole = $rolesByName->get(strtolower($gameUserRoleName)) ?: $fallbackGameUserRole;
+                    $gameUserRoleId = (string) ($gameUserRole->id ?? 3);
 
                     return [
                         'type' => 'game_users',
@@ -363,14 +426,14 @@ class UserController extends Controller
             // and production uploads resolve via the production API host.
             $profileImageUrl = $request->getSchemeAndHttpHost() . $fileUrl;
             $user->profile_image = $profileImageUrl;
+            $user->updated_by = $request->input('vmd_user_email') ?: $user->updated_by;
             $user->save();
 
 
             // ***************************************************************************************************************
             // IJV - 2025.04.02 - we can assume the two identifier parameters are included because you must be logged in.
             // 
-            $realIp = $request->header('X-Forwarded-For');
-            $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
+            $realIp = $this->getAuditIpAddress($request);
 
             // Get vmd_user_email from the post data
             $createdByEmail = $request->input('vmd_user_email');
@@ -380,7 +443,7 @@ class UserController extends Controller
             DB::table('user_audit_history')->insert([
                 'custno' => $user->custno,
                 'dteprfmd' => now(),
-                'comments' => 'User created via New User function',
+                'comments' => $request->input('vmd_audit_reason') ?: 'Profile image updated',
                 'clerk_id' => $createdByName,
                 'created_by_email' => $createdByEmail,
                 'created_by_ip_address' => $realIp,
@@ -416,11 +479,22 @@ class UserController extends Controller
     {
         $request->validate([
             'attachment' => 'required|image|max:2048',
+            'vmd_user_email' => 'required|email',
         ]);
 
-        $path = "game-users/{$gameUserId}/profile-image";
+        $gameUser = GameUser::findOrFail($gameUserId);
+        $actorEmail = $request->input('vmd_user_email');
+        $isSelfUpdate = strcasecmp((string) $gameUser->email, (string) $actorEmail) === 0;
+
+        if (! $isSelfUpdate && ! $this->canManageGameUsers($actorEmail)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin or Protector.',
+            ], 403);
+        }
 
         try {
+            $path = "game-users/{$gameUserId}/profile-image";
             $filePath = Storage::disk('public')->put($path, $request->file('attachment'));
 
             if (!$filePath) {
@@ -434,11 +508,21 @@ class UserController extends Controller
             }
 
             $fileUrl = Storage::url($filePath);
-            $gameUser = GameUser::findOrFail($gameUserId);
             $profileImageUrl = $request->getSchemeAndHttpHost() . $fileUrl;
             $gameUser->profile_image = $profileImageUrl;
-            $gameUser->updated_by = $request->input('vmd_user_email');
+            $gameUser->updated_by = $actorEmail;
             $gameUser->save();
+
+            DB::table('user_audit_history')->insert([
+                'custno' => 900000 + intval($gameUser->id),
+                'dteprfmd' => now(),
+                'comments' => $request->input('vmd_audit_reason') ?: 'Profile image updated',
+                'clerk_id' => $request->input('vmd_user_name'),
+                'created_by_email' => $actorEmail,
+                'created_by_ip_address' => $this->getAuditIpAddress($request),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
 
             return response()->json([
                 'jsonapi' => ['version' => '1.0'],
