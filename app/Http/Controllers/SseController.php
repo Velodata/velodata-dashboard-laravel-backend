@@ -140,6 +140,9 @@ class SseController extends Controller
                                 'game_intake_code' => $gameUser->intake_code,
                                 'game_intake_name' => $gameUser->intake_name,
                                 'game_active_week' => $gameUser->intake_active_week,
+                                'action_locked_until' => $gameUser->action_locked_until,
+                                'action_locked_reason' => $gameUser->action_locked_reason,
+                                'action_locked_by_game_user_id' => $gameUser->action_locked_by_game_user_id,
                             ]) . "\n\n";
 
                             $lastUpdated = $gameUser->updated_at;

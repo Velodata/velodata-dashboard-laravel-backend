@@ -45,6 +45,76 @@ class CustomController extends Controller
         return filter_var($value, FILTER_VALIDATE_BOOLEAN);
     }
 
+    private function dashboardSettingInteger(string $key, int $default = 0): int
+    {
+        $value = $this->dashboardSettingValue($key, (string) $default);
+
+        return is_numeric($value) ? intval($value) : $default;
+    }
+
+    private function userManagementTimeoutResponse(?string $email)
+    {
+        if (! $email) {
+            return null;
+        }
+
+        $gameUser = GameUser::where('email', $email)->first();
+        if (! $gameUser || ! $gameUser->action_locked_until) {
+            return null;
+        }
+
+        $lockedUntil = Carbon::parse($gameUser->action_locked_until);
+        if (! $lockedUntil->isFuture()) {
+            return null;
+        }
+
+        $message = 'You are currently in a timeout period because you either banned or deleted a fellow user.';
+
+        $this->createPersistedNotification([
+            'recipient_email' => $gameUser->email,
+            'actor_email' => $gameUser->email,
+            'type' => 'warning',
+            'title' => 'User Management timeout',
+            'message' => $message,
+            'source' => 'user-management',
+            'metadata' => [
+                'action_locked_until' => $lockedUntil->toDateTimeString(),
+                'reason' => $gameUser->action_locked_reason,
+            ],
+        ]);
+
+        return response()->json([
+            'outcome' => 'FAIL',
+            'message' => $message,
+            'action_locked_until' => $lockedUntil->toDateTimeString(),
+        ], 423);
+    }
+
+    private function applyActionCooldownIfNeeded(?string $actorEmail, object $targetGameUser, bool $targetWasActive, string $action): ?Carbon
+    {
+        if (! $targetWasActive || ! $this->dashboardSettingBoolean('game_delete_cooldown_enabled', false)) {
+            return null;
+        }
+
+        $minutes = max(0, $this->dashboardSettingInteger('game_delete_cooldown_minutes', 5));
+        if ($minutes === 0) {
+            return null;
+        }
+
+        $actorGameUser = GameUser::where('email', $actorEmail)->first();
+        if (! $actorGameUser || intval($actorGameUser->id) === intval($targetGameUser->id)) {
+            return null;
+        }
+
+        $lockedUntil = now()->addMinutes($minutes);
+        $actorGameUser->action_locked_until = $lockedUntil;
+        $actorGameUser->action_locked_reason = ucfirst(strtolower($action)) . ' a fellow user';
+        $actorGameUser->action_locked_by_game_user_id = intval($targetGameUser->id);
+        $actorGameUser->save();
+
+        return $lockedUntil;
+    }
+
     private function dashboardSettingRows()
     {
         return DB::table('dashboard_settings')
@@ -114,7 +184,322 @@ class CustomController extends Controller
         return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
     }
 
-    private function documentationViewerRole(?string $email): ?string
+    private function staffRoleName(User $user): string
+    {
+        return (string) ($user->role_name ?: optional($user->roles()->first())->name);
+    }
+
+    private function isStaffAdmin(User $user): bool
+    {
+        return strcasecmp($this->staffRoleName($user), 'Admin') === 0;
+    }
+
+    private function staffAssignedIntakeQuery(User $user)
+    {
+        $now = now();
+
+        return DB::table('game_intakes')
+            ->where(function ($query) use ($user, $now) {
+                $query->whereExists(function ($assignmentQuery) use ($user, $now) {
+                    $assignmentQuery->select(DB::raw(1))
+                        ->from('staff_intake_assignments')
+                        ->whereColumn('staff_intake_assignments.game_intake_id', 'game_intakes.id')
+                        ->where('staff_intake_assignments.staff_user_id', $user->id)
+                        ->where('staff_intake_assignments.active', true)
+                        ->where(function ($dateQuery) use ($now) {
+                            $dateQuery->whereNull('staff_intake_assignments.starts_at')
+                                ->orWhere('staff_intake_assignments.starts_at', '<=', $now);
+                        })
+                        ->where(function ($dateQuery) use ($now) {
+                            $dateQuery->whereNull('staff_intake_assignments.ends_at')
+                                ->orWhere('staff_intake_assignments.ends_at', '>=', $now);
+                        });
+                })
+                    ->orWhere('game_intakes.trainer_user_id', $user->id);
+            });
+    }
+
+    private function staffVisibleIntakes(User $user)
+    {
+        $query = DB::table('game_intakes')
+            ->select(
+                'game_intakes.id',
+                'game_intakes.code',
+                'game_intakes.name',
+                'game_intakes.status',
+                'game_intakes.active_week',
+                'game_intakes.trainer_user_id'
+            );
+
+        if (! $this->isStaffAdmin($user)) {
+            $assignedIds = $this->staffAssignedIntakeQuery($user)->pluck('game_intakes.id');
+            $query->whereIn('game_intakes.id', $assignedIds);
+        }
+
+        return $query
+            ->orderByRaw("CASE WHEN game_intakes.status = 'active' THEN 0 ELSE 1 END")
+            ->orderBy('game_intakes.code')
+            ->get()
+            ->map(function ($intake) {
+                return [
+                    'id' => (int) $intake->id,
+                    'code' => $intake->code,
+                    'name' => $intake->name,
+                    'status' => $intake->status,
+                    'activeWeek' => $intake->active_week,
+                    'trainer_user_id' => $intake->trainer_user_id ? (int) $intake->trainer_user_id : null,
+                ];
+            })
+            ->values();
+    }
+
+    private function staffCanAccessIntake(User $user, ?int $intakeId, ?string $intakeCode): bool
+    {
+        if (! $intakeId && ! $intakeCode) {
+            return false;
+        }
+
+        if ($this->isStaffAdmin($user)) {
+            return true;
+        }
+
+        $query = $this->staffAssignedIntakeQuery($user);
+
+        if ($intakeCode) {
+            $query->where('game_intakes.code', $intakeCode);
+        } else {
+            $query->where('game_intakes.id', $intakeId);
+        }
+
+        return $query->exists();
+    }
+
+    public function F0_VMD_get_staff_game_intakes(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'vmd_user_email' => 'required|email',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 409);
+        }
+
+        $user = User::where('email', $request->input('vmd_user_email'))->first();
+        if (! $user) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Staff user not found.',
+                'data' => [],
+            ], 404);
+        }
+
+        $roleName = $this->staffRoleName($user);
+        $intakes = $this->staffVisibleIntakes($user);
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'role_name' => $roleName,
+            'is_staff_admin' => strcasecmp($roleName, 'Admin') === 0,
+            'data' => $intakes,
+        ], 200);
+    }
+
+    private function staffAdminFromRequest(Request $request): ?User
+    {
+        $email = $request->input('vmd_user_email') ?: $request->query('vmd_user_email');
+        if (! $email) {
+            return null;
+        }
+
+        $user = User::where('email', $email)->first();
+        if (! $user || ! $this->isStaffAdmin($user)) {
+            return null;
+        }
+
+        return $user;
+    }
+
+    private function classIntakeManagementPayload(): array
+    {
+        $intakes = DB::table('game_intakes')
+            ->leftJoin('game_users', 'game_users.intake_id', '=', 'game_intakes.id')
+            ->select(
+                'game_intakes.id',
+                'game_intakes.code',
+                'game_intakes.name',
+                'game_intakes.status',
+                'game_intakes.active_week',
+                'game_intakes.trainer_user_id',
+                DB::raw('COUNT(game_users.id) as students')
+            )
+            ->groupBy(
+                'game_intakes.id',
+                'game_intakes.code',
+                'game_intakes.name',
+                'game_intakes.status',
+                'game_intakes.active_week',
+                'game_intakes.trainer_user_id'
+            )
+            ->orderByRaw("CASE WHEN game_intakes.status = 'active' THEN 0 ELSE 1 END")
+            ->orderBy('game_intakes.code')
+            ->get()
+            ->map(function ($intake) {
+                return [
+                    'id' => (int) $intake->id,
+                    'code' => $intake->code,
+                    'name' => $intake->name,
+                    'course' => $intake->name,
+                    'status' => $intake->status,
+                    'activeWeek' => $intake->active_week,
+                    'trainer_user_id' => $intake->trainer_user_id ? (int) $intake->trainer_user_id : null,
+                    'students' => (int) $intake->students,
+                ];
+            })
+            ->values();
+
+        $assignments = DB::table('staff_intake_assignments')
+            ->join('users', 'users.id', '=', 'staff_intake_assignments.staff_user_id')
+            ->where('staff_intake_assignments.active', true)
+            ->select(
+                'staff_intake_assignments.game_intake_id',
+                'staff_intake_assignments.assignment_type',
+                'users.id',
+                'users.name',
+                'users.email',
+                'users.role_name',
+                'users.profile_image'
+            )
+            ->orderBy('users.name')
+            ->get()
+            ->groupBy('game_intake_id')
+            ->map(function ($rows) {
+                return $rows->map(function ($row) {
+                    return [
+                        'id' => (int) $row->id,
+                        'name' => $row->name,
+                        'email' => $row->email,
+                        'role_name' => $row->role_name,
+                        'profile_image' => $row->profile_image,
+                        'assignment_type' => $row->assignment_type,
+                    ];
+                })->values();
+            });
+
+        $staff = User::query()
+            ->select('id', 'name', 'email', 'role_name', 'profile_image', 'status')
+            ->orderBy('name')
+            ->get()
+            ->map(function ($user) {
+                return [
+                    'id' => (int) $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'role_name' => $user->role_name,
+                    'profile_image' => $user->profile_image,
+                    'status' => $user->status,
+                ];
+            })
+            ->values();
+
+        return [
+            'intakes' => $intakes,
+            'assignments' => $assignments,
+            'staff' => $staff,
+        ];
+    }
+
+    public function F0_VMD_get_class_intake_management_data(Request $request)
+    {
+        $adminUser = $this->staffAdminFromRequest($request);
+        if (! $adminUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: only Staff users with Admin powers can manage Class Intake assignments.',
+            ], 403);
+        }
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'data' => $this->classIntakeManagementPayload(),
+        ], 200);
+    }
+
+    public function F0_VMD_save_staff_intake_assignments(Request $request)
+    {
+        $adminUser = $this->staffAdminFromRequest($request);
+        if (! $adminUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: only Staff users with Admin powers can manage Class Intake assignments.',
+            ], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+            'staff_user_ids' => 'array',
+            'staff_user_ids.*' => 'integer|exists:users,id',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 409);
+        }
+
+        $gameIntakeId = (int) $request->input('game_intake_id');
+        $staffUserIds = collect($request->input('staff_user_ids', []))
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->values();
+
+        DB::transaction(function () use ($gameIntakeId, $staffUserIds, $adminUser) {
+            $deactivateQuery = DB::table('staff_intake_assignments')
+                ->where('game_intake_id', $gameIntakeId)
+                ->where('assignment_type', 'trainer');
+
+            if ($staffUserIds->isNotEmpty()) {
+                $deactivateQuery->whereNotIn('staff_user_id', $staffUserIds->all());
+            }
+
+            $deactivateQuery->update([
+                'active' => false,
+                'ends_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+            foreach ($staffUserIds as $staffUserId) {
+                DB::table('staff_intake_assignments')->updateOrInsert(
+                    [
+                        'staff_user_id' => $staffUserId,
+                        'game_intake_id' => $gameIntakeId,
+                        'assignment_type' => 'trainer',
+                    ],
+                    [
+                        'active' => true,
+                        'starts_at' => null,
+                        'ends_at' => null,
+                        'assigned_by_user_id' => $adminUser->id,
+                        'updated_at' => now(),
+                        'created_at' => now(),
+                    ]
+                );
+            }
+        });
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'message' => 'Staff intake assignments saved.',
+            'data' => $this->classIntakeManagementPayload(),
+        ], 200);
+    }
+
+    private function documentationViewerIdentity(?string $email): ?string
     {
         if (! $email) {
             return null;
@@ -122,11 +507,11 @@ class CustomController extends Controller
 
         $user = User::where('email', $email)->first();
         if ($user) {
-            return strtolower((string) ($user->role_name ?: optional($user->roles()->first())->name));
+            return 'staff';
         }
 
         $gameUser = GameUser::where('email', $email)->first();
-        return $gameUser ? strtolower((string) $gameUser->game_role) : null;
+        return $gameUser ? 'student' : null;
     }
 
     public function F0_VMD_get_documentation(Request $request)
@@ -146,16 +531,16 @@ class CustomController extends Controller
         }
 
         $data = $validator->validated();
-        $viewerRole = $this->documentationViewerRole($data['vmd_user_email']);
+        $viewerIdentity = $this->documentationViewerIdentity($data['vmd_user_email']);
 
-        if (! $viewerRole) {
+        if (! $viewerIdentity) {
             return response()->json([
                 'outcome' => 'FAIL',
                 'message' => 'Documentation access denied.',
             ], 403);
         }
 
-        if ($data['audience'] === 'staff' && ! in_array($viewerRole, ['admin', 'protector'], true)) {
+        if ($data['audience'] === 'staff' && $viewerIdentity !== 'staff') {
             return response()->json([
                 'outcome' => 'FAIL',
                 'message' => 'Documentation access denied.',
@@ -623,6 +1008,9 @@ class CustomController extends Controller
                     "game_intake_code" => $gameUser->intake_code,
                     "game_intake_name" => $gameUser->intake_name,
                     "game_active_week" => $gameUser->intake_active_week,
+                    "action_locked_until" => $gameUser->action_locked_until,
+                    "action_locked_reason" => $gameUser->action_locked_reason,
+                    "action_locked_by_game_user_id" => $gameUser->action_locked_by_game_user_id,
                     "email" => $gameUser->email,
                     "name" => $displayName,
                     "company_name" => $gameUser->intake_name,
@@ -746,6 +1134,9 @@ class CustomController extends Controller
                     "game_intake_code" => $gameUser->intake_code,
                     "game_intake_name" => $gameUser->intake_name,
                     "game_active_week" => $gameUser->intake_active_week,
+                    "action_locked_until" => $gameUser->action_locked_until,
+                    "action_locked_reason" => $gameUser->action_locked_reason,
+                    "action_locked_by_game_user_id" => $gameUser->action_locked_by_game_user_id,
                     "email" => $gameUser->email,
                     "name" => $displayName,
                     "company_name" => $gameUser->intake_name,
@@ -1195,6 +1586,10 @@ class CustomController extends Controller
 
         // Extract validated data
         $data = $validator->validated();
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($data['vmd_user_email'])) {
+            return $timeoutResponse;
+        }
+
         if ($data['id'] === 1) {
             $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'ban protected account');
             $response['outcome'] = "FAIL";
@@ -1287,6 +1682,10 @@ class CustomController extends Controller
         }
 
         $data = $validator->validated();
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($data['vmd_user_email'])) {
+            return $timeoutResponse;
+        }
+
         $user = User::where('id', $data['id'])->first();
 
         if (!$user) {
@@ -1386,6 +1785,10 @@ class CustomController extends Controller
 
         // Extract validated data
         $data = $validator->validated();
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($data['vmd_user_email'])) {
+            return $timeoutResponse;
+        }
+
         if ($data['id'] === 1) {
             $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'delete protected account');
             $response['outcome'] = "FAIL";
@@ -1496,12 +1899,10 @@ class CustomController extends Controller
                 $scopeQuery->whereNull('game_users.id');
 
                 $scopeQuery->orWhere(function ($studentQuery) use ($gameIntakeId, $gameIntakeCode) {
-                    if ($gameIntakeId) {
-                        $studentQuery->where('game_users.intake_id', $gameIntakeId);
-                    }
-
                     if ($gameIntakeCode) {
-                        $studentQuery->orWhere('game_intakes.code', $gameIntakeCode);
+                        $studentQuery->where('game_intakes.code', $gameIntakeCode);
+                    } elseif ($gameIntakeId) {
+                        $studentQuery->where('game_users.intake_id', $gameIntakeId);
                     }
                 });
             });
@@ -1646,12 +2047,10 @@ class CustomController extends Controller
                 $query->whereNull('game_users.id');
 
                 $query->orWhere(function ($studentQuery) use ($gameIntakeId, $gameIntakeCode) {
-                    if ($gameIntakeId) {
-                        $studentQuery->where('game_users.intake_id', $gameIntakeId);
-                    }
-
                     if ($gameIntakeCode) {
-                        $studentQuery->orWhere('game_intakes.code', $gameIntakeCode);
+                        $studentQuery->where('game_intakes.code', $gameIntakeCode);
+                    } elseif ($gameIntakeId) {
+                        $studentQuery->where('game_users.intake_id', $gameIntakeId);
                     }
                 });
             });
@@ -1906,6 +2305,9 @@ if ($validator->fails()) {
         // Extract validated data
         $data = $validator->validated();
         $protectedAdminSelfAvatarUpdate = false;
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($data['vmd_user_email'])) {
+            return $timeoutResponse;
+        }
 
         if ($data['id'] === 1) {
             $targetAdmin = User::where('id', 1)->first();
@@ -2066,6 +2468,10 @@ if ($validator->fails()) {
         }
 
         $data = $validator->validated();
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($data['vmd_user_email'])) {
+            return $timeoutResponse;
+        }
+
         $gameUser = DB::table('game_users')
             ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
             ->where('game_users.id', $data['id'])
@@ -2185,6 +2591,7 @@ if ($validator->fails()) {
             'password_confirmation' => 'required|string|same:password',
             'vmd_user_email' => 'required|email',
             'vmd_user_name' => 'required|string|max:255',
+            'vmd_audit_reason' => 'nullable|string|max:255',
         ]);
 
         if ($validator->fails()) {
@@ -2196,6 +2603,10 @@ if ($validator->fails()) {
         }
 
         $data = $validator->validated();
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($data['vmd_user_email'])) {
+            return $timeoutResponse;
+        }
+
         $gameUser = DB::table('game_users')
             ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
             ->where('game_users.id', $data['id'])
@@ -2213,10 +2624,12 @@ if ($validator->fails()) {
             ], 404);
         }
 
-        if (strcasecmp($gameUser->email, $data['vmd_user_email']) !== 0) {
+        $isSelfPasswordChange = strcasecmp($gameUser->email, $data['vmd_user_email']) === 0;
+
+        if (! $isSelfPasswordChange && ! $this->canManageGameUsers($data['vmd_user_email'])) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: You can only change your own student password.',
+                'message' => 'Permission Denied: You can only change your own student password unless you are Admin or Protector.',
             ], 403);
         }
 
@@ -2224,6 +2637,17 @@ if ($validator->fails()) {
             'password' => bcrypt($data['password']),
             'must_change_password' => false,
             'updated_by' => $data['vmd_user_email'],
+            'updated_at' => now(),
+        ]);
+
+        DB::table('user_audit_history')->insert([
+            'custno' => 900000 + intval($gameUser->id),
+            'dteprfmd' => now(),
+            'comments' => $data['vmd_audit_reason'] ?? 'User password changed',
+            'clerk_id' => $data['vmd_user_name'],
+            'created_by_email' => $data['vmd_user_email'],
+            'created_by_ip_address' => $this->getRequestIpAddress($request),
+            'created_at' => now(),
             'updated_at' => now(),
         ]);
 
@@ -2252,6 +2676,9 @@ if ($validator->fails()) {
         }
 
         $data = $validator->validated();
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($data['vmd_user_email'])) {
+            return $timeoutResponse;
+        }
 
         if (! $this->canManageGameUsers($data['vmd_user_email'])) {
             return response()->json([
@@ -2277,6 +2704,8 @@ if ($validator->fails()) {
             ], 404);
         }
 
+        $targetWasActive = strcasecmp((string) $gameUser->game_status, 'ACTIVE') === 0;
+
         DB::table('game_users')->where('id', $data['id'])->update([
             'game_status' => $status,
             'updated_by' => $data['vmd_user_email'],
@@ -2301,11 +2730,41 @@ if ($validator->fails()) {
             'updated_at' => now(),
         ]);
 
+        if ($status === 'ACTIVE') {
+            $displayName = $gameUser->display_name
+                ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname);
+
+            $this->createPersistedNotification([
+                'recipient_email' => $gameUser->email,
+                'actor_email' => $data['vmd_user_email'],
+                'type' => 'info',
+                'title' => 'You have been unbanned',
+                'message' => "{$displayName}, your account has been unbanned by {$data['vmd_user_name']}.",
+                'source' => 'user-management',
+                'metadata' => [
+                    'game_user_id' => intval($gameUser->id),
+                    'game_status' => $status,
+                    'intake_code' => $gameUser->intake_code,
+                ],
+            ]);
+        }
+
+        $actorActionLockedUntil = null;
+        if (in_array($status, ['BANNED', 'DELETED'], true)) {
+            $actorActionLockedUntil = $this->applyActionCooldownIfNeeded(
+                $data['vmd_user_email'],
+                $gameUser,
+                $targetWasActive,
+                $status === 'BANNED' ? 'Banned' : 'Deleted'
+            );
+        }
+
         return response()->json([
             'outcome' => 'SUCCESS',
             'message' => $message,
             'game_user_id' => intval($data['id']),
             'game_status' => $status,
+            'actor_action_locked_until' => $actorActionLockedUntil ? $actorActionLockedUntil->toDateTimeString() : null,
         ], 200);
     }
 
@@ -2369,6 +2828,8 @@ if ($validator->fails()) {
             'settings.login_2fa_send_to_account' => 'required|boolean',
             'settings.login_2fa_send_to_master' => 'required|boolean',
             'settings.login_2fa_master_email' => 'nullable|email',
+            'settings.game_delete_cooldown_enabled' => 'required|boolean',
+            'settings.game_delete_cooldown_minutes' => 'required|integer|min:1|max:1440',
         ]);
 
         if (!$this->isAdminEmail($request->input('vmd_user_email'))) {
@@ -2382,6 +2843,8 @@ if ($validator->fails()) {
         $sendToAccount = (bool) $settings['login_2fa_send_to_account'];
         $sendToMaster = (bool) $settings['login_2fa_send_to_master'];
         $masterEmail = $settings['login_2fa_master_email'] ?? '';
+        $deleteCooldownEnabled = (bool) $settings['game_delete_cooldown_enabled'];
+        $deleteCooldownMinutes = intval($settings['game_delete_cooldown_minutes']);
 
         if ($twoFactorEnabled && !$sendToAccount && !$sendToMaster) {
             return response()->json([
@@ -2402,6 +2865,8 @@ if ($validator->fails()) {
             'login_2fa_send_to_account' => $sendToAccount ? '1' : '0',
             'login_2fa_send_to_master' => $sendToMaster ? '1' : '0',
             'login_2fa_master_email' => $masterEmail,
+            'game_delete_cooldown_enabled' => $deleteCooldownEnabled ? '1' : '0',
+            'game_delete_cooldown_minutes' => (string) $deleteCooldownMinutes,
         ];
 
         foreach ($updates as $key => $value) {

@@ -26,6 +26,9 @@ Route::prefix('v2')->group(function () {
     Route::match(['get', 'post'], '/VMD-get-audit-history', [CustomController::class, 'F0_VMD_get_audit_history']);
     Route::match(['get', 'post'], '/VMD-get-notifications', [CustomController::class, 'F0_VMD_get_notifications']);
     Route::match(['get', 'post'], '/VMD-get-documentation', [CustomController::class, 'F0_VMD_get_documentation']);
+    Route::match(['get', 'post'], '/VMD-get-staff-game-intakes', [CustomController::class, 'F0_VMD_get_staff_game_intakes']);
+    Route::match(['get', 'post'], '/VMD-get-class-intake-management-data', [CustomController::class, 'F0_VMD_get_class_intake_management_data']);
+    Route::post('/VMD-save-staff-intake-assignments', [CustomController::class, 'F0_VMD_save_staff_intake_assignments']);
     Route::post('/VMD-create-notification', [CustomController::class, 'F0_VMD_create_notification']);
     Route::post('/VMD-mark-notifications-read', [CustomController::class, 'F0_VMD_mark_notifications_read']);
     Route::post('/VMD-clear-notifications', [CustomController::class, 'F0_VMD_clear_notifications']);

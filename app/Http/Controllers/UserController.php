@@ -75,12 +75,125 @@ class UserController extends Controller
         return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
     }
 
+    private function staffRoleName(User $user): string
+    {
+        return (string) ($user->role_name ?: optional($user->roles()->first())->name);
+    }
+
+    private function isStaffAdmin(User $user): bool
+    {
+        return strcasecmp($this->staffRoleName($user), 'Admin') === 0;
+    }
+
+    private function staffAssignedIntakeQuery(User $user)
+    {
+        $now = now();
+
+        return DB::table('game_intakes')
+            ->where(function ($query) use ($user, $now) {
+                $query->whereExists(function ($assignmentQuery) use ($user, $now) {
+                    $assignmentQuery->select(DB::raw(1))
+                        ->from('staff_intake_assignments')
+                        ->whereColumn('staff_intake_assignments.game_intake_id', 'game_intakes.id')
+                        ->where('staff_intake_assignments.staff_user_id', $user->id)
+                        ->where('staff_intake_assignments.active', true)
+                        ->where(function ($dateQuery) use ($now) {
+                            $dateQuery->whereNull('staff_intake_assignments.starts_at')
+                                ->orWhere('staff_intake_assignments.starts_at', '<=', $now);
+                        })
+                        ->where(function ($dateQuery) use ($now) {
+                            $dateQuery->whereNull('staff_intake_assignments.ends_at')
+                                ->orWhere('staff_intake_assignments.ends_at', '>=', $now);
+                        });
+                })
+                    ->orWhere('game_intakes.trainer_user_id', $user->id);
+            });
+    }
+
+    private function staffCanAccessIntake(User $user, ?int $intakeId, ?string $intakeCode): bool
+    {
+        if (! $intakeId && ! $intakeCode) {
+            return false;
+        }
+
+        if ($this->isStaffAdmin($user)) {
+            return true;
+        }
+
+        $query = $this->staffAssignedIntakeQuery($user);
+
+        if ($intakeCode) {
+            $query->where('game_intakes.code', $intakeCode);
+        } else {
+            $query->where('game_intakes.id', $intakeId);
+        }
+
+        return $query->exists();
+    }
+
+    private function userManagementTimeoutResponse(?string $email)
+    {
+        if (! $email) {
+            return null;
+        }
+
+        $gameUser = GameUser::where('email', $email)->first();
+        if (! $gameUser || ! $gameUser->action_locked_until) {
+            return null;
+        }
+
+        $lockedUntil = \Carbon\Carbon::parse($gameUser->action_locked_until);
+        if (! $lockedUntil->isFuture()) {
+            return null;
+        }
+
+        $message = 'You are currently in a timeout period because you either banned or deleted a fellow user.';
+
+        DB::table('user_notifications')->insert([
+            'recipient_email' => $gameUser->email,
+            'actor_email' => $gameUser->email,
+            'type' => 'warning',
+            'title' => 'User Management timeout',
+            'message' => $message,
+            'source' => 'user-management',
+            'metadata' => json_encode([
+                'action_locked_until' => $lockedUntil->toDateTimeString(),
+                'reason' => $gameUser->action_locked_reason,
+            ]),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        return response()->json([
+            'outcome' => 'FAIL',
+            'message' => $message,
+            'action_locked_until' => $lockedUntil->toDateTimeString(),
+        ], 423);
+    }
+
     // Get all users
     public function index(Request $request)
     {
         $users = User::with('roles')->get(); // Eager load roles
         $gameIntakeId = $request->query('game_intake_id');
         $gameIntakeCode = $request->query('game_intake_code');
+        $viewerEmail = $request->query('vmd_user_email');
+        $viewer = $viewerEmail ? User::where('email', $viewerEmail)->first() : null;
+        $viewerGameUser = (! $viewer && $viewerEmail) ? GameUser::where('email', $viewerEmail)->first() : null;
+        $viewerCanAccessRequestedIntake = false;
+
+        if (! $gameIntakeId && ! $gameIntakeCode) {
+            $viewerCanAccessRequestedIntake = true;
+        } elseif ($viewer) {
+            $viewerCanAccessRequestedIntake = $this->staffCanAccessIntake($viewer, $gameIntakeId ? (int) $gameIntakeId : null, $gameIntakeCode);
+        } elseif ($viewerGameUser) {
+            $viewerCanAccessRequestedIntake =
+                ($gameIntakeId && (int) $viewerGameUser->intake_id === (int) $gameIntakeId) ||
+                ($gameIntakeCode && DB::table('game_intakes')
+                    ->where('id', $viewerGameUser->intake_id)
+                    ->where('code', $gameIntakeCode)
+                    ->exists());
+        }
 
         // Check if the include query parameter is set to roles
         $includeRoles = $request->query('include') === 'roles';
@@ -138,7 +251,7 @@ class UserController extends Controller
 
         $gameRows = collect();
 
-        if ($gameIntakeId || $gameIntakeCode) {
+        if (($gameIntakeId || $gameIntakeCode) && $viewerCanAccessRequestedIntake) {
             $gameUsersQuery = GameUser::query()
                 ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
                 ->select(
@@ -147,10 +260,10 @@ class UserController extends Controller
                     'game_intakes.name as intake_name'
                 );
 
-            if ($gameIntakeId) {
-                $gameUsersQuery->where('game_users.intake_id', $gameIntakeId);
-            } elseif ($gameIntakeCode) {
+            if ($gameIntakeCode) {
                 $gameUsersQuery->where('game_intakes.code', $gameIntakeCode);
+            } elseif ($gameIntakeId) {
+                $gameUsersQuery->where('game_users.intake_id', $gameIntakeId);
             }
 
             $gameRows = $gameUsersQuery
@@ -179,6 +292,9 @@ class UserController extends Controller
                             'game_intake_id' => $gameUser->intake_id,
                             'game_intake_code' => $gameUser->intake_code,
                             'game_intake_name' => $gameUser->intake_name,
+                            'action_locked_until' => $gameUser->action_locked_until,
+                            'action_locked_reason' => $gameUser->action_locked_reason,
+                            'action_locked_by_game_user_id' => $gameUser->action_locked_by_game_user_id,
                             'created_at' => $gameUser->created_at,
                             'updated_at' => $gameUser->updated_at,
                             'status' => strtoupper($gameUser->game_status),
@@ -259,6 +375,10 @@ class UserController extends Controller
 
         // Extract user attributes
         $attributes = $data['attributes'];
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($attributes['vmd_user_email'] ?? null)) {
+            return $timeoutResponse;
+        }
+
         $name = $attributes['name'];
         $email = $attributes['email'];
         $password = bcrypt($attributes['password']); // hash password securely
@@ -323,6 +443,10 @@ class UserController extends Controller
 
     public function update(Request $request, $id)
     {
+        $actorEmail = $request->input('data.attributes.vmd_user_email') ?: $request->input('vmd_user_email');
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($actorEmail)) {
+            return $timeoutResponse;
+        }
 
         // Fetch the real user IP from Cloudflare
         $realIp = $request->header('X-Forwarded-For');
@@ -400,6 +524,10 @@ class UserController extends Controller
         $request->validate([
             'attachment' => 'required|image|max:2048',
         ]);
+
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($request->input('vmd_user_email'))) {
+            return $timeoutResponse;
+        }
 
         $path = "users/{$userId}/profile-image";
 
@@ -484,6 +612,10 @@ class UserController extends Controller
 
         $gameUser = GameUser::findOrFail($gameUserId);
         $actorEmail = $request->input('vmd_user_email');
+        if ($timeoutResponse = $this->userManagementTimeoutResponse($actorEmail)) {
+            return $timeoutResponse;
+        }
+
         $isSelfUpdate = strcasecmp((string) $gameUser->email, (string) $actorEmail) === 0;
 
         if (! $isSelfUpdate && ! $this->canManageGameUsers($actorEmail)) {
