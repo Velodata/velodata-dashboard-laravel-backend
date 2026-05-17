@@ -147,7 +147,7 @@ class UserController extends Controller
             return null;
         }
 
-        $message = 'You are currently in a timeout period because you either banned or deleted a fellow user.';
+        $message = 'You are currently in a timeout period because you banned or deleted another user.';
 
         DB::table('user_notifications')->insert([
             'recipient_email' => $gameUser->email,
@@ -382,6 +382,14 @@ class UserController extends Controller
         $name = $attributes['name'];
         $email = $attributes['email'];
         $password = bcrypt($attributes['password']); // hash password securely
+        $roleId = $data['relationships']['roles']['data'][0]['id'] ?? ($attributes['role_id'] ?? null);
+        $createdByEmail = $attributes['vmd_user_email'] ?? null;
+        $createdByName  = $attributes['vmd_user_name'] ?? null;
+        $creatorGameUser = $createdByEmail ? GameUser::where('email', $createdByEmail)->first() : null;
+
+        if ($creatorGameUser) {
+            return $this->storeStudentCreatedGameUser($request, $attributes, $roleId, $creatorGameUser);
+        }
 
         // Check if email already exists
         if (User::where('email', $email)->exists()) {
@@ -399,9 +407,6 @@ class UserController extends Controller
             ], 409);
         }
 
-        // Extract role ID from the relationships
-        $roleId = $data['relationships']['roles']['data'][0]['id'] ?? null;
-
         // Create and save the new user
         $user = User::create([
             'name' => $name,
@@ -418,9 +423,6 @@ class UserController extends Controller
         $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
 
         // Handle optional audit trail for admin-created users
-        $createdByEmail = $attributes['vmd_user_email'] ?? null;
-        $createdByName  = $attributes['vmd_user_name'] ?? null;
-
         $comments = $createdByEmail && $createdByName
             ? 'User created via New User function'
             : 'User self-registered via API';
@@ -437,6 +439,86 @@ class UserController extends Controller
         ]);
 
         return response()->json(['data' => $user], 201);
+    }
+
+    private function storeStudentCreatedGameUser(Request $request, array $attributes, $roleId, GameUser $creatorGameUser)
+    {
+        $name = trim((string) ($attributes['name'] ?? ''));
+        $email = trim((string) ($attributes['email'] ?? ''));
+        $password = (string) ($attributes['password'] ?? '');
+        $createdByEmail = $attributes['vmd_user_email'] ?? $creatorGameUser->email;
+        $createdByName = $attributes['vmd_user_name'] ?? $creatorGameUser->display_name;
+
+        if ($email === '' || $name === '' || $password === '') {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Name, email, and password are required.',
+            ], 422);
+        }
+
+        if (User::where('email', $email)->exists() || GameUser::where('email', $email)->exists()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'email_exists' => 'true',
+                'error' => 'Invalid credentials',
+                'status' => '409',
+                'detail' => 'A user with this email already exists.'
+            ], 409);
+        }
+
+        $roleName = DB::table('roles')->where('id', $roleId)->value('name') ?: 'Creator';
+        $nameParts = preg_split('/\s+/', $name, -1, PREG_SPLIT_NO_EMPTY);
+        $firstName = $nameParts[0] ?? $name;
+        $surname = count($nameParts) > 1 ? implode(' ', array_slice($nameParts, 1)) : 'Account';
+
+        $metadata = [
+            'source' => 'student_fake_account',
+            'created_by_student_email' => $creatorGameUser->email,
+            'created_by_game_user_id' => (int) $creatorGameUser->id,
+            'created_by_student_name' => $creatorGameUser->display_name,
+        ];
+
+        $gameUser = GameUser::create([
+            'intake_id' => $creatorGameUser->intake_id,
+            'first_name' => $firstName,
+            'surname' => $surname,
+            'preferred_name' => $name,
+            'display_name' => $name,
+            'email' => $email,
+            'password' => Hash::make($password),
+            'must_change_password' => false,
+            'profile_image' => $attributes['profile_image'] ?? null,
+            'game_role' => $roleName,
+            'game_status' => 'active',
+            'updated_by' => $createdByEmail,
+            'metadata' => $metadata,
+        ]);
+
+        DB::table('user_audit_history')->insert([
+            'custno' => 900000 + intval($gameUser->id),
+            'dteprfmd' => now(),
+            'comments' => 'Fake account created by Student via New User function',
+            'clerk_id' => $createdByName,
+            'created_by_email' => $createdByEmail,
+            'created_by_ip_address' => $this->getAuditIpAddress($request),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        return response()->json([
+            'data' => [
+                'type' => 'game_users',
+                'id' => $gameUser->id,
+                'game_user_id' => $gameUser->id,
+                'identity_type' => 'student',
+                'name' => $gameUser->display_name,
+                'email' => $gameUser->email,
+                'role_id' => $roleId,
+                'role_name' => $gameUser->game_role,
+                'game_intake_id' => $gameUser->intake_id,
+                'created_by_student_email' => $creatorGameUser->email,
+            ],
+        ], 201);
     }
 
 

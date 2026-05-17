@@ -8,6 +8,8 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Response;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Database\QueryException;
 
 
 use App\Mail\Test2FAMail;
@@ -68,7 +70,7 @@ class CustomController extends Controller
             return null;
         }
 
-        $message = 'You are currently in a timeout period because you either banned or deleted a fellow user.';
+        $message = 'You are currently in a timeout period because you banned or deleted another user.';
 
         $this->createPersistedNotification([
             'recipient_email' => $gameUser->email,
@@ -92,6 +94,24 @@ class CustomController extends Controller
 
     private function applyActionCooldownIfNeeded(?string $actorEmail, object $targetGameUser, bool $targetWasActive, string $action): ?Carbon
     {
+        if (intval($targetGameUser->id) === intval(GameUser::where('email', $actorEmail)->value('id'))) {
+            return null;
+        }
+
+        return $this->lockActorGameUserIfNeeded(
+            $actorEmail,
+            $targetWasActive,
+            ucfirst(strtolower($action)) . ' a fellow user',
+            intval($targetGameUser->id)
+        );
+    }
+
+    private function lockActorGameUserIfNeeded(
+        ?string $actorEmail,
+        bool $targetWasActive,
+        string $reason,
+        ?int $targetGameUserId = null
+    ): ?Carbon {
         if (! $targetWasActive || ! $this->dashboardSettingBoolean('game_delete_cooldown_enabled', false)) {
             return null;
         }
@@ -102,14 +122,14 @@ class CustomController extends Controller
         }
 
         $actorGameUser = GameUser::where('email', $actorEmail)->first();
-        if (! $actorGameUser || intval($actorGameUser->id) === intval($targetGameUser->id)) {
+        if (! $actorGameUser) {
             return null;
         }
 
         $lockedUntil = now()->addMinutes($minutes);
         $actorGameUser->action_locked_until = $lockedUntil;
-        $actorGameUser->action_locked_reason = ucfirst(strtolower($action)) . ' a fellow user';
-        $actorGameUser->action_locked_by_game_user_id = intval($targetGameUser->id);
+        $actorGameUser->action_locked_reason = $reason;
+        $actorGameUser->action_locked_by_game_user_id = $targetGameUserId;
         $actorGameUser->save();
 
         return $lockedUntil;
@@ -182,6 +202,55 @@ class CustomController extends Controller
         $roleName = $gameUser?->game_role;
 
         return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+    }
+
+    private function actorGameUser(?string $email): ?GameUser
+    {
+        if (! $email) {
+            return null;
+        }
+
+        return GameUser::where('email', $email)->first();
+    }
+
+    private function canBanStaffUser(?string $actorEmail, User $targetUser): bool
+    {
+        if ($this->isStaffAdmin($targetUser)) {
+            return false;
+        }
+
+        $actorStaff = $actorEmail ? User::where('email', $actorEmail)->first() : null;
+        if ($actorStaff) {
+            $roleName = $this->staffRoleName($actorStaff);
+
+            return in_array(strtolower($roleName), ['admin', 'protector'], true);
+        }
+
+        $actorGameUser = $this->actorGameUser($actorEmail);
+        $actorGameRole = strtolower((string) $actorGameUser?->game_role);
+
+        return in_array($actorGameRole, ['admin', 'protector'], true);
+    }
+
+    private function canDeleteStaffUser(?string $actorEmail, User $targetUser): bool
+    {
+        if ($this->isStaffAdmin($targetUser)) {
+            return false;
+        }
+
+        $actorStaff = $actorEmail ? User::where('email', $actorEmail)->first() : null;
+        if (! $actorStaff) {
+            return false;
+        }
+
+        $roleName = $this->staffRoleName($actorStaff);
+
+        return in_array(strtolower($roleName), ['admin', 'protector'], true);
+    }
+
+    private function canUnbanStaffUser(?string $actorEmail, User $targetUser): bool
+    {
+        return $this->canBanStaffUser($actorEmail, $targetUser);
     }
 
     private function staffRoleName(User $user): string
@@ -323,6 +392,20 @@ class CustomController extends Controller
         return $user;
     }
 
+    private function staffIntakeAssignmentsMissingResponse()
+    {
+        return response()->json([
+            'outcome' => 'FAIL',
+            'message' => 'Staff intake assignments table is missing. Run migrations.',
+        ], 500);
+    }
+
+    private function isMissingStaffIntakeAssignmentsException(QueryException $exception): bool
+    {
+        return str_contains($exception->getMessage(), 'staff_intake_assignments')
+            && str_contains($exception->getMessage(), 'Base table or view not found');
+    }
+
     private function classIntakeManagementPayload(): array
     {
         $intakes = DB::table('game_intakes')
@@ -391,6 +474,10 @@ class CustomController extends Controller
 
         $staff = User::query()
             ->select('id', 'name', 'email', 'role_name', 'profile_image', 'status')
+            ->where(function ($query) {
+                $query->whereNull('status')
+                    ->orWhereNotIn('status', ['BANNED', 'DELETED']);
+            })
             ->orderBy('name')
             ->get()
             ->map(function ($user) {
@@ -412,6 +499,54 @@ class CustomController extends Controller
         ];
     }
 
+    private function createStaffIntakeAssignmentNotifications(
+        $staffUserIds,
+        object $intake,
+        User $adminUser,
+        string $changeType
+    ): void {
+        $ids = collect($staffUserIds)
+            ->map(fn ($id) => (int) $id)
+            ->filter()
+            ->unique()
+            ->values();
+
+        if ($ids->isEmpty()) {
+            return;
+        }
+
+        $staffUsers = User::query()
+            ->whereIn('id', $ids->all())
+            ->where(function ($query) {
+                $query->whereNull('status')
+                    ->orWhereNotIn('status', ['BANNED', 'DELETED']);
+            })
+            ->get();
+
+        foreach ($staffUsers as $staffUser) {
+            $granted = $changeType === 'granted';
+
+            $this->createPersistedNotification([
+                'recipient_email' => $staffUser->email,
+                'actor_email' => $adminUser->email,
+                'type' => $granted ? 'info' : 'warning',
+                'title' => $granted ? 'Class Intake access granted' : 'Class Intake access removed',
+                'message' => $granted
+                    ? "You have been linked to {$intake->name} ({$intake->code})."
+                    : "Your access to {$intake->name} ({$intake->code}) has been removed.",
+                'source' => 'class-intake-management',
+                'metadata' => [
+                    'change_type' => $changeType,
+                    'game_intake_id' => (int) $intake->id,
+                    'game_intake_code' => $intake->code,
+                    'game_intake_name' => $intake->name,
+                    'assigned_by_user_id' => (int) $adminUser->id,
+                    'assigned_by_email' => $adminUser->email,
+                ],
+            ]);
+        }
+    }
+
     public function F0_VMD_get_class_intake_management_data(Request $request)
     {
         $adminUser = $this->staffAdminFromRequest($request);
@@ -422,10 +557,22 @@ class CustomController extends Controller
             ], 403);
         }
 
-        return response()->json([
-            'outcome' => 'SUCCESS',
-            'data' => $this->classIntakeManagementPayload(),
-        ], 200);
+        if (! Schema::hasTable('staff_intake_assignments')) {
+            return $this->staffIntakeAssignmentsMissingResponse();
+        }
+
+        try {
+            return response()->json([
+                'outcome' => 'SUCCESS',
+                'data' => $this->classIntakeManagementPayload(),
+            ], 200);
+        } catch (QueryException $exception) {
+            if ($this->isMissingStaffIntakeAssignmentsException($exception)) {
+                return $this->staffIntakeAssignmentsMissingResponse();
+            }
+
+            throw $exception;
+        }
     }
 
     public function F0_VMD_save_staff_intake_assignments(Request $request)
@@ -436,6 +583,10 @@ class CustomController extends Controller
                 'outcome' => 'FAIL',
                 'message' => 'Permission Denied: only Staff users with Admin powers can manage Class Intake assignments.',
             ], 403);
+        }
+
+        if (! Schema::hasTable('staff_intake_assignments')) {
+            return $this->staffIntakeAssignmentsMissingResponse();
         }
 
         $validator = Validator::make($request->all(), [
@@ -457,46 +608,97 @@ class CustomController extends Controller
             ->map(fn ($id) => (int) $id)
             ->unique()
             ->values();
+        $gameIntake = DB::table('game_intakes')->where('id', $gameIntakeId)->first();
 
-        DB::transaction(function () use ($gameIntakeId, $staffUserIds, $adminUser) {
-            $deactivateQuery = DB::table('staff_intake_assignments')
-                ->where('game_intake_id', $gameIntakeId)
-                ->where('assignment_type', 'trainer');
+        if ($staffUserIds->isNotEmpty()) {
+            $availableStaffUserIds = User::query()
+                ->whereIn('id', $staffUserIds->all())
+                ->where(function ($query) {
+                    $query->whereNull('status')
+                        ->orWhereNotIn('status', ['BANNED', 'DELETED']);
+                })
+                ->pluck('id')
+                ->map(fn ($id) => (int) $id)
+                ->values();
 
-            if ($staffUserIds->isNotEmpty()) {
-                $deactivateQuery->whereNotIn('staff_user_id', $staffUserIds->all());
+            if ($availableStaffUserIds->count() !== $staffUserIds->count()) {
+                return response()->json([
+                    'outcome' => 'FAIL',
+                    'message' => 'One or more selected Staff users are no longer active.',
+                ], 409);
             }
+        }
 
-            $deactivateQuery->update([
-                'active' => false,
-                'ends_at' => now(),
-                'updated_at' => now(),
-            ]);
+        try {
+            DB::transaction(function () use ($gameIntakeId, $staffUserIds, $adminUser, $gameIntake) {
+                $previousStaffUserIds = DB::table('staff_intake_assignments')
+                    ->where('game_intake_id', $gameIntakeId)
+                    ->where('assignment_type', 'trainer')
+                    ->where('active', true)
+                    ->pluck('staff_user_id')
+                    ->map(fn ($id) => (int) $id)
+                    ->values();
+                $addedStaffUserIds = $staffUserIds->diff($previousStaffUserIds)->values();
+                $removedStaffUserIds = $previousStaffUserIds->diff($staffUserIds)->values();
 
-            foreach ($staffUserIds as $staffUserId) {
-                DB::table('staff_intake_assignments')->updateOrInsert(
-                    [
-                        'staff_user_id' => $staffUserId,
-                        'game_intake_id' => $gameIntakeId,
-                        'assignment_type' => 'trainer',
-                    ],
-                    [
-                        'active' => true,
-                        'starts_at' => null,
-                        'ends_at' => null,
-                        'assigned_by_user_id' => $adminUser->id,
-                        'updated_at' => now(),
-                        'created_at' => now(),
-                    ]
+                $deactivateQuery = DB::table('staff_intake_assignments')
+                    ->where('game_intake_id', $gameIntakeId)
+                    ->where('assignment_type', 'trainer');
+
+                if ($staffUserIds->isNotEmpty()) {
+                    $deactivateQuery->whereNotIn('staff_user_id', $staffUserIds->all());
+                }
+
+                $deactivateQuery->update([
+                    'active' => false,
+                    'ends_at' => now(),
+                    'updated_at' => now(),
+                ]);
+
+                foreach ($staffUserIds as $staffUserId) {
+                    DB::table('staff_intake_assignments')->updateOrInsert(
+                        [
+                            'staff_user_id' => $staffUserId,
+                            'game_intake_id' => $gameIntakeId,
+                            'assignment_type' => 'trainer',
+                        ],
+                        [
+                            'active' => true,
+                            'starts_at' => null,
+                            'ends_at' => null,
+                            'assigned_by_user_id' => $adminUser->id,
+                            'updated_at' => now(),
+                            'created_at' => now(),
+                        ]
+                    );
+                }
+
+                $this->createStaffIntakeAssignmentNotifications(
+                    $addedStaffUserIds,
+                    $gameIntake,
+                    $adminUser,
+                    'granted'
                 );
-            }
-        });
+                $this->createStaffIntakeAssignmentNotifications(
+                    $removedStaffUserIds,
+                    $gameIntake,
+                    $adminUser,
+                    'removed'
+                );
+            });
 
-        return response()->json([
-            'outcome' => 'SUCCESS',
-            'message' => 'Staff intake assignments saved.',
-            'data' => $this->classIntakeManagementPayload(),
-        ], 200);
+            return response()->json([
+                'outcome' => 'SUCCESS',
+                'message' => 'Staff intake assignments saved.',
+                'data' => $this->classIntakeManagementPayload(),
+            ], 200);
+        } catch (QueryException $exception) {
+            if ($this->isMissingStaffIntakeAssignmentsException($exception)) {
+                return $this->staffIntakeAssignmentsMissingResponse();
+            }
+
+            throw $exception;
+        }
     }
 
     private function documentationViewerIdentity(?string $email): ?string
@@ -732,6 +934,42 @@ class CustomController extends Controller
         ]);
 
         return DB::table('user_notifications')->where('id', $notificationId)->first();
+    }
+
+    private function isProfileWatcherStudentUnbanArtifact(array $notification): bool
+    {
+        if (($notification['source'] ?? '') !== 'profile-watcher') {
+            return false;
+        }
+
+        $recipientEmail = $notification['recipient_email'] ?? '';
+        if (! $recipientEmail) {
+            return false;
+        }
+
+        $title = (string) ($notification['title'] ?? '');
+        $message = (string) ($notification['message'] ?? '');
+        $combined = strtolower($title . ' ' . $message);
+        $looksLikeUnbanArtifact =
+            str_contains($combined, 'student was successfully unbanned') ||
+            str_contains($combined, 'profile was edited') ||
+            str_contains($combined, 'profile was modified') ||
+            str_contains($combined, 'role was changed');
+
+        if (! $looksLikeUnbanArtifact) {
+            return false;
+        }
+
+        $gameUser = DB::table('game_users')->where('email', $recipientEmail)->first();
+        if (! $gameUser) {
+            return false;
+        }
+
+        return DB::table('user_audit_history')
+            ->where('custno', 900000 + intval($gameUser->id))
+            ->where('comments', 'like', '%UNBANNED%')
+            ->where('created_at', '>=', now()->subMinutes(10))
+            ->exists();
     }
 
     private function createProtectedAccountWarningNotifications(int $auditHistoryId, array $event): void
@@ -1590,17 +1828,30 @@ class CustomController extends Controller
             return $timeoutResponse;
         }
 
-        if ($data['id'] === 1) {
-            $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'ban protected account');
-            $response['outcome'] = "FAIL";
-            $response['message'] = "Permission Denied:  (You can NEVER EVER edit the Admin account.)";
-            return response()->json($response, 403);
-        }
-
         // Update the user record based on custno
         $user = User::where('id', $data['id'])->first();
 
         if ($user) {
+            $targetWasActive = ! in_array(strtoupper((string) $user->status), ['BANNED', 'DELETED'], true);
+
+            if (! $this->canBanStaffUser($data['vmd_user_email'], $user)) {
+                if ($this->isStaffAdmin($user)) {
+                    $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'ban protected account');
+                    $response['message'] = "Permission Denied: Staff Admin users cannot be banned.";
+                } else {
+                    $response['message'] = "Permission Denied: You do not have permission to ban this Staff user.";
+                }
+
+                $response['outcome'] = "FAIL";
+                return response()->json($response, 403);
+            }
+
+            $actorActionLockedUntil = $this->lockActorGameUserIfNeeded(
+                $data['vmd_user_email'],
+                $targetWasActive,
+                'Banned a Staff user'
+            );
+
             $user->status       = "BANNED";
             $user->updated_by   = $data['updated_by'] ?? $user->updated_by;
             $user->save();
@@ -1628,6 +1879,9 @@ class CustomController extends Controller
             // Prepare response data
             $response['outcome'] = "SUCCESS";
             $response['message'] = "User Banned successfully.";
+            $response['actor_action_locked_until'] = $actorActionLockedUntil
+                ? $actorActionLockedUntil->toDateTimeString()
+                : null;
             $response['updated_details'] = [
                 "id"            => intval($user->id),
                 "custno"        => intval($user->custno),
@@ -1692,6 +1946,14 @@ class CustomController extends Controller
             $response['outcome'] = false;
             $response['message'] = "User not found.";
             return response()->json($response, 404);
+        }
+
+        if (! $this->canUnbanStaffUser($data['vmd_user_email'], $user)) {
+            $response['outcome'] = "FAIL";
+            $response['message'] = $this->actorGameUser($data['vmd_user_email'])
+                ? "Permission Denied: Students cannot unban Staff users."
+                : "Permission Denied: You do not have permission to unban this Staff user.";
+            return response()->json($response, 403);
         }
 
         if ($user->status === 'BANNED') {
@@ -1789,17 +2051,24 @@ class CustomController extends Controller
             return $timeoutResponse;
         }
 
-        if ($data['id'] === 1) {
-            $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'delete protected account');
-            $response['outcome'] = "FAIL";
-            $response['message'] = "Permission Denied:  (You can NEVER EVER edit the Admin account.)";
-            return response()->json($response, 403);
-        }
-
         // Update the user record based on custno
         $user = User::where('id', $data['id'])->first();
 
         if ($user) {
+            if (! $this->canDeleteStaffUser($data['vmd_user_email'], $user)) {
+                if ($this->isStaffAdmin($user)) {
+                    $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'delete protected account');
+                    $response['message'] = "Permission Denied: Staff Admin users cannot be deleted.";
+                } elseif ($this->actorGameUser($data['vmd_user_email'])) {
+                    $response['message'] = "Permission Denied: Students cannot delete Staff users.";
+                } else {
+                    $response['message'] = "Permission Denied: You do not have permission to delete this Staff user.";
+                }
+
+                $response['outcome'] = "FAIL";
+                return response()->json($response, 403);
+            }
+
             $user->status       = "DELETED";
             $user->updated_by   = $data['updated_by'] ?? $user->updated_by;
             $user->save();
@@ -2171,7 +2440,7 @@ class CustomController extends Controller
 
         $data = $validator->validated();
 
-        $notification = $this->createPersistedNotification([
+        $notificationInput = [
             'recipient_email' => $data['recipient_email'],
             'actor_email' => $data['actor_email'] ?? null,
             'type' => $data['type'] ?? 'info',
@@ -2182,7 +2451,17 @@ class CustomController extends Controller
             'dedupe_key' => $data['dedupe_key'] ?? null,
             'metadata' => $this->normalizeNotificationMetadata($data['metadata'] ?? []),
             'created_at' => $data['created_at'] ?? now(),
-        ]);
+        ];
+
+        if ($this->isProfileWatcherStudentUnbanArtifact($notificationInput)) {
+            return response()->json([
+                'outcome' => 'SUPPRESSED',
+                'message' => 'Profile watcher student unban artifact suppressed.',
+                'data' => null,
+            ], 200);
+        }
+
+        $notification = $this->createPersistedNotification($notificationInput);
 
         return response()->json([
             'outcome' => 'SUCCESS',
@@ -2741,6 +3020,7 @@ if ($validator->fails()) {
                 'title' => 'You have been unbanned',
                 'message' => "{$displayName}, your account has been unbanned by {$data['vmd_user_name']}.",
                 'source' => 'user-management',
+                'dedupe_key' => 'student-unbanned-' . intval($gameUser->id) . '-' . now()->format('YmdHis'),
                 'metadata' => [
                     'game_user_id' => intval($gameUser->id),
                     'game_status' => $status,
