@@ -332,6 +332,32 @@ class CustomController extends Controller
         return strcasecmp($this->staffRoleName($user), 'Admin') === 0;
     }
 
+    private function roleInputIsAdmin($roleName, $roleId = null): bool
+    {
+        if ($roleName && strcasecmp((string) $roleName, 'Admin') === 0) {
+            return true;
+        }
+
+        if ($roleId) {
+            $role = Role::where('id', $roleId)->first();
+
+            return $role && strcasecmp((string) $role->name, 'Admin') === 0;
+        }
+
+        return false;
+    }
+
+    private function nonAdminStaffAssigningAdmin(?string $actorEmail, $roleId = null, $roleName = null): bool
+    {
+        if (! $this->roleInputIsAdmin($roleName, $roleId)) {
+            return false;
+        }
+
+        $actorStaff = $actorEmail ? User::where('email', $actorEmail)->first() : null;
+
+        return $actorStaff && ! $this->isStaffAdmin($actorStaff);
+    }
+
     private function staffAssignedIntakeQuery(User $user)
     {
         $now = now();
@@ -410,6 +436,86 @@ class CustomController extends Controller
         }
 
         return $query->exists();
+    }
+
+    private function historyIntakeScope(?string $viewerEmail, $requestedIntakeId, ?string $requestedIntakeCode): array
+    {
+        $requestedIntakeId = $requestedIntakeId ? (int) $requestedIntakeId : null;
+        $requestedIntakeCode = $requestedIntakeCode ? trim($requestedIntakeCode) : null;
+
+        $viewer = $viewerEmail ? User::where('email', $viewerEmail)->first() : null;
+        if ($viewer) {
+            if ($this->isStaffAdmin($viewer)) {
+                if ($requestedIntakeCode) {
+                    return ['mode' => 'single_code', 'code' => $requestedIntakeCode];
+                }
+
+                if ($requestedIntakeId) {
+                    return ['mode' => 'single_id', 'id' => $requestedIntakeId];
+                }
+
+                return ['mode' => 'all'];
+            }
+
+            if ($requestedIntakeCode || $requestedIntakeId) {
+                if ($this->staffCanAccessIntake($viewer, $requestedIntakeId, $requestedIntakeCode)) {
+                    return $requestedIntakeCode
+                        ? ['mode' => 'single_code', 'code' => $requestedIntakeCode]
+                        : ['mode' => 'single_id', 'id' => $requestedIntakeId];
+                }
+
+                return ['mode' => 'none'];
+            }
+
+            $assignedIds = $this->staffAssignedIntakeQuery($viewer)
+                ->pluck('game_intakes.id')
+                ->map(fn ($id) => (int) $id)
+                ->values()
+                ->all();
+
+            return count($assignedIds) > 0
+                ? ['mode' => 'multiple_ids', 'ids' => $assignedIds]
+                : ['mode' => 'none'];
+        }
+
+        $viewerGameUser = $viewerEmail ? GameUser::where('email', $viewerEmail)->first() : null;
+        if ($viewerGameUser) {
+            $intake = DB::table('game_intakes')->where('id', $viewerGameUser->intake_id)->first();
+
+            return $intake
+                ? ['mode' => 'single_code', 'code' => $intake->code]
+                : ['mode' => 'single_id', 'id' => (int) $viewerGameUser->intake_id];
+        }
+
+        return ['mode' => 'none'];
+    }
+
+    private function applyHistoryIntakeScope($query, array $scope)
+    {
+        if (($scope['mode'] ?? 'none') === 'all') {
+            return $query;
+        }
+
+        return $query->where(function ($scopeQuery) use ($scope) {
+            $scopeQuery->whereNull('game_users.id');
+
+            $scopeQuery->orWhere(function ($studentQuery) use ($scope) {
+                switch ($scope['mode'] ?? 'none') {
+                    case 'single_code':
+                        $studentQuery->where('game_intakes.code', $scope['code']);
+                        break;
+                    case 'single_id':
+                        $studentQuery->where('game_users.intake_id', $scope['id']);
+                        break;
+                    case 'multiple_ids':
+                        $studentQuery->whereIn('game_users.intake_id', $scope['ids']);
+                        break;
+                    default:
+                        $studentQuery->whereRaw('1 = 0');
+                        break;
+                }
+            });
+        });
     }
 
     public function F0_VMD_get_staff_game_intakes(Request $request)
@@ -2222,6 +2328,7 @@ class CustomController extends Controller
         $method = $request->input('method');
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
+        $historyIntakeScope = $this->historyIntakeScope($email, $gameIntakeId, $gameIntakeCode);
 
         // Get the total number of records in the table
         $recordsTotal = DB::table('user_login_history')->count();
@@ -2231,28 +2338,10 @@ class CustomController extends Controller
                 ->leftJoin('game_users', 'user_login_history.email', '=', 'game_users.email')
                 ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id');
         };
-        $applyGameIntakeScope = function ($query) use ($gameIntakeId, $gameIntakeCode) {
-            if (! $gameIntakeId && ! $gameIntakeCode) {
-                return $query;
-            }
-
-            return $query->where(function ($scopeQuery) use ($gameIntakeId, $gameIntakeCode) {
-                $scopeQuery->whereNull('game_users.id');
-
-                $scopeQuery->orWhere(function ($studentQuery) use ($gameIntakeId, $gameIntakeCode) {
-                    if ($gameIntakeCode) {
-                        $studentQuery->where('game_intakes.code', $gameIntakeCode);
-                    } elseif ($gameIntakeId) {
-                        $studentQuery->where('game_users.intake_id', $gameIntakeId);
-                    }
-                });
-            });
-        };
-
         // Apply filters based on method
         switch ($method) {
             case 'single user':
-                $login_history_list = $applyGameIntakeScope($newLoginHistoryQuery())
+                $login_history_list = $this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)
                     ->where('user_login_history.email', $email)
                     ->select(
                         'user_login_history.*',
@@ -2265,7 +2354,7 @@ class CustomController extends Controller
                 break;
 
             case 'Staff Logins':
-                $login_history_list = $applyGameIntakeScope($newLoginHistoryQuery())
+                $login_history_list = $this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)
                     ->where(function ($query) {
                         $query->where('user_login_history.login_identity_type', 'staff')
                             ->orWhereNull('user_login_history.login_identity_type');
@@ -2282,7 +2371,7 @@ class CustomController extends Controller
                 break;
 
             case 'Student Logins':
-                $login_history_list = $applyGameIntakeScope($newLoginHistoryQuery())
+                $login_history_list = $this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)
                     ->where('user_login_history.login_identity_type', 'student')
                     ->select(
                         'user_login_history.*',
@@ -2296,7 +2385,7 @@ class CustomController extends Controller
                 break;
 
             default:
-                $login_history_list = $applyGameIntakeScope($newLoginHistoryQuery())
+                $login_history_list = $this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)
                     ->select(
                         'user_login_history.*',
                         'users.google_id',
@@ -2371,6 +2460,7 @@ class CustomController extends Controller
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
         $viewer = $requestEmail ? DB::table('users')->where('email', $requestEmail)->first() : null;
         $canViewProtectedSecurityAudits = $viewer && in_array($viewer->role_name, ['Admin', 'Protector', 'Trainer'], true);
+        $historyIntakeScope = $this->historyIntakeScope($requestEmail, $gameIntakeId, $gameIntakeCode);
 
 
         $auditHistoryQuery = DB::table('user_audit_history')
@@ -2383,19 +2473,7 @@ class CustomController extends Controller
                 DB::raw('COALESCE(users.email, game_users.email) as target_email')
             );
 
-        if ($gameIntakeId || $gameIntakeCode) {
-            $auditHistoryQuery->where(function ($query) use ($gameIntakeId, $gameIntakeCode) {
-                $query->whereNull('game_users.id');
-
-                $query->orWhere(function ($studentQuery) use ($gameIntakeId, $gameIntakeCode) {
-                    if ($gameIntakeCode) {
-                        $studentQuery->where('game_intakes.code', $gameIntakeCode);
-                    } elseif ($gameIntakeId) {
-                        $studentQuery->where('game_users.intake_id', $gameIntakeId);
-                    }
-                });
-            });
-        }
+        $auditHistoryQuery = $this->applyHistoryIntakeScope($auditHistoryQuery, $historyIntakeScope);
 
         if (! $canViewProtectedSecurityAudits) {
             $auditHistoryQuery
@@ -2709,6 +2787,13 @@ if ($validator->fails()) {
             return response()->json(['errors' => "Permission Denied:  (You cannot edit the Admin account)"], 403);
         }
 
+        if ($this->nonAdminStaffAssigningAdmin($data['vmd_user_email'], $data['role_id'] ?? null, $data['role_name'] ?? null)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Only Staff Admins can assign the Admin role.',
+            ], 403);
+        }
+
         // Update the user record based on ID
         $user = User::where('id', $data['id'])->first();
 
@@ -2856,6 +2941,13 @@ if ($validator->fails()) {
                 'outcome' => 'FAIL',
                 'message' => 'Students cannot be assigned the Trainer role.',
             ], 422);
+        }
+
+        if ($this->nonAdminStaffAssigningAdmin($data['vmd_user_email'], null, $data['role_name'] ?? null)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Only Staff Admins can assign the Admin role.',
+            ], 403);
         }
 
         DB::table('game_users')->where('id', $data['id'])->update([
