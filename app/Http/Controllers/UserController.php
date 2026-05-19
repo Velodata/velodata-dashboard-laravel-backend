@@ -17,12 +17,14 @@ class UserController extends Controller
 {
     private function getAuditIpAddress(Request $request): string
     {
-        $clientIpv4 = $request->input('vmd_ip_address_v4');
+        $clientIpv4 = $request->input('vmd_ip_address_v4')
+            ?: $request->input('data.attributes.vmd_ip_address_v4');
         if ($clientIpv4 && filter_var($clientIpv4, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
             return $clientIpv4;
         }
 
-        $clientIpv6 = $request->input('vmd_ip_address_v6');
+        $clientIpv6 = $request->input('vmd_ip_address_v6')
+            ?: $request->input('data.attributes.vmd_ip_address_v6');
         if ($clientIpv6 && filter_var($clientIpv6, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
             return $clientIpv6;
         }
@@ -66,7 +68,7 @@ class UserController extends Controller
         if ($user) {
             $roleName = $user->role_name ?: optional($user->roles()->first())->name;
 
-            return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+            return in_array(strtolower((string) $roleName), ['admin', 'protector', 'trainer'], true);
         }
 
         $gameUser = GameUser::where('email', $email)->first();
@@ -419,8 +421,7 @@ class UserController extends Controller
         $user->save();
 
         // Determine real IP address
-        $realIp = $request->header('X-Forwarded-For');
-        $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
+        $realIp = $this->getAuditIpAddress($request);
 
         // Handle optional audit trail for admin-created users
         $comments = $createdByEmail && $createdByName
@@ -467,6 +468,13 @@ class UserController extends Controller
         }
 
         $roleName = DB::table('roles')->where('id', $roleId)->value('name') ?: 'Creator';
+        if (strcasecmp((string) $roleName, 'Trainer') === 0) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot create Trainer accounts.',
+            ], 422);
+        }
+
         $nameParts = preg_split('/\s+/', $name, -1, PREG_SPLIT_NO_EMPTY);
         $firstName = $nameParts[0] ?? $name;
         $surname = count($nameParts) > 1 ? implode(' ', array_slice($nameParts, 1)) : 'Account';
@@ -611,6 +619,17 @@ class UserController extends Controller
             return $timeoutResponse;
         }
 
+        $user = User::findOrFail($userId);
+        if ((int) $user->id === 1 || strcasecmp((string) $user->email, 'admin@velodata.org') === 0) {
+            return response()->json([
+                'error' => [
+                    'title' => 'Permission Denied',
+                    'detail' => 'The System Admin avatar cannot be changed.',
+                    'status' => 403,
+                ]
+            ], 403);
+        }
+
         $path = "users/{$userId}/profile-image";
 
         try {
@@ -630,7 +649,6 @@ class UserController extends Controller
             $fileUrl = Storage::url($filePath);
 
             // Update user profile_image URL in the database
-            $user = User::findOrFail($userId);
             $user->ensureCustno();
             // Use the current request host so local uploads resolve via laravel.localhost
             // and production uploads resolve via the production API host.
@@ -703,7 +721,7 @@ class UserController extends Controller
         if (! $isSelfUpdate && ! $this->canManageGameUsers($actorEmail)) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin or Protector.',
+                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin, Protector, or Trainer.',
             ], 403);
         }
 

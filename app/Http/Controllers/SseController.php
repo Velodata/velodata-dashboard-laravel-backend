@@ -18,7 +18,7 @@ class SseController extends Controller
         $roleName = strtolower((string) ($user->role_name ?? ''));
         $roleId = (int) ($user->role_id ?? 0);
 
-        return in_array($roleName, ['admin', 'protector'], true) || in_array($roleId, [1, 5], true);
+        return in_array($roleName, ['admin', 'protector', 'trainer'], true) || in_array($roleId, [1, 5], true);
     }
 
     private function getLatestProtectedSecurityAudit()

@@ -18,6 +18,20 @@ use Carbon\Carbon;
 
 class RoleController extends Controller
 {
+    private function actorCanModifyRoleManagementAccess(array $attributes): bool
+    {
+        return strtolower((string) ($attributes['vmd_user_email'] ?? '')) === 'admin@velodata.org';
+    }
+
+    private function roleCurrentlyHasRoleManagementAccess(Role $role): bool
+    {
+        return DB::table('role_has_permissions')
+            ->join('permissions', 'role_has_permissions.permission_id', '=', 'permissions.id')
+            ->where('role_has_permissions.role_id', $role->id)
+            ->where('permissions.name', 'view roles')
+            ->exists();
+    }
+
     // Get all roles
     // public function index()
     // {
@@ -123,14 +137,15 @@ class RoleController extends Controller
         $structured = [];
 
         foreach ($permissions as $permission) {
-            if (preg_match('/(\w+)\s(\w+)/', $permission->name, $matches)) {
-                $action = $matches[1]; // e.g. 'edit'
-                $module = $matches[2]; // e.g. 'users'
+            $parts = explode(' ', (string) $permission->name, 2);
+
+            if (count($parts) === 2) {
+                $action = $parts[0]; // e.g. 'edit'
+                $module = $parts[1]; // e.g. 'user-audit-history'
 
                 if (!isset($structured[$module])) {
                     $structured[$module] = ['view' => false, 'create' => false, 'edit' => false, 'delete' => false];
                 }
-
                 $structured[$module][$action] = true;
             }
         }
@@ -209,11 +224,27 @@ class RoleController extends Controller
 
         // Find and update the role name
         $role = Role::findOrFail($id);
+        $permissionsInput = $attributes['permissions'] ?? [];
+
+        if (strtolower((string) $role->name) === 'admin') {
+            if (strtolower((string) ($attributes['name'] ?? '')) !== 'admin') {
+                return response()->json([
+                    'message' => 'The Admin role cannot be renamed.',
+                ], 403);
+            }
+
+            $permissionsInput['roles'] = $permissionsInput['roles'] ?? [];
+        }
+
+        if (! $this->actorCanModifyRoleManagementAccess($attributes)) {
+            $permissionsInput['roles'] = $permissionsInput['roles'] ?? [];
+            $permissionsInput['roles']['view'] = $this->roleCurrentlyHasRoleManagementAccess($role);
+        }
+
         $role->name = $attributes['name'];
         $role->save();
 
         // Process permissions
-        $permissionsInput = $attributes['permissions'] ?? [];
         $flattenedPermissionNames = [];
 
         foreach ($permissionsInput as $module => $actions) {
@@ -237,7 +268,9 @@ class RoleController extends Controller
             'permission_id' => $permissionId
         ], $permissionIds);
 
-        DB::table('role_has_permissions')->insert($insertRows);
+        if (! empty($insertRows)) {
+            DB::table('role_has_permissions')->insert($insertRows);
+        }
 
         return response()->json([
             'message' => 'Role updated successfully',

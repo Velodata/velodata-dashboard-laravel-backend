@@ -54,6 +54,34 @@ class CustomController extends Controller
         return is_numeric($value) ? intval($value) : $default;
     }
 
+    private function intakeGameSettingValue(?int $intakeId, string $key, $default = null)
+    {
+        if (! $intakeId || ! Schema::hasTable('game_intake_settings')) {
+            return $default;
+        }
+
+        $setting = DB::table('game_intake_settings')
+            ->where('game_intake_id', $intakeId)
+            ->where('key', $key)
+            ->first();
+
+        return $setting ? $setting->value : $default;
+    }
+
+    private function intakeGameSettingBoolean(?int $intakeId, string $key, bool $default = false): bool
+    {
+        $value = $this->intakeGameSettingValue($intakeId, $key, $default ? '1' : '0');
+
+        return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    private function intakeGameSettingInteger(?int $intakeId, string $key, int $default = 0): int
+    {
+        $value = $this->intakeGameSettingValue($intakeId, $key, (string) $default);
+
+        return is_numeric($value) ? intval($value) : $default;
+    }
+
     private function userManagementTimeoutResponse(?string $email)
     {
         if (! $email) {
@@ -112,17 +140,28 @@ class CustomController extends Controller
         string $reason,
         ?int $targetGameUserId = null
     ): ?Carbon {
-        if (! $targetWasActive || ! $this->dashboardSettingBoolean('game_delete_cooldown_enabled', false)) {
-            return null;
-        }
-
-        $minutes = max(0, $this->dashboardSettingInteger('game_delete_cooldown_minutes', 5));
-        if ($minutes === 0) {
-            return null;
-        }
-
         $actorGameUser = GameUser::where('email', $actorEmail)->first();
         if (! $actorGameUser) {
+            return null;
+        }
+
+        $intakeId = $actorGameUser->intake_id ? intval($actorGameUser->intake_id) : null;
+        $cooldownEnabled = $this->intakeGameSettingBoolean(
+            $intakeId,
+            'game_delete_cooldown_enabled',
+            $this->dashboardSettingBoolean('game_delete_cooldown_enabled', false)
+        );
+
+        if (! $targetWasActive || ! $cooldownEnabled) {
+            return null;
+        }
+
+        $minutes = max(0, $this->intakeGameSettingInteger(
+            $intakeId,
+            'game_delete_cooldown_minutes',
+            $this->dashboardSettingInteger('game_delete_cooldown_minutes', 5)
+        ));
+        if ($minutes === 0) {
             return null;
         }
 
@@ -184,6 +223,29 @@ class CustomController extends Controller
         return $role && strcasecmp((string) $role->name, 'Admin') === 0;
     }
 
+    private function isStaffRoleEmail(?string $email, array $allowedRoles): bool
+    {
+        if (!$email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+
+        if (!$user) {
+            return false;
+        }
+
+        $roleName = strtolower($this->staffRoleName($user));
+        $allowedRoles = array_map('strtolower', $allowedRoles);
+
+        return in_array($roleName, $allowedRoles, true);
+    }
+
+    private function canAccessGlobalManagement(?string $email): bool
+    {
+        return $this->isStaffRoleEmail($email, ['Admin', 'Trainer']);
+    }
+
     private function canManageGameUsers(?string $email): bool
     {
         if (! $email) {
@@ -195,13 +257,20 @@ class CustomController extends Controller
         if ($user) {
             $roleName = $user->role_name ?: optional($user->roles()->first())->name;
 
-            return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+            return in_array(strtolower((string) $roleName), ['admin', 'protector', 'trainer'], true);
         }
 
         $gameUser = GameUser::where('email', $email)->first();
         $roleName = $gameUser?->game_role;
 
         return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+    }
+
+    private function isGameUserAdminActor(?string $email): bool
+    {
+        $gameUser = $this->actorGameUser($email);
+
+        return $gameUser && strcasecmp((string) $gameUser->game_role, 'Admin') === 0;
     }
 
     private function actorGameUser(?string $email): ?GameUser
@@ -223,7 +292,7 @@ class CustomController extends Controller
         if ($actorStaff) {
             $roleName = $this->staffRoleName($actorStaff);
 
-            return in_array(strtolower($roleName), ['admin', 'protector'], true);
+            return in_array(strtolower($roleName), ['admin', 'protector', 'trainer'], true);
         }
 
         $actorGameUser = $this->actorGameUser($actorEmail);
@@ -245,7 +314,7 @@ class CustomController extends Controller
 
         $roleName = $this->staffRoleName($actorStaff);
 
-        return in_array(strtolower($roleName), ['admin', 'protector'], true);
+        return in_array(strtolower($roleName), ['admin', 'protector', 'trainer'], true);
     }
 
     private function canUnbanStaffUser(?string $actorEmail, User $targetUser): bool
@@ -976,7 +1045,7 @@ class CustomController extends Controller
     {
         $recipients = DB::table('users')
             ->where(function ($query) {
-                $query->whereIn(DB::raw('LOWER(role_name)'), ['admin', 'protector'])
+                $query->whereIn(DB::raw('LOWER(role_name)'), ['admin', 'protector', 'trainer'])
                     ->orWhereIn('role_id', [1, 5]);
             })
             ->where(function ($query) {
@@ -1228,15 +1297,16 @@ class CustomController extends Controller
                     $languages = is_array($decodedLanguages) ? $decodedLanguages : [];
                 }
 
-                $creatorRole = DB::table('roles')->whereRaw('LOWER(name) = ?', ['creator'])->first();
+                $gameRoleName = $gameUser->game_role ?: 'Member';
+                $gameRole = DB::table('roles')->whereRaw('LOWER(name) = ?', [strtolower($gameRoleName)])->first();
 
                 return response()->json([
                     "outcome" => 'SUCCESS: Existing game user successfully extracted.',
                     "id" => intval($gameUser->id),
                     "profile_image" => $gameUser->profile_image,
                     "custno" => 900000 + intval($gameUser->id),
-                    "role_id" => $creatorRole ? intval($creatorRole->id) : 2,
-                    "role_name" => $gameUser->game_role,
+                    "role_id" => $gameRole ? intval($gameRole->id) : null,
+                    "role_name" => $gameRoleName,
                     "status" => strtoupper($gameUser->game_status),
                     "is_system_user" => false,
                     "is_game_user" => true,
@@ -1355,14 +1425,16 @@ class CustomController extends Controller
                     $decodedLanguages = json_decode($gameUser->languages, true);
                     $languages = is_array($decodedLanguages) ? $decodedLanguages : [];
                 }
+                $gameRoleName = $gameUser->game_role ?: 'Member';
+                $gameRole = DB::table('roles')->whereRaw('LOWER(name) = ?', [strtolower($gameRoleName)])->first();
 
                 return response()->json([
                     "outcome" => 'SUCCESS: Existing game user successfully extracted.',
                     "id" => intval($gameUser->id),
                     "profile_image" => $gameUser->profile_image,
                     "custno" => 900000 + intval($gameUser->id),
-                    "role_id" => null,
-                    "role_name" => $gameUser->game_role,
+                    "role_id" => $gameRole ? intval($gameRole->id) : null,
+                    "role_name" => $gameRoleName,
                     "status" => $gameUser->game_status,
                     "is_system_user" => false,
                     "is_game_user" => true,
@@ -2298,7 +2370,7 @@ class CustomController extends Controller
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
         $viewer = $requestEmail ? DB::table('users')->where('email', $requestEmail)->first() : null;
-        $canViewProtectedSecurityAudits = $viewer && in_array($viewer->role_name, ['Admin', 'Protector'], true);
+        $canViewProtectedSecurityAudits = $viewer && in_array($viewer->role_name, ['Admin', 'Protector', 'Trainer'], true);
 
 
         $auditHistoryQuery = DB::table('user_audit_history')
@@ -2775,8 +2847,15 @@ if ($validator->fails()) {
         if (strcasecmp($gameUser->email, $data['email']) !== 0 || (! $isSelfUpdate && ! $this->canManageGameUsers($data['vmd_user_email']))) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin or Protector.',
+                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin, Protector, or Trainer.',
             ], 403);
+        }
+
+        if (isset($data['role_name']) && strcasecmp((string) $data['role_name'], 'Trainer') === 0) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot be assigned the Trainer role.',
+            ], 422);
         }
 
         DB::table('game_users')->where('id', $data['id'])->update([
@@ -2908,7 +2987,7 @@ if ($validator->fails()) {
         if (! $isSelfPasswordChange && ! $this->canManageGameUsers($data['vmd_user_email'])) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: You can only change your own student password unless you are Admin or Protector.',
+                'message' => 'Permission Denied: You can only change your own student password unless you are Admin, Protector, or Trainer.',
             ], 403);
         }
 
@@ -2962,7 +3041,7 @@ if ($validator->fails()) {
         if (! $this->canManageGameUsers($data['vmd_user_email'])) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: Admin or Protector access required.',
+                'message' => 'Permission Denied: Admin, Protector, or Trainer access required.',
             ], 403);
         }
 
@@ -2981,6 +3060,17 @@ if ($validator->fails()) {
                 'outcome' => 'FAIL',
                 'message' => 'Game user not found.',
             ], 404);
+        }
+
+        if (
+            in_array($status, ['BANNED', 'DELETED'], true)
+            && $this->isGameUserAdminActor($data['vmd_user_email'])
+            && strcasecmp((string) $gameUser->game_role, 'Admin') === 0
+        ) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Student Admin users cannot ban or delete Admin users.',
+            ], 403);
         }
 
         $targetWasActive = strcasecmp((string) $gameUser->game_status, 'ACTIVE') === 0;
@@ -3079,9 +3169,9 @@ if ($validator->fails()) {
             'vmd_user_email' => 'required|email',
         ]);
 
-        if (!$this->isAdminEmail($request->input('vmd_user_email'))) {
+        if (!$this->canAccessGlobalManagement($request->input('vmd_user_email'))) {
             return response()->json([
-                'outcome' => 'ERROR: Admin access required.',
+                'outcome' => 'ERROR: Staff Admin or Trainer access required.',
             ], 403);
         }
 
@@ -3104,50 +3194,61 @@ if ($validator->fails()) {
         $request->validate([
             'vmd_user_email' => 'required|email',
             'settings' => 'required|array',
-            'settings.login_2fa_enabled' => 'required|boolean',
-            'settings.login_2fa_send_to_account' => 'required|boolean',
-            'settings.login_2fa_send_to_master' => 'required|boolean',
+            'settings.login_2fa_enabled' => 'nullable|boolean',
+            'settings.login_2fa_send_to_account' => 'nullable|boolean',
+            'settings.login_2fa_send_to_master' => 'nullable|boolean',
             'settings.login_2fa_master_email' => 'nullable|email',
-            'settings.game_delete_cooldown_enabled' => 'required|boolean',
-            'settings.game_delete_cooldown_minutes' => 'required|integer|min:1|max:1440',
+            'settings.game_delete_cooldown_enabled' => 'nullable|boolean',
+            'settings.game_delete_cooldown_minutes' => 'nullable|integer|min:1|max:1440',
         ]);
 
-        if (!$this->isAdminEmail($request->input('vmd_user_email'))) {
+        $actorEmail = $request->input('vmd_user_email');
+
+        if (!$this->canAccessGlobalManagement($actorEmail)) {
             return response()->json([
-                'outcome' => 'ERROR: Admin access required.',
+                'outcome' => 'ERROR: Staff Admin or Trainer access required.',
             ], 403);
         }
 
         $settings = $request->input('settings');
-        $twoFactorEnabled = (bool) $settings['login_2fa_enabled'];
-        $sendToAccount = (bool) $settings['login_2fa_send_to_account'];
-        $sendToMaster = (bool) $settings['login_2fa_send_to_master'];
-        $masterEmail = $settings['login_2fa_master_email'] ?? '';
-        $deleteCooldownEnabled = (bool) $settings['game_delete_cooldown_enabled'];
-        $deleteCooldownMinutes = intval($settings['game_delete_cooldown_minutes']);
+        $isAdmin = $this->isAdminEmail($actorEmail);
+        $updates = [];
 
-        if ($twoFactorEnabled && !$sendToAccount && !$sendToMaster) {
-            return response()->json([
-                'outcome' => 'ERROR: Invalid dashboard settings.',
-                'message' => 'When 2FA is enabled, at least one 2FA email destination must be enabled.',
-            ], 422);
+        if ($isAdmin) {
+            $twoFactorEnabled = (bool) ($settings['login_2fa_enabled'] ?? false);
+            $sendToAccount = (bool) ($settings['login_2fa_send_to_account'] ?? false);
+            $sendToMaster = (bool) ($settings['login_2fa_send_to_master'] ?? false);
+            $masterEmail = $settings['login_2fa_master_email'] ?? '';
+
+            if ($twoFactorEnabled && !$sendToAccount && !$sendToMaster) {
+                return response()->json([
+                    'outcome' => 'ERROR: Invalid dashboard settings.',
+                    'message' => 'When 2FA is enabled, at least one 2FA email destination must be enabled.',
+                ], 422);
+            }
+
+            if ($twoFactorEnabled && $sendToMaster && !$masterEmail) {
+                return response()->json([
+                    'outcome' => 'ERROR: Invalid dashboard settings.',
+                    'message' => 'A valid master email account is required when master 2FA email copies are enabled.',
+                ], 422);
+            }
+
+            $updates = [
+                'login_2fa_enabled' => $twoFactorEnabled ? '1' : '0',
+                'login_2fa_send_to_account' => $sendToAccount ? '1' : '0',
+                'login_2fa_send_to_master' => $sendToMaster ? '1' : '0',
+                'login_2fa_master_email' => $masterEmail,
+            ];
         }
 
-        if ($twoFactorEnabled && $sendToMaster && !$masterEmail) {
-            return response()->json([
-                'outcome' => 'ERROR: Invalid dashboard settings.',
-                'message' => 'A valid master email account is required when master 2FA email copies are enabled.',
-            ], 422);
+        if (array_key_exists('game_delete_cooldown_enabled', $settings)) {
+            $updates['game_delete_cooldown_enabled'] = (bool) $settings['game_delete_cooldown_enabled'] ? '1' : '0';
         }
 
-        $updates = [
-            'login_2fa_enabled' => $twoFactorEnabled ? '1' : '0',
-            'login_2fa_send_to_account' => $sendToAccount ? '1' : '0',
-            'login_2fa_send_to_master' => $sendToMaster ? '1' : '0',
-            'login_2fa_master_email' => $masterEmail,
-            'game_delete_cooldown_enabled' => $deleteCooldownEnabled ? '1' : '0',
-            'game_delete_cooldown_minutes' => (string) $deleteCooldownMinutes,
-        ];
+        if (array_key_exists('game_delete_cooldown_minutes', $settings)) {
+            $updates['game_delete_cooldown_minutes'] = (string) intval($settings['game_delete_cooldown_minutes']);
+        }
 
         foreach ($updates as $key => $value) {
             DB::table('dashboard_settings')
@@ -3161,6 +3262,163 @@ if ($validator->fails()) {
         return response()->json([
             'outcome' => 'SUCCESS: Dashboard settings updated.',
             'settings' => $this->dashboardSettingRows(),
+        ]);
+    }
+
+    public function F0_VMD_get_intake_game_settings(Request $request)
+    {
+        $request->validate([
+            'vmd_user_email' => 'required|email',
+            'game_intake_id' => 'nullable|integer|exists:game_intakes,id',
+        ]);
+
+        if (! Schema::hasTable('game_intake_settings')) {
+            return response()->json([
+                'outcome' => 'ERROR: Intake game settings table is missing.',
+                'message' => 'Game intake settings table is missing. Run migrations.',
+            ], 500);
+        }
+
+        $email = $request->input('vmd_user_email');
+        if (!$this->canAccessGlobalManagement($email)) {
+            return response()->json([
+                'outcome' => 'ERROR: Staff Admin or Trainer access required.',
+            ], 403);
+        }
+
+        $user = User::where('email', $email)->first();
+        if (! $user) {
+            return response()->json([
+                'outcome' => 'ERROR: Staff user not found.',
+            ], 404);
+        }
+
+        $intakes = $this->staffVisibleIntakes($user);
+        if ($intakes->isEmpty()) {
+            return response()->json([
+                'outcome' => 'SUCCESS: No Class Intakes available.',
+                'intakes' => [],
+                'selected_intake' => null,
+                'settings' => [],
+            ]);
+        }
+
+        $requestedIntakeId = $request->integer('game_intake_id') ?: null;
+        $selectedIntake = $requestedIntakeId
+            ? $intakes->firstWhere('id', $requestedIntakeId)
+            : $intakes->first();
+
+        if (! $selectedIntake) {
+            return response()->json([
+                'outcome' => 'ERROR: Class Intake not available.',
+                'message' => 'You do not have access to that Class Intake.',
+            ], 403);
+        }
+
+        $intakeId = (int) $selectedIntake['id'];
+        $this->ensureIntakeGameSettings($intakeId);
+        $freshIntake = DB::table('game_intakes')->where('id', $intakeId)->first();
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Intake game settings loaded.',
+            'intakes' => $intakes,
+            'selected_intake' => [
+                'id' => $intakeId,
+                'code' => $freshIntake->code,
+                'name' => $freshIntake->name,
+                'status' => $freshIntake->status,
+                'activeWeek' => $freshIntake->active_week,
+            ],
+            'settings' => $this->intakeGameSettingRows($intakeId),
+        ]);
+    }
+
+    public function F0_VMD_save_intake_game_settings(Request $request)
+    {
+        $request->validate([
+            'vmd_user_email' => 'required|email',
+            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+            'active_week' => 'required|string|in:week_1,week_2,week_3,week_4,week_5,week_6',
+            'settings' => 'required|array',
+        ]);
+
+        if (! Schema::hasTable('game_intake_settings')) {
+            return response()->json([
+                'outcome' => 'ERROR: Intake game settings table is missing.',
+                'message' => 'Game intake settings table is missing. Run migrations.',
+            ], 500);
+        }
+
+        $email = $request->input('vmd_user_email');
+        if (!$this->canAccessGlobalManagement($email)) {
+            return response()->json([
+                'outcome' => 'ERROR: Staff Admin or Trainer access required.',
+            ], 403);
+        }
+
+        $user = User::where('email', $email)->first();
+        $intakeId = $request->integer('game_intake_id');
+
+        if (! $user || ! $this->staffCanAccessIntake($user, $intakeId, null)) {
+            return response()->json([
+                'outcome' => 'ERROR: Class Intake not available.',
+                'message' => 'You do not have access to that Class Intake.',
+            ], 403);
+        }
+
+        $definitions = $this->intakeGameSettingDefinitions();
+        $settings = $request->input('settings', []);
+
+        if (
+            array_key_exists('game_delete_cooldown_minutes', $settings) &&
+            (! is_numeric($settings['game_delete_cooldown_minutes']) ||
+                intval($settings['game_delete_cooldown_minutes']) < 1 ||
+                intval($settings['game_delete_cooldown_minutes']) > 1440)
+        ) {
+            return response()->json([
+                'outcome' => 'ERROR: Invalid intake game settings.',
+                'message' => 'Delete timeout minutes must be between 1 and 1440.',
+            ], 422);
+        }
+
+        DB::transaction(function () use ($intakeId, $request, $definitions, $settings) {
+            DB::table('game_intakes')
+                ->where('id', $intakeId)
+                ->update([
+                    'active_week' => $request->input('active_week'),
+                    'updated_at' => now(),
+                ]);
+
+            $this->ensureIntakeGameSettings($intakeId);
+
+            foreach ($settings as $key => $value) {
+                if (! array_key_exists($key, $definitions)) {
+                    continue;
+                }
+
+                $definition = $definitions[$key];
+                DB::table('game_intake_settings')
+                    ->where('game_intake_id', $intakeId)
+                    ->where('key', $key)
+                    ->update([
+                        'value' => $this->intakeSettingStorageValue($value, $definition['type']),
+                        'updated_at' => now(),
+                    ]);
+            }
+        });
+
+        $freshIntake = DB::table('game_intakes')->where('id', $intakeId)->first();
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Intake game settings saved.',
+            'selected_intake' => [
+                'id' => $intakeId,
+                'code' => $freshIntake->code,
+                'name' => $freshIntake->name,
+                'status' => $freshIntake->status,
+                'activeWeek' => $freshIntake->active_week,
+            ],
+            'settings' => $this->intakeGameSettingRows($intakeId),
         ]);
     }
 
@@ -3207,6 +3465,334 @@ if ($validator->fails()) {
         return response()->json([
             'outcome' => 'SUCCESS: User table baselines loaded.',
             'data' => $baselines,
+        ], 200);
+    }
+
+    private function userTableBaselineRows()
+    {
+        return DB::table('user_table_baselines')
+            ->leftJoin('users', 'users.id', '=', 'user_table_baselines.created_by_user_id')
+            ->select(
+                'user_table_baselines.*',
+                'users.name as created_by_name',
+                'users.email as created_by_email'
+            )
+            ->orderBy('user_table_baselines.created_at', 'DESC')
+            ->get()
+            ->map(function ($baseline) {
+                return [
+                    'id' => $baseline->id,
+                    'name' => $baseline->name,
+                    'description' => $baseline->description,
+                    'is_active' => (bool) $baseline->is_active,
+                    'created_by_user_id' => $baseline->created_by_user_id,
+                    'created_by_name' => $baseline->created_by_name,
+                    'created_by_email' => $baseline->created_by_email,
+                    'row_count' => DB::table('user_table_baseline_rows')->where('baseline_id', $baseline->id)->count(),
+                    'created_at' => $baseline->created_at,
+                    'updated_at' => $baseline->updated_at,
+                    'baseline_type' => 'users',
+                ];
+            });
+    }
+
+    private function intakeGameSettingDefinitions(): array
+    {
+        return [
+            'security_manual_login_requires_2fa' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Manual login requires 2FA', 'sort' => 10],
+            'security_block_banned_login' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Banned players cannot log in', 'sort' => 20],
+            'security_protect_admin_account' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Protected Admin account cannot be edited, banned, or deleted', 'sort' => 30],
+            'security_geo_lock_user_edits' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'User edits must originate from Australia', 'sort' => 40],
+            'security_require_audit_reason' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Dangerous user actions require an audit reason', 'sort' => 50],
+            'security_log_protected_attempts' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Log protected-account attempts', 'sort' => 60],
+            'security_notify_protected_attempts' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Notify Admins, Protectors, and Trainers about protected-account attempts', 'sort' => 70],
+            'security_hide_protected_audits' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Hide protected security audits from normal users', 'sort' => 80],
+            'game_allow_non_admin_add_users' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Non-admin players can add users', 'sort' => 90],
+            'game_allow_non_admin_choose_roles' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Non-admin players can choose any role for new users', 'sort' => 100],
+            'game_allow_oauth_role_selection' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Google OAuth registration can create privileged roles', 'sort' => 110],
+            'game_delete_cooldown_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Delete attacker receives an action lock', 'sort' => 120],
+            'game_delete_cooldown_minutes' => ['type' => 'integer', 'group' => 'elimination-recovery', 'label' => 'Delete timeout minutes', 'sort' => 130],
+            'game_allow_undelete' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Deleted players can be restored by defenders', 'sort' => 140],
+            'game_protector_spy_controls' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Protector spy controls are enabled', 'sort' => 150],
+            'game_spy_audit_impersonation' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Spies can appear as other users in audit screens', 'sort' => 160],
+            'game_last_man_standing_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Winner is the last active eligible player', 'sort' => 170],
+            'game_auto_detect_winner' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Automatically detect a winner when one player remains', 'sort' => 180],
+            'game_baseline_reset_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Class baseline reset is enabled', 'sort' => 190],
+        ];
+    }
+
+    private function intakeWeekDefaults(string $weekId): array
+    {
+        $weekOne = [
+            'security_manual_login_requires_2fa' => false,
+            'security_block_banned_login' => false,
+            'security_protect_admin_account' => false,
+            'security_geo_lock_user_edits' => false,
+            'security_require_audit_reason' => false,
+            'security_log_protected_attempts' => false,
+            'security_notify_protected_attempts' => false,
+            'security_hide_protected_audits' => false,
+            'game_allow_non_admin_add_users' => true,
+            'game_allow_non_admin_choose_roles' => true,
+            'game_allow_oauth_role_selection' => true,
+            'game_delete_cooldown_enabled' => false,
+            'game_allow_undelete' => false,
+            'game_protector_spy_controls' => false,
+            'game_spy_audit_impersonation' => false,
+            'game_last_man_standing_enabled' => true,
+            'game_auto_detect_winner' => false,
+            'game_baseline_reset_enabled' => true,
+        ];
+
+        $weeks = [
+            'week_1' => [],
+            'week_2' => [
+                'security_require_audit_reason' => true,
+                'security_log_protected_attempts' => true,
+                'game_delete_cooldown_enabled' => true,
+                'game_allow_undelete' => true,
+            ],
+            'week_3' => [
+                'security_block_banned_login' => true,
+                'security_protect_admin_account' => true,
+                'security_require_audit_reason' => true,
+                'security_log_protected_attempts' => true,
+                'security_notify_protected_attempts' => true,
+                'game_allow_non_admin_choose_roles' => false,
+                'game_allow_oauth_role_selection' => false,
+                'game_delete_cooldown_enabled' => true,
+                'game_allow_undelete' => true,
+                'game_protector_spy_controls' => true,
+                'game_auto_detect_winner' => true,
+            ],
+            'week_4' => [
+                'security_block_banned_login' => true,
+                'security_protect_admin_account' => true,
+                'security_geo_lock_user_edits' => true,
+                'security_require_audit_reason' => true,
+                'security_log_protected_attempts' => true,
+                'security_notify_protected_attempts' => true,
+                'security_hide_protected_audits' => true,
+                'game_allow_non_admin_choose_roles' => false,
+                'game_allow_oauth_role_selection' => false,
+                'game_delete_cooldown_enabled' => true,
+                'game_allow_undelete' => true,
+                'game_protector_spy_controls' => true,
+                'game_auto_detect_winner' => true,
+            ],
+            'week_5' => [
+                'security_manual_login_requires_2fa' => true,
+                'security_block_banned_login' => true,
+                'security_protect_admin_account' => true,
+                'security_geo_lock_user_edits' => true,
+                'security_require_audit_reason' => true,
+                'security_log_protected_attempts' => true,
+                'security_notify_protected_attempts' => true,
+                'security_hide_protected_audits' => true,
+                'game_allow_non_admin_add_users' => false,
+                'game_allow_non_admin_choose_roles' => false,
+                'game_allow_oauth_role_selection' => false,
+                'game_delete_cooldown_enabled' => true,
+                'game_allow_undelete' => true,
+                'game_protector_spy_controls' => true,
+                'game_spy_audit_impersonation' => true,
+                'game_auto_detect_winner' => true,
+            ],
+            'week_6' => [
+                'security_manual_login_requires_2fa' => true,
+                'security_block_banned_login' => true,
+                'security_protect_admin_account' => true,
+                'security_geo_lock_user_edits' => true,
+                'security_require_audit_reason' => true,
+                'security_log_protected_attempts' => true,
+                'security_notify_protected_attempts' => true,
+                'security_hide_protected_audits' => true,
+                'game_allow_non_admin_add_users' => false,
+                'game_allow_non_admin_choose_roles' => false,
+                'game_allow_oauth_role_selection' => false,
+                'game_delete_cooldown_enabled' => true,
+                'game_allow_undelete' => true,
+                'game_protector_spy_controls' => true,
+                'game_spy_audit_impersonation' => true,
+                'game_auto_detect_winner' => true,
+            ],
+        ];
+
+        return array_merge($weekOne, $weeks[$weekId] ?? []);
+    }
+
+    private function intakeSettingResponseValue($value, string $type)
+    {
+        if ($type === 'boolean') {
+            return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        if ($type === 'integer') {
+            return is_numeric($value) ? intval($value) : 0;
+        }
+
+        return $value;
+    }
+
+    private function intakeSettingStorageValue($value, string $type): string
+    {
+        if ($type === 'boolean') {
+            return filter_var($value, FILTER_VALIDATE_BOOLEAN) ? '1' : '0';
+        }
+
+        if ($type === 'integer') {
+            return (string) intval($value);
+        }
+
+        return (string) $value;
+    }
+
+    private function ensureIntakeGameSettings(int $intakeId): void
+    {
+        if (! Schema::hasTable('game_intake_settings')) {
+            return;
+        }
+
+        $intake = DB::table('game_intakes')->where('id', $intakeId)->first(['active_week']);
+        $defaults = $this->intakeWeekDefaults($intake?->active_week ?: 'week_1');
+        $now = now();
+
+        foreach ($this->intakeGameSettingDefinitions() as $key => $definition) {
+            $existing = DB::table('game_intake_settings')
+                ->where('game_intake_id', $intakeId)
+                ->where('key', $key)
+                ->exists();
+
+            if ($existing) {
+                DB::table('game_intake_settings')
+                    ->where('game_intake_id', $intakeId)
+                    ->where('key', $key)
+                    ->update([
+                        'type' => $definition['type'],
+                        'group' => $definition['group'],
+                        'label' => $definition['label'],
+                        'sort_order' => $definition['sort'],
+                        'updated_at' => $now,
+                    ]);
+
+                continue;
+            }
+
+            DB::table('game_intake_settings')->insert([
+                    'value' => $this->intakeSettingStorageValue(
+                        $defaults[$key] ?? ($definition['type'] === 'integer' ? 5 : false),
+                        $definition['type']
+                    ),
+                    'game_intake_id' => $intakeId,
+                    'key' => $key,
+                    'type' => $definition['type'],
+                    'group' => $definition['group'],
+                    'label' => $definition['label'],
+                    'sort_order' => $definition['sort'],
+                    'updated_at' => $now,
+                    'created_at' => $now,
+            ]);
+        }
+    }
+
+    private function intakeGameSettingRows(int $intakeId)
+    {
+        return DB::table('game_intake_settings')
+            ->where('game_intake_id', $intakeId)
+            ->orderBy('group')
+            ->orderBy('sort_order')
+            ->orderBy('key')
+            ->get()
+            ->map(function ($setting) {
+                return [
+                    'id' => $setting->id,
+                    'game_intake_id' => (int) $setting->game_intake_id,
+                    'key' => $setting->key,
+                    'value' => $this->intakeSettingResponseValue($setting->value, $setting->type),
+                    'type' => $setting->type,
+                    'group' => $setting->group,
+                    'label' => $setting->label,
+                    'description' => $setting->description,
+                    'sort_order' => (int) $setting->sort_order,
+                ];
+            })
+            ->values();
+    }
+
+    private function gameBaselineRows(?int $intakeId = null)
+    {
+        $query = DB::table('game_baselines')
+            ->leftJoin('game_intakes', 'game_intakes.id', '=', 'game_baselines.intake_id')
+            ->leftJoin('users', 'users.id', '=', 'game_baselines.created_by_user_id')
+            ->select(
+                'game_baselines.*',
+                'game_intakes.code as intake_code',
+                'game_intakes.name as intake_name',
+                'users.name as created_by_name',
+                'users.email as created_by_email'
+            );
+
+        if ($intakeId) {
+            $query->where('game_baselines.intake_id', $intakeId);
+        }
+
+        return $query
+            ->orderBy('game_baselines.created_at', 'DESC')
+            ->get()
+            ->map(function ($baseline) {
+                return [
+                    'id' => $baseline->id,
+                    'name' => $baseline->name,
+                    'description' => $baseline->description,
+                    'is_active' => (bool) $baseline->is_active,
+                    'intake_id' => $baseline->intake_id,
+                    'intake_code' => $baseline->intake_code,
+                    'intake_name' => $baseline->intake_name,
+                    'created_by_user_id' => $baseline->created_by_user_id,
+                    'created_by_name' => $baseline->created_by_name,
+                    'created_by_email' => $baseline->created_by_email,
+                    'row_count' => DB::table('game_baseline_users')->where('baseline_id', $baseline->id)->count(),
+                    'created_at' => $baseline->created_at,
+                    'updated_at' => $baseline->updated_at,
+                    'baseline_type' => 'students',
+                ];
+            });
+    }
+
+    private function baselineIntakeRows()
+    {
+        return DB::table('game_intakes')
+            ->select('id', 'code', 'name', 'status', 'active_week')
+            ->orderByRaw("FIELD(status, 'active', 'planned')")
+            ->orderBy('code')
+            ->get()
+            ->map(fn ($intake) => [
+                'id' => (int) $intake->id,
+                'code' => $intake->code,
+                'name' => $intake->name,
+                'status' => $intake->status,
+                'active_week' => $intake->active_week,
+            ]);
+    }
+
+    public function F0_VMD_get_baseline_management_data(Request $request)
+    {
+        $validated = $request->validate([
+            'vmd_user_email' => 'required|email',
+            'game_intake_id' => 'nullable|integer|exists:game_intakes,id',
+        ]);
+
+        if (!$this->isAdminEmail($validated['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Baseline management data loaded.',
+            'user_baselines' => $this->userTableBaselineRows(),
+            'game_baselines' => $this->gameBaselineRows(isset($validated['game_intake_id']) ? (int) $validated['game_intake_id'] : null),
+            'intakes' => $this->baselineIntakeRows(),
         ], 200);
     }
 
@@ -3384,6 +3970,236 @@ if ($validator->fails()) {
             'updated_rows' => $result['updated'],
             'created_rows' => $result['created'],
             'deleted_extra_rows' => $result['deleted'],
+        ], 200);
+    }
+
+    public function F0_VMD_delete_user_table_baseline(Request $request)
+    {
+        $validated = $request->validate([
+            'vmd_user_email' => 'required|email',
+            'baseline_id' => 'required|integer|exists:user_table_baselines,id',
+        ]);
+
+        if (!$this->isAdminEmail($validated['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        DB::table('user_table_baselines')->where('id', $validated['baseline_id'])->delete();
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Users table baseline deleted.',
+            'baseline_id' => (int) $validated['baseline_id'],
+        ], 200);
+    }
+
+    public function F0_VMD_capture_game_user_baseline(Request $request)
+    {
+        $validated = $request->validate([
+            'vmd_user_email' => 'required|email',
+            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+            'name' => 'nullable|string|max:255',
+            'description' => 'nullable|string|max:1000',
+        ]);
+
+        if (!$this->isAdminEmail($validated['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        $intake = DB::table('game_intakes')->where('id', $validated['game_intake_id'])->first();
+        $createdBy = DB::table('users')->where('email', $validated['vmd_user_email'])->first();
+        $baselineName = $validated['name'] ?? "{$intake->code} student baseline " . now()->format('Y-m-d H:i:s');
+        $description = $validated['description'] ?? "Captured from GMUI Reset Baseline for {$intake->code}.";
+
+        $baselineId = DB::transaction(function () use ($validated, $baselineName, $description, $createdBy) {
+            DB::table('game_baselines')
+                ->where('intake_id', $validated['game_intake_id'])
+                ->update(['is_active' => false, 'updated_at' => now()]);
+
+            $baselineId = DB::table('game_baselines')->insertGetId([
+                'intake_id' => $validated['game_intake_id'],
+                'name' => $baselineName,
+                'description' => $description,
+                'is_active' => true,
+                'created_by_user_id' => $createdBy->id ?? null,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+            $gameUsers = DB::table('game_users')
+                ->where('intake_id', $validated['game_intake_id'])
+                ->orderBy('id')
+                ->get();
+
+            foreach ($gameUsers as $gameUser) {
+                DB::table('game_baseline_users')->insert([
+                    'baseline_id' => $baselineId,
+                    'game_user_id' => $gameUser->id,
+                    'first_name' => $gameUser->first_name ?? null,
+                    'surname' => $gameUser->surname ?? null,
+                    'preferred_name' => $gameUser->preferred_name ?? null,
+                    'display_name' => $gameUser->display_name ?? null,
+                    'email' => $gameUser->email ?? null,
+                    'special_needs' => $gameUser->special_needs ?? null,
+                    'game_role' => $gameUser->game_role ?? null,
+                    'game_status' => $gameUser->game_status ?? null,
+                    'is_spy' => (bool) ($gameUser->is_spy ?? false),
+                    'is_protector' => (bool) ($gameUser->is_protector ?? false),
+                    'action_locked_until' => $gameUser->action_locked_until ?? null,
+                    'action_locked_reason' => $gameUser->action_locked_reason ?? null,
+                    'action_locked_by_game_user_id' => $gameUser->action_locked_by_game_user_id ?? null,
+                    'eliminated_at' => $gameUser->eliminated_at ?? null,
+                    'eliminated_by_game_user_id' => $gameUser->eliminated_by_game_user_id ?? null,
+                    'metadata' => $gameUser->metadata ?? null,
+                    'snapshot' => json_encode($gameUser),
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            }
+
+            return $baselineId;
+        });
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Student baseline captured.',
+            'baseline_id' => $baselineId,
+            'game_intake_id' => (int) $validated['game_intake_id'],
+            'row_count' => DB::table('game_baseline_users')->where('baseline_id', $baselineId)->count(),
+        ], 200);
+    }
+
+    public function F0_VMD_restore_game_user_baseline(Request $request)
+    {
+        $validated = $request->validate([
+            'vmd_user_email' => 'required|email',
+            'baseline_id' => 'required|integer|exists:game_baselines,id',
+            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+        ]);
+
+        if (!$this->isAdminEmail($validated['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        $baseline = DB::table('game_baselines')
+            ->where('id', $validated['baseline_id'])
+            ->where('intake_id', $validated['game_intake_id'])
+            ->first();
+
+        if (!$baseline) {
+            return response()->json([
+                'outcome' => 'ERROR: Student baseline not found for selected Class Intake.',
+            ], 404);
+        }
+
+        $gameUserColumns = collect(Schema::getColumnListing('game_users'))->flip();
+
+        $result = DB::transaction(function () use ($baseline, $gameUserColumns) {
+            $rows = DB::table('game_baseline_users')->where('baseline_id', $baseline->id)->get();
+            $baselineGameUserIds = $rows->pluck('game_user_id')->map(fn ($id) => (int) $id)->all();
+            $deleted = DB::table('game_users')
+                ->where('intake_id', $baseline->intake_id)
+                ->whereNotIn('id', $baselineGameUserIds)
+                ->delete();
+            $updated = 0;
+            $created = 0;
+
+            foreach ($rows as $row) {
+                $snapshot = json_decode($row->snapshot ?: '{}', true) ?: [];
+                $values = collect($snapshot)
+                    ->only($gameUserColumns->keys()->all())
+                    ->except(['id', 'created_at', 'updated_at'])
+                    ->toArray();
+
+                $values = array_merge($values, [
+                    'intake_id' => $baseline->intake_id,
+                    'first_name' => $row->first_name,
+                    'surname' => $row->surname,
+                    'preferred_name' => $row->preferred_name,
+                    'display_name' => $row->display_name,
+                    'email' => $row->email,
+                    'special_needs' => $row->special_needs,
+                    'game_role' => $row->game_role,
+                    'game_status' => $row->game_status,
+                    'is_spy' => (bool) $row->is_spy,
+                    'is_protector' => (bool) $row->is_protector,
+                    'action_locked_until' => $row->action_locked_until,
+                    'action_locked_reason' => $row->action_locked_reason,
+                    'action_locked_by_game_user_id' => $row->action_locked_by_game_user_id,
+                    'eliminated_at' => $row->eliminated_at,
+                    'eliminated_by_game_user_id' => $row->eliminated_by_game_user_id,
+                    'metadata' => $row->metadata,
+                    'updated_at' => now(),
+                ]);
+
+                $values = collect($values)
+                    ->map(fn ($value) => is_array($value) || is_object($value) ? json_encode($value) : $value)
+                    ->toArray();
+
+                if (DB::table('game_users')->where('id', $row->game_user_id)->exists()) {
+                    DB::table('game_users')->where('id', $row->game_user_id)->update($values);
+                    $updated += 1;
+                } else {
+                    DB::table('game_users')->insert(array_merge([
+                        'id' => $row->game_user_id,
+                        'created_at' => now(),
+                    ], $values));
+                    $created += 1;
+                }
+            }
+
+            return [
+                'deleted' => $deleted,
+                'updated' => $updated,
+                'created' => $created,
+                'total' => $rows->count(),
+            ];
+        });
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Student baseline restored for selected Class Intake.',
+            'baseline_id' => $baseline->id,
+            'game_intake_id' => (int) $baseline->intake_id,
+            'restored_rows' => $result['total'],
+            'updated_rows' => $result['updated'],
+            'created_rows' => $result['created'],
+            'deleted_extra_rows' => $result['deleted'],
+        ], 200);
+    }
+
+    public function F0_VMD_delete_game_user_baseline(Request $request)
+    {
+        $validated = $request->validate([
+            'vmd_user_email' => 'required|email',
+            'baseline_id' => 'required|integer|exists:game_baselines,id',
+            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+        ]);
+
+        if (!$this->isAdminEmail($validated['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'ERROR: Admin access required.',
+            ], 403);
+        }
+
+        $deleted = DB::table('game_baselines')
+            ->where('id', $validated['baseline_id'])
+            ->where('intake_id', $validated['game_intake_id'])
+            ->delete();
+
+        if (!$deleted) {
+            return response()->json([
+                'outcome' => 'ERROR: Student baseline not found for selected Class Intake.',
+            ], 404);
+        }
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Student baseline deleted.',
+            'baseline_id' => (int) $validated['baseline_id'],
+            'game_intake_id' => (int) $validated['game_intake_id'],
         ], 200);
     }
 

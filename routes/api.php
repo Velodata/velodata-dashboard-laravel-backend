@@ -43,9 +43,16 @@ Route::prefix('v2')->group(function () {
     Route::match(['get', 'post'], '/VMD-delete-user', [CustomController::class, 'F0_VMD_delete_user']);
     Route::post('/VMD-get-dashboard-settings', [CustomController::class, 'F0_VMD_get_dashboard_settings']);
     Route::post('/VMD-update-dashboard-settings', [CustomController::class, 'F0_VMD_update_dashboard_settings']);
+    Route::post('/VMD-get-intake-game-settings', [CustomController::class, 'F0_VMD_get_intake_game_settings']);
+    Route::post('/VMD-save-intake-game-settings', [CustomController::class, 'F0_VMD_save_intake_game_settings']);
     Route::post('/VMD-get-user-table-baselines', [CustomController::class, 'F0_VMD_get_user_table_baselines']);
+    Route::post('/VMD-get-baseline-management-data', [CustomController::class, 'F0_VMD_get_baseline_management_data']);
     Route::post('/VMD-capture-user-table-baseline', [CustomController::class, 'F0_VMD_capture_user_table_baseline']);
     Route::post('/VMD-restore-user-table-baseline', [CustomController::class, 'F0_VMD_restore_user_table_baseline']);
+    Route::post('/VMD-delete-user-table-baseline', [CustomController::class, 'F0_VMD_delete_user_table_baseline']);
+    Route::post('/VMD-capture-game-user-baseline', [CustomController::class, 'F0_VMD_capture_game_user_baseline']);
+    Route::post('/VMD-restore-game-user-baseline', [CustomController::class, 'F0_VMD_restore_game_user_baseline']);
+    Route::post('/VMD-delete-game-user-baseline', [CustomController::class, 'F0_VMD_delete_game_user_baseline']);
     Route::match(['get', 'post'], '/VMD-verify-2fa', [CustomController::class, 'F0_VMD_verify_2fa_code']);
     Route::match(['get', 'post'], '/VMD-resend-2fa', [CustomController::class, 'F0_VMD_resend_2fa']);
 
