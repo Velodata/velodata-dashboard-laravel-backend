@@ -74,7 +74,7 @@ class UserController extends Controller
         $gameUser = GameUser::where('email', $email)->first();
         $roleName = $gameUser?->game_role;
 
-        return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+        return in_array(strtolower((string) $roleName), ['admin', 'protector', 'spy'], true);
     }
 
     private function staffRoleName(User $user): string
@@ -173,6 +173,66 @@ class UserController extends Controller
         ], 423);
     }
 
+    private function intakeGameSettingBoolean(?int $intakeId, string $key, bool $default = false): bool
+    {
+        if (! $intakeId) {
+            return $default;
+        }
+
+        $value = DB::table('game_intake_settings')
+            ->where('game_intake_id', $intakeId)
+            ->where('key', $key)
+            ->value('value');
+
+        if ($value === null) {
+            return $default;
+        }
+
+        return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    private function geoLockUserEditResponse(Request $request, ?int $intakeId, string $context)
+    {
+        if (! $intakeId || ! $this->intakeGameSettingBoolean($intakeId, 'security_geo_lock_user_edits', false)) {
+            return null;
+        }
+
+        if (app()->environment('testing') && $request->filled('vmd_test_country_code')) {
+            $country = strtoupper((string) $request->input('vmd_test_country_code'));
+        } else {
+            $country = null;
+            $realIp = $this->getAuditIpAddress($request);
+
+            if (in_array($realIp, ['127.0.0.1', '::1', '0:0:0:0:0:0:0:1', 'localhost'], true)
+                || str_starts_with($realIp, '192.168.')
+                || str_starts_with($realIp, '10.')
+                || preg_match('/^172\.(1[6-9]|2[0-9]|3[0-1])\./', $realIp)) {
+                $country = 'AU';
+            } else {
+                $accessToken = '4af1c2308a696c';
+                $apiUrl = "http://ipinfo.io/{$realIp}/json?token={$accessToken}";
+                $pageContent = file_get_contents($apiUrl);
+
+                if ($pageContent === false) {
+                    return response()->json([
+                        'errors' => "Failed to fetch geolocation data during {$context} for {$realIp}.",
+                    ], 500);
+                }
+
+                $parsedJson = json_decode($pageContent);
+                $country = $parsedJson->country ?? null;
+            }
+        }
+
+        if ($country !== 'AU') {
+            return response()->json([
+                'errors' => 'Permission Denied:  (You can only perform updates if you are in Australia)',
+            ], 403);
+        }
+
+        return null;
+    }
+
     // Get all users
     public function index(Request $request)
     {
@@ -189,12 +249,9 @@ class UserController extends Controller
         } elseif ($viewer) {
             $viewerCanAccessRequestedIntake = $this->staffCanAccessIntake($viewer, $gameIntakeId ? (int) $gameIntakeId : null, $gameIntakeCode);
         } elseif ($viewerGameUser) {
-            $viewerCanAccessRequestedIntake =
-                ($gameIntakeId && (int) $viewerGameUser->intake_id === (int) $gameIntakeId) ||
-                ($gameIntakeCode && DB::table('game_intakes')
-                    ->where('id', $viewerGameUser->intake_id)
-                    ->where('code', $gameIntakeCode)
-                    ->exists());
+            $gameIntakeId = $viewerGameUser->intake_id;
+            $gameIntakeCode = null;
+            $viewerCanAccessRequestedIntake = true;
         }
 
         // Check if the include query parameter is set to roles
@@ -467,7 +524,19 @@ class UserController extends Controller
             ], 409);
         }
 
+        if ($this->intakeGameSettingBoolean((int) $creatorGameUser->intake_id, 'game_block_student_add_users', false)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot add users for this Class Intake right now.',
+            ], 403);
+        }
+
         $roleName = DB::table('roles')->where('id', $roleId)->value('name') ?: 'Creator';
+        if ($this->intakeGameSettingBoolean((int) $creatorGameUser->intake_id, 'game_restrict_student_role_selection', false)) {
+            $roleName = 'Creator';
+            $roleId = DB::table('roles')->whereRaw('LOWER(name) = ?', [strtolower($roleName)])->value('id') ?: $roleId;
+        }
+
         if (strcasecmp((string) $roleName, 'Trainer') === 0) {
             return response()->json([
                 'outcome' => 'FAIL',
@@ -620,6 +689,11 @@ class UserController extends Controller
         }
 
         $user = User::findOrFail($userId);
+        $geoLockIntakeId = $request->input('game_intake_id') ? (int) $request->input('game_intake_id') : null;
+        if ($geoLockResponse = $this->geoLockUserEditResponse($request, $geoLockIntakeId, 'uploadProfileImage()')) {
+            return $geoLockResponse;
+        }
+
         if ((int) $user->id === 1 || strcasecmp((string) $user->email, 'admin@velodata.org') === 0) {
             return response()->json([
                 'error' => [
@@ -711,6 +785,14 @@ class UserController extends Controller
         ]);
 
         $gameUser = GameUser::findOrFail($gameUserId);
+        if ($geoLockResponse = $this->geoLockUserEditResponse(
+            $request,
+            $gameUser->intake_id ? (int) $gameUser->intake_id : null,
+            'uploadGameUserProfileImage()'
+        )) {
+            return $geoLockResponse;
+        }
+
         $actorEmail = $request->input('vmd_user_email');
         if ($timeoutResponse = $this->userManagementTimeoutResponse($actorEmail)) {
             return $timeoutResponse;
@@ -721,7 +803,7 @@ class UserController extends Controller
         if (! $isSelfUpdate && ! $this->canManageGameUsers($actorEmail)) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin, Protector, or Trainer.',
+                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin, Protector, Trainer, or Spy.',
             ], 403);
         }
 

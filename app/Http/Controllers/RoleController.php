@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Role;
 use App\Models\Permission;
+use App\Models\User;
 use Illuminate\Database\QueryException;
 // use Illuminate\Http\Request;
 
@@ -18,6 +19,29 @@ use Carbon\Carbon;
 
 class RoleController extends Controller
 {
+    private function actorIsStaffAdmin(array $attributes): bool
+    {
+        $email = strtolower((string) ($attributes['vmd_user_email'] ?? ''));
+        if ($email === '') {
+            return false;
+        }
+
+        $identityType = strtolower((string) ($attributes['vmd_user_identity_type'] ?? 'staff'));
+        $isGameUser = filter_var($attributes['vmd_user_is_game_user'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if ($identityType === 'student' || $isGameUser) {
+            return false;
+        }
+
+        $user = User::with('roles')->where('email', $email)->first();
+        if (! $user) {
+            return false;
+        }
+
+        $roleName = (string) ($user->role_name ?: optional($user->roles)->name);
+
+        return strtolower($roleName) === 'admin';
+    }
+
     private function actorCanModifyRoleManagementAccess(array $attributes): bool
     {
         return strtolower((string) ($attributes['vmd_user_email'] ?? '')) === 'admin@velodata.org';
@@ -176,7 +200,16 @@ class RoleController extends Controller
     {
         $validated = $request->validate([
             'name' => 'required|string|max:255',
+            'vmd_user_email' => 'required|string',
+            'vmd_user_identity_type' => 'nullable|string',
+            'vmd_user_is_game_user' => 'nullable',
         ]);
+
+        if (! $this->actorIsStaffAdmin($validated)) {
+            return response()->json([
+                'message' => 'Role Management is only available to Staff Admin users.',
+            ], 403);
+        }
 
         try {
             $role = Role::create([
@@ -221,6 +254,12 @@ class RoleController extends Controller
     {
         $data = $request->input('data');
         $attributes = $data['attributes'] ?? [];
+
+        if (! $this->actorIsStaffAdmin($attributes)) {
+            return response()->json([
+                'message' => 'Role Management is only available to Staff Admin users.',
+            ], 403);
+        }
 
         // Find and update the role name
         $role = Role::findOrFail($id);
@@ -286,8 +325,8 @@ class RoleController extends Controller
     // Delete a role
     public function destroy($id)
     {
-        $role = Role::findOrFail($id);
-        $role->delete();
-        return response()->json(null, 204);
+        return response()->json([
+            'message' => 'Deleting roles is disabled.',
+        ], 403);
     }
 }

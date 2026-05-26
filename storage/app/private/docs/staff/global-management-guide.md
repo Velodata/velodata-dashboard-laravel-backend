@@ -5,15 +5,20 @@
 - [Purpose](#purpose)
 - [Who Should Use It](#who-should-use-it)
 - [Class Intake Selection](#class-intake-selection)
-- [Course Week Presets](#course-week-presets)
-- [Pane 01: Game Controls](#pane-01-game-controls)
-- [Pane 02: Game Vulnerabilities](#pane-02-game-vulnerabilities)
-- [Pane 03: Roles And Spies](#pane-03-roles-and-spies)
-- [Pane 04: Elimination And Recovery](#pane-04-elimination-and-recovery)
+- [How Saving Works](#how-saving-works)
+- [Consequences Pane](#consequences-pane)
+- [Week Presets](#week-presets)
+- [Week One](#week-one)
+- [Week Two](#week-two)
+- [Week Three](#week-three)
+- [Week Four](#week-four)
+- [Week Five](#week-five)
+- [Week Six](#week-six)
 - [Delete Timeout](#delete-timeout)
 - [Reset And Baseline](#reset-and-baseline)
 - [Login Security](#login-security)
 - [Email Delivery](#email-delivery)
+- [Regression-Backed Rules](#regression-backed-rules)
 - [Operational Notes](#operational-notes)
 
 ## Purpose
@@ -22,6 +27,8 @@ Global Management is the staff control area for tuning the classroom game.
 
 It lets staff configure how hard the Dashboard game is for a selected Class Intake, including which defensive rules are active, which vulnerabilities remain open, and what recovery tools are available if a class needs to be reset.
 
+The current GMUI is organised as week panes. A pane may contain settings whose historical option numbers do not match the pane number. Do not rename an option just because it has moved panes; the option number is part of the game language.
+
 ## Who Should Use It
 
 Global Management is intended for Staff users.
@@ -29,7 +36,7 @@ Global Management is intended for Staff users.
 - Staff Admin users can access the full Global Management UI.
 - Trainer users can access the class/game tuning areas they need for teaching.
 - Reset Baseline, Login Security, and Email Delivery remain Staff Admin-only areas.
-- Students must not see Global Management, even if they have gained Admin powers inside the game.
+- Students must not see Global Management, even if they have gained Admin or Spy powers inside the game.
 
 Student Admin powers and Staff Admin powers are deliberately different.
 
@@ -37,21 +44,51 @@ Student Admin powers and Staff Admin powers are deliberately different.
 
 Class Intake Selection controls which intake the game settings apply to.
 
-This matters when one Trainer is linked to more than one Class Intake, or when multiple intakes are running on different teaching schedules.
-
 Rules:
 
 - Select the Class Intake first.
-- The settings in Pane 01-04 are scoped to the selected intake.
-- Changing intake should load that intake's current settings.
-- A Trainer should only tune the intakes they are linked to.
+- The week pane settings are scoped to the selected intake.
+- Changing intake loads that intake's current saved settings.
+- Trainers should only tune intakes they are linked to.
 - Staff Admin users can manage broader intake settings.
+- Existing saved intake settings override the defaults shown by new week presets.
 
-## Course Week Presets
+If a default changes later, existing Class Intakes may still show their saved value until the setting is deliberately changed and saved.
 
-Course week presets are quick-start configurations for the game.
+## How Saving Works
 
-Selecting a week turns on a known bundle of settings for Pane 01-04.
+GMUI changes are draft changes until they are saved.
+
+Changing a checkbox or selecting a different week does not immediately activate that behaviour in Laravel. The user must use `Save Changes`.
+
+When there are unsaved changes:
+
+- The Consequences Pane appears near the top of the week controls.
+- Week panes show a `Save your changes` button with an upward arrow.
+- That button scrolls back to the Consequences Pane rather than saving directly.
+
+This flow is intentional. Staff should review the consequence text before committing game changes.
+
+## Consequences Pane
+
+The Consequences Pane lists pending setting changes before they are saved.
+
+It warns for both directions:
+
+- OFF to ON
+- ON to OFF
+
+This matters because turning a rule off can be as important as turning it on. For example:
+
+- Turning `01.02` OFF allows banned Students to log in again.
+- Turning `02.01` OFF lets eligible Students see Add User and create users.
+- Turning `02.04` OFF stops locking Students after they Delete or Ban someone.
+
+The warning pane is regression-tested so Pane 01-04 options have consequence text when switched from ON to OFF.
+
+## Week Presets
+
+Week presets are quick-start configurations for the game.
 
 The current week model is:
 
@@ -64,41 +101,82 @@ The current week model is:
 
 The intended teaching model is progressive hardening. The system starts easier to exploit and becomes harder as students learn how the weaknesses work.
 
-## Pane 01: Game Controls
+Current default highlights:
 
-Pane 01 contains defensive rules that can be switched on as the intake progresses.
+- `01.02 Banned players cannot log in` is ON from Week One onward.
+- `02.05 Admins or Protectors can undelete eliminated players` is ON from Week Two onward.
+- `02.02 Students can no longer choose any role for new users` is ON by default only in Week Six.
 
-These settings are the normal first place to tune how strict the class game should be.
+## Week One
 
-Use Pane 01 when you want to control whether the game should allow or block broad account-management behaviours.
+Week One currently contains:
 
-## Pane 02: Game Vulnerabilities
+- `01.02 Banned players cannot log in`
 
-Pane 02 contains intentional weaknesses.
+This is ON by default from Week One onward. Laravel also enforces it: banned Students cannot log in when this setting is active.
 
-Some weaknesses exist because they are part of the teaching exercise. Do not assume every vulnerability in this pane is a bug.
+## Week Two
 
-Use Pane 02 when you want to decide which loopholes remain available for the current Class Intake.
+Week Two currently contains:
 
-## Pane 03: Roles And Spies
+- `02.04 Students receive a lockdown when they Delete or Ban someone.`
+- `02.05 Admins or Protectors can undelete eliminated players`
 
-Pane 03 relates to role behaviour, privileged role selection, Spy/Protector mechanics, and identity uncertainty.
+`02.04` affects Student users only. When active, a Student who bans or deletes another user can be locked out of further User Management edits for the timeout period.
 
-The Spy role is still an unfinished design area. Treat these settings as game-design controls, not normal business administration settings.
+`02.05` allows deleted users to be restored, but restore permissions are deliberately narrow: only Staff Admins and Staff Protectors can restore deleted users.
 
-## Pane 04: Elimination And Recovery
+## Week Three
 
-Pane 04 controls elimination-style rules and recovery behaviour.
+Week Three currently contains:
 
-This area matters when students ban, delete, or otherwise knock each other out of play.
+- `02.06 Staff user Protectors can now see, ban or delete spies`
+- `03.02 Protectors can identify spies`
+- `03.03 Only Protectors can ban or delete spies`
+- `03.04 Spies can appear as other users in audit screens`
 
-Use Pane 04 carefully because these settings can change whether an action is simply recorded, triggers a lockout, or affects whether a player remains active.
+Spy and Protector play is now a live part of the game.
+
+Role Spy has Admin-like powers for attacking other Students. Spy users are hidden from normal visibility surfaces unless the viewer is a Protector.
+
+Protectors can be Staff Protectors or Student Protectors. Both identities are allowed to reveal Spy visibility in the relevant history/user views.
+
+## Week Four
+
+Week Four currently contains:
+
+- `01.04 User edits must originate from Australia`
+- `04.02 Winner is the last active eligible player`
+- `04.03 Banned players count as eliminated`
+
+`01.04` blocks covered User Management edits from outside Australia when active. Regression tests cover Role changes, Avatar changes, Basic Info changes, and Password changes for Staff and Student edit paths.
+
+The remaining Week Four controls support elimination logic and winner detection design.
+
+## Week Five
+
+Week Five currently contains:
+
+- `01.01 Manual login requires 2FA`
+
+`01.01` is linked to the Login Security 2FA checkbox. Turning one on or off updates the other.
+
+When `01.01` is turned ON, the system can start sending real 2FA emails during manual login. Staff should review the Consequences Pane before saving this change.
+
+## Week Six
+
+Week Six currently contains:
+
+- `02.01 Students can no longer Add Users`
+- `02.02 Students can no longer choose any role for new users.`
+
+`02.01` blocks Students from adding users. The User Management UI hides the Add User button for Students, and Laravel blocks Student Add User requests while this setting is active.
+
+`02.02` hides Role selection for Student-created fake accounts. Laravel also enforces the rule by creating the account as Creator when Students add a user while this setting is active.
 
 ## Delete Timeout
 
 Delete Timeout controls temporary lockout behaviour after dangerous Student actions.
-
-The main teaching use is to discourage reckless banning or deleting while still allowing those actions to exist inside the game.
 
 Current direction:
 
@@ -106,6 +184,9 @@ Current direction:
 - The lockout duration is configurable.
 - The default teaching value has been 5 minutes.
 - Timeout-blocked actions should produce clear feedback and notification records.
+- This lockout applies to Student users only, not Staff users.
+
+The Week Two `02.04` checkbox is linked to the Delete Timeout enabled checkbox, and vice versa.
 
 ## Reset And Baseline
 
@@ -116,7 +197,7 @@ It supports restoring known-good data when a classroom game becomes too damaged 
 Current direction:
 
 - Users table baselines can be captured and restored.
-- Student intake baselines are being expanded so a selected Class Intake can be captured or restored independently.
+- Student intake baselines can be captured or restored independently.
 - Baseline operations should be handled carefully because they can delete extra records and recreate missing snapshot records.
 
 ## Login Security
@@ -125,7 +206,11 @@ Login Security is a Staff Admin-only area.
 
 It controls login hardening features such as two-factor login behaviour.
 
-These settings affect authentication flow, so they should not be exposed to Trainers or Students unless the access model is deliberately changed later.
+`01.01 Manual login requires 2FA` is linked to the Login Security 2FA checkbox. This linkage works both ways:
+
+- Turning `01.01` on updates Login Security.
+- Turning Login Security on updates `01.01`.
+- Turning either one off updates the other.
 
 ## Email Delivery
 
@@ -135,10 +220,30 @@ It controls email-related operational settings, including where security/login m
 
 Treat this as infrastructure configuration, not classroom game tuning.
 
+## Regression-Backed Rules
+
+The following behaviours are protected by regression tests and should be treated as current system rules:
+
+- Student-created accounts are created in `game_users`, not the real Staff `users` table.
+- Student-created accounts inherit the creator's Class Intake.
+- Students are scoped to their own Class Intake.
+- Staff Protectors only see Students from linked intakes.
+- Students cannot be assigned Trainer.
+- Student Admins cannot delete Staff users or ban any Admin.
+- Role Spy has Admin-like power to edit other Students.
+- Spy users are hidden from User Management unless the viewer is a Protector.
+- Spy actors are hidden from User Audit History unless the viewer is a Protector.
+- Spy users are hidden from User Login History unless the viewer is a Protector.
+- Protector means Staff Protector or Student Protector for Spy visibility.
+- Staff and Student users receive notifications when their Role, Password, or Basic Info changes.
+- `admin@velodata.org` / user table id `1` is sacrosanct and must never be edited, role-changed, password-changed, avatar-changed, banned, or deleted through the game.
+- Only `admin@velodata.org` can change the Role Management view permission.
+
 ## Operational Notes
 
-- Always confirm the selected Class Intake before changing week presets or Pane 01-04 settings.
+- Always confirm the selected Class Intake before changing week presets or week pane settings.
 - Trainers may be teaching different intakes on different schedules.
 - Week presets are useful, but fine tuning may still be needed.
+- Existing saved settings can override newly changed defaults.
 - Global Management controls should be tested with a real Trainer account and a real Staff Admin account after permission changes.
-- If a setting appears to save but does not change behaviour, check whether the feature has frontend-only UI or completed Laravel backend support.
+- If a setting appears to save but does not change behaviour, check whether the selected Class Intake already has a saved value and whether Laravel has backend support for that setting.

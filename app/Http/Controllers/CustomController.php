@@ -82,6 +82,97 @@ class CustomController extends Controller
         return is_numeric($value) ? intval($value) : $default;
     }
 
+    private function gameUserSettingBoolean($gameUser, string $key, bool $default = false): bool
+    {
+        $intakeId = $gameUser?->intake_id ? intval($gameUser->intake_id) : null;
+
+        return $this->intakeGameSettingBoolean($intakeId, $key, $default);
+    }
+
+    private function paneOneBlocksBannedLogin($gameUser): bool
+    {
+        return $this->gameUserSettingBoolean($gameUser, 'security_block_banned_login', false);
+    }
+
+    private function isLocalOrPrivateIp(?string $ip): bool
+    {
+        if (! $ip) {
+            return false;
+        }
+
+        return in_array($ip, ['127.0.0.1', '::1', '0:0:0:0:0:0:0:1', 'localhost'], true)
+            || str_starts_with($ip, '192.168.')
+            || str_starts_with($ip, '10.')
+            || preg_match('/^172\.(1[6-9]|2[0-9]|3[0-1])\./', $ip);
+    }
+
+    private function getLocationLookupIp(Request $request): string
+    {
+        $clientReportedIpV4 = $this->normalizeIpAddress($request->input('vmd_ip_address_v4'));
+        if ($clientReportedIpV4 && $clientReportedIpV4['ip_address_v4']) {
+            return $clientReportedIpV4['ip_address_v4'];
+        }
+
+        $clientReportedIpV6 = $this->normalizeIpAddress($request->input('vmd_ip_address_v6'));
+        if ($clientReportedIpV6 && $clientReportedIpV6['ip_address_v6']) {
+            return $clientReportedIpV6['ip_address_v6'];
+        }
+
+        $resolved = $this->resolveClientIpAddresses($request);
+
+        return $resolved['ip_address_v4'] ?: $resolved['ip_address_v6'] ?: $resolved['ip_address'] ?: $request->ip();
+    }
+
+    private function countryCodeForRequest(Request $request, string $context): array
+    {
+        if (app()->environment('testing') && $request->filled('vmd_test_country_code')) {
+            return ['country' => strtoupper((string) $request->input('vmd_test_country_code')), 'error' => null];
+        }
+
+        $lookupIp = trim($this->getLocationLookupIp($request));
+
+        if ($this->isLocalOrPrivateIp($lookupIp)) {
+            return ['country' => 'AU', 'error' => null];
+        }
+
+        $accessToken = '4af1c2308a696c';
+        $apiUrl = "http://ipinfo.io/{$lookupIp}/json?token={$accessToken}";
+        $pageContent = file_get_contents($apiUrl);
+
+        if ($pageContent === false) {
+            return [
+                'country' => null,
+                'error' => response()->json([
+                    'errors' => "Failed to fetch geolocation data during {$context} for {$lookupIp}.",
+                ], 500),
+            ];
+        }
+
+        $parsedJson = json_decode($pageContent);
+
+        return ['country' => $parsedJson->country ?? null, 'error' => null];
+    }
+
+    private function geoLockUserEditResponse(Request $request, ?int $intakeId, string $context)
+    {
+        if (! $intakeId || ! $this->intakeGameSettingBoolean($intakeId, 'security_geo_lock_user_edits', false)) {
+            return null;
+        }
+
+        $location = $this->countryCodeForRequest($request, $context);
+        if ($location['error']) {
+            return $location['error'];
+        }
+
+        if ($location['country'] !== 'AU') {
+            return response()->json([
+                'errors' => 'Permission Denied:  (You can only perform updates if you are in Australia)',
+            ], 403);
+        }
+
+        return null;
+    }
+
     private function userManagementTimeoutResponse(?string $email)
     {
         if (! $email) {
@@ -263,7 +354,12 @@ class CustomController extends Controller
         $gameUser = GameUser::where('email', $email)->first();
         $roleName = $gameUser?->game_role;
 
-        return in_array(strtolower((string) $roleName), ['admin', 'protector'], true);
+        return in_array(strtolower((string) $roleName), ['admin', 'protector', 'spy'], true);
+    }
+
+    private function canRestoreDeletedUsers(?string $email): bool
+    {
+        return $this->isStaffRoleEmail($email, ['Admin', 'Protector']);
     }
 
     private function isGameUserAdminActor(?string $email): bool
@@ -298,7 +394,7 @@ class CustomController extends Controller
         $actorGameUser = $this->actorGameUser($actorEmail);
         $actorGameRole = strtolower((string) $actorGameUser?->game_role);
 
-        return in_array($actorGameRole, ['admin', 'protector'], true);
+        return in_array($actorGameRole, ['admin', 'protector', 'spy'], true);
     }
 
     private function canDeleteStaffUser(?string $actorEmail, User $targetUser): bool
@@ -319,6 +415,10 @@ class CustomController extends Controller
 
     private function canUnbanStaffUser(?string $actorEmail, User $targetUser): bool
     {
+        if (strtoupper((string) $targetUser->status) === 'DELETED') {
+            return $this->canRestoreDeletedUsers($actorEmail);
+        }
+
         return $this->canBanStaffUser($actorEmail, $targetUser);
     }
 
@@ -1795,7 +1895,7 @@ class CustomController extends Controller
 
                 $gameUserStatus = strtoupper((string) $gameUser->game_status);
 
-                if ($gameUserStatus === 'BANNED') {
+                if ($gameUserStatus === 'BANNED' && $this->paneOneBlocksBannedLogin($gameUser)) {
                     return response()->json([
                         'outcome' => 'STUDENT_LOGIN_DENIED',
                         'errors' => 'Your class intake account has been banned.',
@@ -2134,7 +2234,7 @@ class CustomController extends Controller
             return response()->json($response, 403);
         }
 
-        if ($user->status === 'BANNED') {
+        if (in_array($user->status, ['BANNED', 'DELETED'], true)) {
             $user->status = 'Active';
             $user->updated_by = $data['updated_by'] ?? $user->updated_by;
             $user->save();
@@ -2328,6 +2428,11 @@ class CustomController extends Controller
         $method = $request->input('method');
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
+        $viewer = DB::table('users')->where('email', $email)->first();
+        $viewerGameUser = $viewer ? null : DB::table('game_users')->where('email', $email)->first();
+        $canViewSpyLoginRows =
+            ($viewer && strcasecmp((string) $viewer->role_name, 'Protector') === 0) ||
+            ($viewerGameUser && strcasecmp((string) $viewerGameUser->game_role, 'Protector') === 0);
         $historyIntakeScope = $this->historyIntakeScope($email, $gameIntakeId, $gameIntakeCode);
 
         // Get the total number of records in the table
@@ -2338,32 +2443,41 @@ class CustomController extends Controller
                 ->leftJoin('game_users', 'user_login_history.email', '=', 'game_users.email')
                 ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id');
         };
+        $applySpyLoginVisibility = function ($query) use ($canViewSpyLoginRows) {
+            if ($canViewSpyLoginRows) {
+                return $query;
+            }
+
+            return $query->where(function ($query) {
+                $query
+                    ->whereNull(DB::raw('COALESCE(users.role_name, game_users.game_role)'))
+                    ->orWhereRaw('LOWER(COALESCE(users.role_name, game_users.game_role)) <> ?', ['spy']);
+            });
+        };
+        $loginHistorySelect = [
+            'user_login_history.*',
+            'users.google_id',
+            DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image'),
+            DB::raw('COALESCE(users.role_name, game_users.game_role) as role_name'),
+        ];
         // Apply filters based on method
         switch ($method) {
             case 'single user':
-                $login_history_list = $this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)
+                $login_history_list = $applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope))
                     ->where('user_login_history.email', $email)
-                    ->select(
-                        'user_login_history.*',
-                        'users.google_id',
-                        DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image')
-                    )
+                    ->select($loginHistorySelect)
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->get();
 
                 break;
 
             case 'Staff Logins':
-                $login_history_list = $this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)
+                $login_history_list = $applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope))
                     ->where(function ($query) {
                         $query->where('user_login_history.login_identity_type', 'staff')
                             ->orWhereNull('user_login_history.login_identity_type');
                     })
-                    ->select(
-                        'user_login_history.*',
-                        'users.google_id',
-                        DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image')
-                    )
+                    ->select($loginHistorySelect)
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->limit(100)
                     ->get();
@@ -2371,13 +2485,9 @@ class CustomController extends Controller
                 break;
 
             case 'Student Logins':
-                $login_history_list = $this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)
+                $login_history_list = $applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope))
                     ->where('user_login_history.login_identity_type', 'student')
-                    ->select(
-                        'user_login_history.*',
-                        'users.google_id',
-                        DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image')
-                    )
+                    ->select($loginHistorySelect)
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->limit(100)
                     ->get();
@@ -2385,12 +2495,8 @@ class CustomController extends Controller
                 break;
 
             default:
-                $login_history_list = $this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)
-                    ->select(
-                        'user_login_history.*',
-                        'users.google_id',
-                        DB::raw('COALESCE(users.profile_image, game_users.profile_image) as profile_image')
-                    )
+                $login_history_list = $applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope))
+                    ->select($loginHistorySelect)
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->limit(100)
                     ->get();
@@ -2430,6 +2536,7 @@ class CustomController extends Controller
                     "created_at" => $row->created_at,
                     "google_id" => $row->google_id,
                     "profile_image" => $row->profile_image ?? null,
+                    "role_name" => $row->role_name,
                 ],
             ];
         });
@@ -2459,7 +2566,11 @@ class CustomController extends Controller
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
         $viewer = $requestEmail ? DB::table('users')->where('email', $requestEmail)->first() : null;
+        $viewerGameUser = ($requestEmail && ! $viewer) ? DB::table('game_users')->where('email', $requestEmail)->first() : null;
         $canViewProtectedSecurityAudits = $viewer && in_array($viewer->role_name, ['Admin', 'Protector', 'Trainer'], true);
+        $canViewSpyAuditRows =
+            ($viewer && strcasecmp((string) $viewer->role_name, 'Protector') === 0) ||
+            ($viewerGameUser && strcasecmp((string) $viewerGameUser->game_role, 'Protector') === 0);
         $historyIntakeScope = $this->historyIntakeScope($requestEmail, $gameIntakeId, $gameIntakeCode);
 
 
@@ -2467,10 +2578,14 @@ class CustomController extends Controller
             ->leftJoin('users', 'users.id', '=', DB::raw('user_audit_history.custno - 100000'))
             ->leftJoin('game_users', 'game_users.id', '=', DB::raw('user_audit_history.custno - 900000'))
             ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+            ->leftJoin('users as actor_users', 'actor_users.email', '=', 'user_audit_history.created_by_email')
+            ->leftJoin('game_users as actor_game_users', 'actor_game_users.email', '=', 'user_audit_history.created_by_email')
             ->select(
                 'user_audit_history.*',
                 DB::raw("COALESCE(users.name, game_users.display_name, TRIM(CONCAT(COALESCE(game_users.preferred_name, game_users.first_name, ''), ' ', COALESCE(game_users.surname, '')))) as target_name"),
-                DB::raw('COALESCE(users.email, game_users.email) as target_email')
+                DB::raw('COALESCE(users.email, game_users.email) as target_email'),
+                DB::raw('COALESCE(users.role_name, game_users.game_role) as target_role_name'),
+                DB::raw('COALESCE(actor_users.role_name, actor_game_users.game_role) as actor_role_name')
             );
 
         $auditHistoryQuery = $this->applyHistoryIntakeScope($auditHistoryQuery, $historyIntakeScope);
@@ -2479,6 +2594,18 @@ class CustomController extends Controller
             $auditHistoryQuery
                 ->where('user_audit_history.comments', 'not like', 'Protected account edit blocked:%')
                 ->where('user_audit_history.comments', 'not like', 'Protected account warning;%');
+        }
+
+        if (! $canViewSpyAuditRows) {
+            $auditHistoryQuery->where(function ($query) {
+                $query
+                    ->whereNull(DB::raw('COALESCE(users.role_name, game_users.game_role)'))
+                    ->orWhereRaw('LOWER(COALESCE(users.role_name, game_users.game_role)) <> ?', ['spy']);
+            })->where(function ($query) {
+                $query
+                    ->whereNull(DB::raw('COALESCE(actor_users.role_name, actor_game_users.game_role)'))
+                    ->orWhereRaw('LOWER(COALESCE(actor_users.role_name, actor_game_users.game_role)) <> ?', ['spy']);
+            });
         }
 
         $audit_history_list = $auditHistoryQuery
@@ -2511,6 +2638,8 @@ class CustomController extends Controller
                     "created_by_ip_address" => $row->created_by_ip_address,
                     "target_name" => $row->target_name,
                     "target_email" => $row->target_email,
+                    "target_role_name" => $row->target_role_name,
+                    "actor_role_name" => $row->actor_role_name,
                     // "user_city" => $row->user_city,
                     // "user_region" => $row->user_region,
                     // "user_country" => $row->user_country,
@@ -2707,6 +2836,7 @@ class CustomController extends Controller
             'vmd_audit_reason' => 'required|string|max:255',
             'vmd_user_name'    => 'required|string|max:255',
             'vmd_user_email'   => 'required|string|max:255',
+            'game_intake_id'    => 'nullable|integer|exists:game_intakes,id',
         ]);
 
 if ($validator->fails()) {
@@ -2738,6 +2868,19 @@ if ($validator->fails()) {
             return $timeoutResponse;
         }
 
+        $actorGameUserForGeoLock = $this->actorGameUser($data['vmd_user_email']);
+        $geoLockIntakeId = isset($data['game_intake_id'])
+            ? intval($data['game_intake_id'])
+            : ($actorGameUserForGeoLock?->intake_id ? intval($actorGameUserForGeoLock->intake_id) : null);
+
+        if ($geoLockResponse = $this->geoLockUserEditResponse(
+            $request,
+            $geoLockIntakeId,
+            'F0_VMD_updateUser()'
+        )) {
+            return $geoLockResponse;
+        }
+
         if ($data['id'] === 1) {
             $targetAdmin = User::where('id', 1)->first();
             $protectedAdminSelfAvatarUpdate = $targetAdmin
@@ -2752,35 +2895,6 @@ if ($validator->fails()) {
             $response['message'] = "Permission Denied:  (You can NEVER EVER edit the Admin account.)";
             return response()->json($response, 403);
             }
-        }
-
-        // Fetch the real user IP from Cloudflare
-        $realIp = $request->header('X-Forwarded-For');
-        $realIp = $realIp ? explode(',', $realIp)[0] : $request->ip();
-        $realIp = trim($realIp);
-
-        // IPinfo API credentials
-        $accessToken = '4af1c2308a696c';
-        $isLocalIp = in_array($realIp, ['127.0.0.1', '::1', 'localhost'], true)
-            || str_starts_with($realIp, '192.168.')
-            || str_starts_with($realIp, '10.')
-            || preg_match('/^172\.(1[6-9]|2[0-9]|3[0-1])\./', $realIp);
-
-        if ($isLocalIp) {
-            $country = 'AU';
-        } else {
-            $apiUrl = "http://ipinfo.io/{$realIp}/json?token={$accessToken}";
-            $pageContent = file_get_contents($apiUrl);
-            if ($pageContent === false) {
-                return response()->json(['errors' => 'Failed to fetch geolocation data during F0_VMD_updateUser().'], 500);
-            }
-
-            $parsedJson = json_decode($pageContent);
-            $country = $parsedJson->country ?? null;
-        }
-
-        if ($country !== 'AU') {
-            return response()->json(['errors' => "Permission Denied:  (You can only perform updates if you are in Australia)"], 403);
         }
 
         if ($data['id'] == 1 && ! $protectedAdminSelfAvatarUpdate) {
@@ -2798,6 +2912,7 @@ if ($validator->fails()) {
         $user = User::where('id', $data['id'])->first();
 
         if ($user) {
+            $oldRoleName = (string) ($user->role_name ?: optional($user->roles()->first())->name);
             $user->name         = $data['name'] ?? $user->name;
             $user->email        = $data['email'] ?? $user->email;
             $user->role_id      = $data['role_id'] ?? $user->role_id;
@@ -2812,7 +2927,8 @@ if ($validator->fails()) {
             $user->gender       = $data['gender'] ?? $user->gender;
             $user->location     = $data['location'] ?? $user->location;
             $user->phone_no     = $data['phone_no'] ?? $user->phone_no;
-            $user->password     = isset($data['password']) ? bcrypt($data['password']) : $user->password;
+            $passwordWasChanged = isset($data['password']) && (string) $data['password'] !== '';
+            $user->password     = $passwordWasChanged ? bcrypt($data['password']) : $user->password;
 
             $user->address_1    = $data['address_1'] ?? $user->address_1;
             $user->address_2    = $data['address_2'] ?? $user->address_2;
@@ -2843,6 +2959,52 @@ if ($validator->fails()) {
                 'created_at' => now(),
                 'updated_at' => now(),
             ]);
+
+            if ($passwordWasChanged) {
+                $this->createPersistedNotification([
+                    'recipient_email' => $user->email,
+                    'actor_email' => $data['vmd_user_email'],
+                    'type' => 'warning',
+                    'title' => 'Password changed',
+                    'message' => "Your password was changed by {$data['vmd_user_name']}.",
+                    'source' => 'user-management',
+                    'dedupe_key' => 'staff-password-changed-' . intval($user->id) . '-' . now()->format('YmdHis'),
+                    'metadata' => [
+                        'user_id' => intval($user->id),
+                        'identity_type' => 'staff',
+                    ],
+                ]);
+            } elseif (strcasecmp($oldRoleName, (string) $user->role_name) !== 0) {
+                $this->createPersistedNotification([
+                    'recipient_email' => $user->email,
+                    'actor_email' => $data['vmd_user_email'],
+                    'type' => 'warning',
+                    'title' => 'Role changed',
+                    'message' => "Your role was changed from {$oldRoleName} to {$user->role_name} by {$data['vmd_user_name']}. Your permissions have been updated.",
+                    'source' => 'user-management',
+                    'dedupe_key' => 'staff-role-changed-' . intval($user->id) . '-' . strtolower($oldRoleName) . '-' . strtolower((string) $user->role_name) . '-' . now()->format('YmdHis'),
+                    'metadata' => [
+                        'user_id' => intval($user->id),
+                        'identity_type' => 'staff',
+                        'previousRole' => $oldRoleName,
+                        'role' => $user->role_name,
+                    ],
+                ]);
+            } else {
+                $this->createPersistedNotification([
+                    'recipient_email' => $user->email,
+                    'actor_email' => $data['vmd_user_email'],
+                    'type' => 'info',
+                    'title' => 'Basic Info changed',
+                    'message' => "Your Basic Info was changed by {$data['vmd_user_name']}.",
+                    'source' => 'user-management',
+                    'dedupe_key' => 'staff-basic-info-changed-' . intval($user->id) . '-' . now()->format('YmdHis'),
+                    'metadata' => [
+                        'user_id' => intval($user->id),
+                        'identity_type' => 'staff',
+                    ],
+                ]);
+            }
 
             $response['outcome'] = "SUCCESS";
             $response['message'] = "User updated successfully.";
@@ -2926,13 +3088,21 @@ if ($validator->fails()) {
             ], 404);
         }
 
+        if ($geoLockResponse = $this->geoLockUserEditResponse(
+            $request,
+            $gameUser->intake_id ? intval($gameUser->intake_id) : null,
+            'F0_VMD_update_game_user_basic_info()'
+        )) {
+            return $geoLockResponse;
+        }
+
         $isSelfUpdate = strcasecmp($gameUser->email, $data['email']) === 0
             && strcasecmp($gameUser->email, $data['vmd_user_email']) === 0;
 
         if (strcasecmp($gameUser->email, $data['email']) !== 0 || (! $isSelfUpdate && ! $this->canManageGameUsers($data['vmd_user_email']))) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin, Protector, or Trainer.',
+                'message' => 'Permission Denied: You can only update your own student profile unless you are Admin, Protector, Trainer, or Spy.',
             ], 403);
         }
 
@@ -2950,13 +3120,16 @@ if ($validator->fails()) {
             ], 403);
         }
 
+        $oldRole = (string) $gameUser->game_role;
+        $newRole = (string) ($data['role_name'] ?? $gameUser->game_role);
+
         DB::table('game_users')->where('id', $data['id'])->update([
             'display_name' => $data['name'],
             'gender' => $data['gender'] ?? null,
             'location' => $data['location'] ?? null,
             'phone_no' => $data['phone_no'] ?? null,
             'languages' => json_encode($data['languages'] ?? []),
-            'game_role' => $data['role_name'] ?? $gameUser->game_role,
+            'game_role' => $newRole,
             'updated_by' => $data['vmd_user_email'],
             'updated_at' => now(),
         ]);
@@ -2995,6 +3168,39 @@ if ($validator->fails()) {
             'created_at' => now(),
             'updated_at' => now(),
         ]);
+
+        $this->createPersistedNotification([
+            'recipient_email' => $updatedGameUser->email,
+            'actor_email' => $data['vmd_user_email'],
+            'type' => 'info',
+            'title' => 'Basic Info changed',
+            'message' => "Your Basic Info was changed by {$data['vmd_user_name']}.",
+            'source' => 'user-management',
+            'dedupe_key' => 'student-basic-info-changed-' . intval($updatedGameUser->id) . '-' . now()->format('YmdHis'),
+            'metadata' => [
+                'game_user_id' => intval($updatedGameUser->id),
+                'identity_type' => 'student',
+                'intake_code' => $updatedGameUser->intake_code,
+            ],
+        ]);
+
+        if (strcasecmp($oldRole, (string) $updatedGameUser->game_role) !== 0) {
+            $this->createPersistedNotification([
+                'recipient_email' => $updatedGameUser->email,
+                'actor_email' => $data['vmd_user_email'],
+                'type' => 'warning',
+                'title' => 'Role changed',
+                'message' => "Your role was changed from {$oldRole} to {$updatedGameUser->game_role} by {$data['vmd_user_name']}. Your permissions have been updated.",
+                'source' => 'user-management',
+                'dedupe_key' => 'student-role-changed-' . intval($updatedGameUser->id) . '-' . strtolower($oldRole) . '-' . strtolower((string) $updatedGameUser->game_role) . '-' . now()->format('YmdHis'),
+                'metadata' => [
+                    'game_user_id' => intval($updatedGameUser->id),
+                    'previousRole' => $oldRole,
+                    'role' => $updatedGameUser->game_role,
+                    'intake_code' => $updatedGameUser->intake_code,
+                ],
+            ]);
+        }
 
         return response()->json([
             'outcome' => 'SUCCESS',
@@ -3074,12 +3280,20 @@ if ($validator->fails()) {
             ], 404);
         }
 
+        if ($geoLockResponse = $this->geoLockUserEditResponse(
+            $request,
+            $gameUser->intake_id ? intval($gameUser->intake_id) : null,
+            'F0_VMD_update_game_user_password()'
+        )) {
+            return $geoLockResponse;
+        }
+
         $isSelfPasswordChange = strcasecmp($gameUser->email, $data['vmd_user_email']) === 0;
 
         if (! $isSelfPasswordChange && ! $this->canManageGameUsers($data['vmd_user_email'])) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: You can only change your own student password unless you are Admin, Protector, or Trainer.',
+                'message' => 'Permission Denied: You can only change your own student password unless you are Admin, Protector, Trainer, or Spy.',
             ], 403);
         }
 
@@ -3099,6 +3313,21 @@ if ($validator->fails()) {
             'created_by_ip_address' => $this->getRequestIpAddress($request),
             'created_at' => now(),
             'updated_at' => now(),
+        ]);
+
+        $this->createPersistedNotification([
+            'recipient_email' => $gameUser->email,
+            'actor_email' => $data['vmd_user_email'],
+            'type' => 'warning',
+            'title' => 'Password changed',
+            'message' => "Your password was changed by {$data['vmd_user_name']}.",
+            'source' => 'user-management',
+            'dedupe_key' => 'student-password-changed-' . intval($gameUser->id) . '-' . now()->format('YmdHis'),
+            'metadata' => [
+                'game_user_id' => intval($gameUser->id),
+                'identity_type' => 'student',
+                'intake_code' => $gameUser->intake_code,
+            ],
         ]);
 
         return response()->json([
@@ -3133,7 +3362,7 @@ if ($validator->fails()) {
         if (! $this->canManageGameUsers($data['vmd_user_email'])) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: Admin, Protector, or Trainer access required.',
+                'message' => 'Permission Denied: Admin, Protector, Trainer, or Spy access required.',
             ], 403);
         }
 
@@ -3152,6 +3381,17 @@ if ($validator->fails()) {
                 'outcome' => 'FAIL',
                 'message' => 'Game user not found.',
             ], 404);
+        }
+
+        if (
+            $status === 'ACTIVE'
+            && strcasecmp((string) $gameUser->game_status, 'DELETED') === 0
+            && ! $this->canRestoreDeletedUsers($data['vmd_user_email'])
+        ) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Staff Admin or Staff Protector access required to restore deleted users.',
+            ], 403);
         }
 
         if (
@@ -3372,6 +3612,41 @@ if ($validator->fails()) {
         }
 
         $email = $request->input('vmd_user_email');
+        $requestedIntakeId = $request->integer('game_intake_id') ?: null;
+
+        $gameUser = GameUser::where('email', $email)->first();
+        if ($gameUser) {
+            $intakeId = (int) $gameUser->intake_id;
+            if ($requestedIntakeId && $requestedIntakeId !== $intakeId) {
+                return response()->json([
+                    'outcome' => 'ERROR: Class Intake not available.',
+                    'message' => 'You do not have access to that Class Intake.',
+                ], 403);
+            }
+
+            $this->ensureIntakeGameSettings($intakeId);
+            $freshIntake = DB::table('game_intakes')->where('id', $intakeId)->first();
+
+            return response()->json([
+                'outcome' => 'SUCCESS: Intake game settings loaded.',
+                'intakes' => [[
+                    'id' => $intakeId,
+                    'code' => $freshIntake->code,
+                    'name' => $freshIntake->name,
+                    'status' => $freshIntake->status,
+                    'activeWeek' => $freshIntake->active_week,
+                ]],
+                'selected_intake' => [
+                    'id' => $intakeId,
+                    'code' => $freshIntake->code,
+                    'name' => $freshIntake->name,
+                    'status' => $freshIntake->status,
+                    'activeWeek' => $freshIntake->active_week,
+                ],
+                'settings' => $this->intakeGameSettingRows($intakeId),
+            ]);
+        }
+
         if (!$this->canAccessGlobalManagement($email)) {
             return response()->json([
                 'outcome' => 'ERROR: Staff Admin or Trainer access required.',
@@ -3395,7 +3670,6 @@ if ($validator->fails()) {
             ]);
         }
 
-        $requestedIntakeId = $request->integer('game_intake_id') ?: null;
         $selectedIntake = $requestedIntakeId
             ? $intakes->firstWhere('id', $requestedIntakeId)
             : $intakes->first();
@@ -3593,16 +3867,10 @@ if ($validator->fails()) {
         return [
             'security_manual_login_requires_2fa' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Manual login requires 2FA', 'sort' => 10],
             'security_block_banned_login' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Banned players cannot log in', 'sort' => 20],
-            'security_protect_admin_account' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Protected Admin account cannot be edited, banned, or deleted', 'sort' => 30],
             'security_geo_lock_user_edits' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'User edits must originate from Australia', 'sort' => 40],
-            'security_require_audit_reason' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Dangerous user actions require an audit reason', 'sort' => 50],
-            'security_log_protected_attempts' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Log protected-account attempts', 'sort' => 60],
-            'security_notify_protected_attempts' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Notify Admins, Protectors, and Trainers about protected-account attempts', 'sort' => 70],
-            'security_hide_protected_audits' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Hide protected security audits from normal users', 'sort' => 80],
-            'game_allow_non_admin_add_users' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Non-admin players can add users', 'sort' => 90],
-            'game_allow_non_admin_choose_roles' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Non-admin players can choose any role for new users', 'sort' => 100],
-            'game_allow_oauth_role_selection' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Google OAuth registration can create privileged roles', 'sort' => 110],
-            'game_delete_cooldown_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Delete attacker receives an action lock', 'sort' => 120],
+            'game_block_student_add_users' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Students can no longer Add Users', 'sort' => 90],
+            'game_restrict_student_role_selection' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Students can no longer choose any role for new users.', 'sort' => 100],
+            'game_delete_cooldown_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Students receive a lockdown when they Delete or Ban someone.', 'sort' => 120],
             'game_delete_cooldown_minutes' => ['type' => 'integer', 'group' => 'elimination-recovery', 'label' => 'Delete timeout minutes', 'sort' => 130],
             'game_allow_undelete' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Deleted players can be restored by defenders', 'sort' => 140],
             'game_protector_spy_controls' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Protector spy controls are enabled', 'sort' => 150],
@@ -3617,16 +3885,10 @@ if ($validator->fails()) {
     {
         $weekOne = [
             'security_manual_login_requires_2fa' => false,
-            'security_block_banned_login' => false,
-            'security_protect_admin_account' => false,
+            'security_block_banned_login' => true,
             'security_geo_lock_user_edits' => false,
-            'security_require_audit_reason' => false,
-            'security_log_protected_attempts' => false,
-            'security_notify_protected_attempts' => false,
-            'security_hide_protected_audits' => false,
-            'game_allow_non_admin_add_users' => true,
-            'game_allow_non_admin_choose_roles' => true,
-            'game_allow_oauth_role_selection' => true,
+            'game_block_student_add_users' => false,
+            'game_restrict_student_role_selection' => false,
             'game_delete_cooldown_enabled' => false,
             'game_allow_undelete' => false,
             'game_protector_spy_controls' => false,
@@ -3639,19 +3901,12 @@ if ($validator->fails()) {
         $weeks = [
             'week_1' => [],
             'week_2' => [
-                'security_require_audit_reason' => true,
-                'security_log_protected_attempts' => true,
+                'security_block_banned_login' => true,
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
             ],
             'week_3' => [
                 'security_block_banned_login' => true,
-                'security_protect_admin_account' => true,
-                'security_require_audit_reason' => true,
-                'security_log_protected_attempts' => true,
-                'security_notify_protected_attempts' => true,
-                'game_allow_non_admin_choose_roles' => false,
-                'game_allow_oauth_role_selection' => false,
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
@@ -3659,14 +3914,7 @@ if ($validator->fails()) {
             ],
             'week_4' => [
                 'security_block_banned_login' => true,
-                'security_protect_admin_account' => true,
                 'security_geo_lock_user_edits' => true,
-                'security_require_audit_reason' => true,
-                'security_log_protected_attempts' => true,
-                'security_notify_protected_attempts' => true,
-                'security_hide_protected_audits' => true,
-                'game_allow_non_admin_choose_roles' => false,
-                'game_allow_oauth_role_selection' => false,
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
@@ -3675,15 +3923,8 @@ if ($validator->fails()) {
             'week_5' => [
                 'security_manual_login_requires_2fa' => true,
                 'security_block_banned_login' => true,
-                'security_protect_admin_account' => true,
                 'security_geo_lock_user_edits' => true,
-                'security_require_audit_reason' => true,
-                'security_log_protected_attempts' => true,
-                'security_notify_protected_attempts' => true,
-                'security_hide_protected_audits' => true,
-                'game_allow_non_admin_add_users' => false,
-                'game_allow_non_admin_choose_roles' => false,
-                'game_allow_oauth_role_selection' => false,
+                'game_block_student_add_users' => true,
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
@@ -3693,15 +3934,9 @@ if ($validator->fails()) {
             'week_6' => [
                 'security_manual_login_requires_2fa' => true,
                 'security_block_banned_login' => true,
-                'security_protect_admin_account' => true,
                 'security_geo_lock_user_edits' => true,
-                'security_require_audit_reason' => true,
-                'security_log_protected_attempts' => true,
-                'security_notify_protected_attempts' => true,
-                'security_hide_protected_audits' => true,
-                'game_allow_non_admin_add_users' => false,
-                'game_allow_non_admin_choose_roles' => false,
-                'game_allow_oauth_role_selection' => false,
+                'game_block_student_add_users' => true,
+                'game_restrict_student_role_selection' => true,
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
@@ -3789,8 +4024,11 @@ if ($validator->fails()) {
 
     private function intakeGameSettingRows(int $intakeId)
     {
+        $activeKeys = array_keys($this->intakeGameSettingDefinitions());
+
         return DB::table('game_intake_settings')
             ->where('game_intake_id', $intakeId)
+            ->whereIn('key', $activeKeys)
             ->orderBy('group')
             ->orderBy('sort_order')
             ->orderBy('key')
@@ -4342,6 +4580,22 @@ if ($validator->fails()) {
                 return response()->json([
                     'outcome' => 'ERROR: Student game user not found.',
                 ], 404);
+            }
+
+            $gameUserStatus = strtoupper((string) $gameUser->game_status);
+
+            if ($gameUserStatus === 'BANNED' && $this->paneOneBlocksBannedLogin($gameUser)) {
+                return response()->json([
+                    'outcome' => 'STUDENT_LOGIN_DENIED',
+                    'errors' => 'Your class intake account has been banned.',
+                ], 403);
+            }
+
+            if ($gameUserStatus === 'DELETED') {
+                return response()->json([
+                    'outcome' => 'STUDENT_LOGIN_DENIED',
+                    'errors' => 'Your class intake account has been deleted.',
+                ], 403);
             }
 
             $studentCustno = 900000 + (int) $gameUser->id;
