@@ -689,7 +689,9 @@ class UserController extends Controller
         }
 
         $user = User::findOrFail($userId);
-        $geoLockIntakeId = $request->input('game_intake_id') ? (int) $request->input('game_intake_id') : null;
+        $geoLockIntakeId = $request->input('game_intake_code')
+            ? (int) DB::table('game_intakes')->where('code', $request->input('game_intake_code'))->value('id')
+            : null;
         if ($geoLockResponse = $this->geoLockUserEditResponse($request, $geoLockIntakeId, 'uploadProfileImage()')) {
             return $geoLockResponse;
         }

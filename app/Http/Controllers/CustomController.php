@@ -774,6 +774,54 @@ class CustomController extends Controller
         ];
     }
 
+    private function classIntakeRosterPayload(string $gameIntakeCode): ?array
+    {
+        $intake = DB::table('game_intakes')
+            ->where('code', $gameIntakeCode)
+            ->first();
+
+        if (! $intake) {
+            return null;
+        }
+
+        $roster = DB::table('game_users')
+            ->join('game_intakes', 'game_intakes.id', '=', 'game_users.intake_id')
+            ->where('game_intakes.code', $gameIntakeCode)
+            ->select(
+                'game_users.id',
+                'game_intakes.code as intake_code',
+                'game_users.display_name',
+                'game_users.email',
+                'game_users.game_role',
+                'game_users.game_status',
+                'game_users.created_at'
+            )
+            ->orderBy('game_users.display_name')
+            ->get()
+            ->map(function ($row) {
+                return [
+                    'id' => (int) $row->id,
+                    'game_intake_code' => $row->intake_code,
+                    'displayName' => $row->display_name,
+                    'email' => $row->email,
+                    'gameRole' => $row->game_role,
+                    'gameStatus' => $row->game_status,
+                    'created_at' => $row->created_at,
+                ];
+            })
+            ->values();
+
+        return [
+            'intake' => [
+                'code' => $intake->code,
+                'name' => $intake->name,
+                'status' => $intake->status,
+                'activeWeek' => $intake->active_week,
+            ],
+            'roster' => $roster,
+        ];
+    }
+
     private function createStaffIntakeAssignmentNotifications(
         $staffUserIds,
         object $intake,
@@ -850,6 +898,43 @@ class CustomController extends Controller
         }
     }
 
+    public function F0_VMD_get_class_intake_roster(Request $request)
+    {
+        $adminUser = $this->staffAdminFromRequest($request);
+        if (! $adminUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: only Staff users with Admin powers can view Class Intake rosters.',
+            ], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 409);
+        }
+
+        $payload = $this->classIntakeRosterPayload($request->input('game_intake_code'));
+
+        if (! $payload) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Class Intake not found.',
+            ], 404);
+        }
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'data' => $payload,
+        ], 200);
+    }
+
     public function F0_VMD_save_staff_intake_assignments(Request $request)
     {
         $adminUser = $this->staffAdminFromRequest($request);
@@ -865,7 +950,7 @@ class CustomController extends Controller
         }
 
         $validator = Validator::make($request->all(), [
-            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
             'staff_user_ids' => 'array',
             'staff_user_ids.*' => 'integer|exists:users,id',
         ]);
@@ -878,12 +963,12 @@ class CustomController extends Controller
             ], 409);
         }
 
-        $gameIntakeId = (int) $request->input('game_intake_id');
+        $gameIntake = DB::table('game_intakes')->where('code', $request->input('game_intake_code'))->first();
+        $gameIntakeId = (int) $gameIntake->id;
         $staffUserIds = collect($request->input('staff_user_ids', []))
             ->map(fn ($id) => (int) $id)
             ->unique()
             ->values();
-        $gameIntake = DB::table('game_intakes')->where('id', $gameIntakeId)->first();
 
         if ($staffUserIds->isNotEmpty()) {
             $availableStaffUserIds = User::query()
@@ -2836,7 +2921,7 @@ class CustomController extends Controller
             'vmd_audit_reason' => 'required|string|max:255',
             'vmd_user_name'    => 'required|string|max:255',
             'vmd_user_email'   => 'required|string|max:255',
-            'game_intake_id'    => 'nullable|integer|exists:game_intakes,id',
+            'game_intake_code'  => 'nullable|string|exists:game_intakes,code',
         ]);
 
 if ($validator->fails()) {
@@ -2869,8 +2954,8 @@ if ($validator->fails()) {
         }
 
         $actorGameUserForGeoLock = $this->actorGameUser($data['vmd_user_email']);
-        $geoLockIntakeId = isset($data['game_intake_id'])
-            ? intval($data['game_intake_id'])
+        $geoLockIntakeId = isset($data['game_intake_code'])
+            ? (int) DB::table('game_intakes')->where('code', $data['game_intake_code'])->value('id')
             : ($actorGameUserForGeoLock?->intake_id ? intval($actorGameUserForGeoLock->intake_id) : null);
 
         if ($geoLockResponse = $this->geoLockUserEditResponse(
@@ -3601,7 +3686,7 @@ if ($validator->fails()) {
     {
         $request->validate([
             'vmd_user_email' => 'required|email',
-            'game_intake_id' => 'nullable|integer|exists:game_intakes,id',
+            'game_intake_code' => 'nullable|string|exists:game_intakes,code',
         ]);
 
         if (! Schema::hasTable('game_intake_settings')) {
@@ -3612,12 +3697,13 @@ if ($validator->fails()) {
         }
 
         $email = $request->input('vmd_user_email');
-        $requestedIntakeId = $request->integer('game_intake_id') ?: null;
+        $requestedIntakeCode = $request->input('game_intake_code') ? trim($request->input('game_intake_code')) : null;
 
         $gameUser = GameUser::where('email', $email)->first();
         if ($gameUser) {
             $intakeId = (int) $gameUser->intake_id;
-            if ($requestedIntakeId && $requestedIntakeId !== $intakeId) {
+            $freshIntake = DB::table('game_intakes')->where('id', $intakeId)->first();
+            if ($requestedIntakeCode && $freshIntake && $requestedIntakeCode !== $freshIntake->code) {
                 return response()->json([
                     'outcome' => 'ERROR: Class Intake not available.',
                     'message' => 'You do not have access to that Class Intake.',
@@ -3625,7 +3711,6 @@ if ($validator->fails()) {
             }
 
             $this->ensureIntakeGameSettings($intakeId);
-            $freshIntake = DB::table('game_intakes')->where('id', $intakeId)->first();
 
             return response()->json([
                 'outcome' => 'SUCCESS: Intake game settings loaded.',
@@ -3670,8 +3755,8 @@ if ($validator->fails()) {
             ]);
         }
 
-        $selectedIntake = $requestedIntakeId
-            ? $intakes->firstWhere('id', $requestedIntakeId)
+        $selectedIntake = $requestedIntakeCode
+            ? $intakes->firstWhere('code', $requestedIntakeCode)
             : $intakes->first();
 
         if (! $selectedIntake) {
@@ -3703,7 +3788,7 @@ if ($validator->fails()) {
     {
         $request->validate([
             'vmd_user_email' => 'required|email',
-            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
             'active_week' => 'required|string|in:week_1,week_2,week_3,week_4,week_5,week_6',
             'settings' => 'required|array',
         ]);
@@ -3716,6 +3801,7 @@ if ($validator->fails()) {
         }
 
         $email = $request->input('vmd_user_email');
+        $gameIntakeCode = trim($request->input('game_intake_code'));
         if (!$this->canAccessGlobalManagement($email)) {
             return response()->json([
                 'outcome' => 'ERROR: Staff Admin or Trainer access required.',
@@ -3723,9 +3809,10 @@ if ($validator->fails()) {
         }
 
         $user = User::where('email', $email)->first();
-        $intakeId = $request->integer('game_intake_id');
+        $intake = DB::table('game_intakes')->where('code', $gameIntakeCode)->first();
+        $intakeId = (int) $intake->id;
 
-        if (! $user || ! $this->staffCanAccessIntake($user, $intakeId, null)) {
+        if (! $user || ! $this->staffCanAccessIntake($user, null, $gameIntakeCode)) {
             return response()->json([
                 'outcome' => 'ERROR: Class Intake not available.',
                 'message' => 'You do not have access to that Class Intake.',
@@ -4109,7 +4196,7 @@ if ($validator->fails()) {
     {
         $validated = $request->validate([
             'vmd_user_email' => 'required|email',
-            'game_intake_id' => 'nullable|integer|exists:game_intakes,id',
+            'game_intake_code' => 'nullable|string|exists:game_intakes,code',
         ]);
 
         if (!$this->isAdminEmail($validated['vmd_user_email'])) {
@@ -4118,10 +4205,17 @@ if ($validator->fails()) {
             ], 403);
         }
 
+        $intakeId = null;
+        if (! empty($validated['game_intake_code'])) {
+            $intakeId = (int) DB::table('game_intakes')
+                ->where('code', $validated['game_intake_code'])
+                ->value('id');
+        }
+
         return response()->json([
             'outcome' => 'SUCCESS: Baseline management data loaded.',
             'user_baselines' => $this->userTableBaselineRows(),
-            'game_baselines' => $this->gameBaselineRows(isset($validated['game_intake_id']) ? (int) $validated['game_intake_id'] : null),
+            'game_baselines' => $this->gameBaselineRows($intakeId),
             'intakes' => $this->baselineIntakeRows(),
         ], 200);
     }
@@ -4328,7 +4422,7 @@ if ($validator->fails()) {
     {
         $validated = $request->validate([
             'vmd_user_email' => 'required|email',
-            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
             'name' => 'nullable|string|max:255',
             'description' => 'nullable|string|max:1000',
         ]);
@@ -4339,18 +4433,19 @@ if ($validator->fails()) {
             ], 403);
         }
 
-        $intake = DB::table('game_intakes')->where('id', $validated['game_intake_id'])->first();
+        $intake = DB::table('game_intakes')->where('code', $validated['game_intake_code'])->first();
+        $intakeId = (int) $intake->id;
         $createdBy = DB::table('users')->where('email', $validated['vmd_user_email'])->first();
         $baselineName = $validated['name'] ?? "{$intake->code} student baseline " . now()->format('Y-m-d H:i:s');
         $description = $validated['description'] ?? "Captured from GMUI Reset Baseline for {$intake->code}.";
 
-        $baselineId = DB::transaction(function () use ($validated, $baselineName, $description, $createdBy) {
+        $baselineId = DB::transaction(function () use ($intakeId, $baselineName, $description, $createdBy) {
             DB::table('game_baselines')
-                ->where('intake_id', $validated['game_intake_id'])
+                ->where('intake_id', $intakeId)
                 ->update(['is_active' => false, 'updated_at' => now()]);
 
             $baselineId = DB::table('game_baselines')->insertGetId([
-                'intake_id' => $validated['game_intake_id'],
+                'intake_id' => $intakeId,
                 'name' => $baselineName,
                 'description' => $description,
                 'is_active' => true,
@@ -4360,7 +4455,7 @@ if ($validator->fails()) {
             ]);
 
             $gameUsers = DB::table('game_users')
-                ->where('intake_id', $validated['game_intake_id'])
+                ->where('intake_id', $intakeId)
                 ->orderBy('id')
                 ->get();
 
@@ -4396,7 +4491,7 @@ if ($validator->fails()) {
         return response()->json([
             'outcome' => 'SUCCESS: Student baseline captured.',
             'baseline_id' => $baselineId,
-            'game_intake_id' => (int) $validated['game_intake_id'],
+            'game_intake_code' => $intake->code,
             'row_count' => DB::table('game_baseline_users')->where('baseline_id', $baselineId)->count(),
         ], 200);
     }
@@ -4406,7 +4501,7 @@ if ($validator->fails()) {
         $validated = $request->validate([
             'vmd_user_email' => 'required|email',
             'baseline_id' => 'required|integer|exists:game_baselines,id',
-            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
         ]);
 
         if (!$this->isAdminEmail($validated['vmd_user_email'])) {
@@ -4415,9 +4510,10 @@ if ($validator->fails()) {
             ], 403);
         }
 
+        $intake = DB::table('game_intakes')->where('code', $validated['game_intake_code'])->first();
         $baseline = DB::table('game_baselines')
             ->where('id', $validated['baseline_id'])
-            ->where('intake_id', $validated['game_intake_id'])
+            ->where('intake_id', $intake->id)
             ->first();
 
         if (!$baseline) {
@@ -4493,7 +4589,7 @@ if ($validator->fails()) {
         return response()->json([
             'outcome' => 'SUCCESS: Student baseline restored for selected Class Intake.',
             'baseline_id' => $baseline->id,
-            'game_intake_id' => (int) $baseline->intake_id,
+            'game_intake_code' => $intake->code,
             'restored_rows' => $result['total'],
             'updated_rows' => $result['updated'],
             'created_rows' => $result['created'],
@@ -4506,7 +4602,7 @@ if ($validator->fails()) {
         $validated = $request->validate([
             'vmd_user_email' => 'required|email',
             'baseline_id' => 'required|integer|exists:game_baselines,id',
-            'game_intake_id' => 'required|integer|exists:game_intakes,id',
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
         ]);
 
         if (!$this->isAdminEmail($validated['vmd_user_email'])) {
@@ -4515,9 +4611,10 @@ if ($validator->fails()) {
             ], 403);
         }
 
+        $intake = DB::table('game_intakes')->where('code', $validated['game_intake_code'])->first();
         $deleted = DB::table('game_baselines')
             ->where('id', $validated['baseline_id'])
-            ->where('intake_id', $validated['game_intake_id'])
+            ->where('intake_id', $intake->id)
             ->delete();
 
         if (!$deleted) {
@@ -4529,7 +4626,7 @@ if ($validator->fails()) {
         return response()->json([
             'outcome' => 'SUCCESS: Student baseline deleted.',
             'baseline_id' => (int) $validated['baseline_id'],
-            'game_intake_id' => (int) $validated['game_intake_id'],
+            'game_intake_code' => $intake->code,
         ], 200);
     }
 

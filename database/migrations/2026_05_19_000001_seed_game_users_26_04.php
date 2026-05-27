@@ -2,6 +2,7 @@
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 
 return new class extends Migration
 {
@@ -62,6 +63,8 @@ return new class extends Migration
                     'preferred_name' => $preferredName,
                     'display_name' => $displayName,
                     'special_needs' => $specialNeeds,
+                    'password' => Hash::make('equinim01'),
+                    'must_change_password' => true,
                     'game_role' => 'Creator',
                     'game_status' => 'active',
                     'is_spy' => false,

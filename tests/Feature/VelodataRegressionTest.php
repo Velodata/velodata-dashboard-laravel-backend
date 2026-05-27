@@ -93,6 +93,23 @@ class VelodataRegressionTest extends TestCase
         $this->assertSame('student_fake_account', json_decode($metadata, true)['source'] ?? null);
     }
 
+    public function test_seeded_student_accounts_have_usable_default_passwords(): void
+    {
+        $seededStudents = DB::table('game_users')
+            ->join('game_intakes', 'game_intakes.id', '=', 'game_users.intake_id')
+            ->where('game_intakes.code', 'EQ-CYBER-26-04')
+            ->select('game_users.email', 'game_users.password', 'game_users.must_change_password')
+            ->get();
+
+        $this->assertGreaterThan(0, $seededStudents->count());
+
+        foreach ($seededStudents as $student) {
+            $this->assertNotNull($student->password, $student->email);
+            $this->assertTrue(Hash::check('equinim01', $student->password), $student->email);
+            $this->assertEquals(1, (int) $student->must_change_password, $student->email);
+        }
+    }
+
     public function test_student_role_change_creates_persisted_notification_for_that_game_user(): void
     {
         $staffAdmin = $this->createStaffUser('role-admin@example.test', 'Admin');
@@ -457,6 +474,25 @@ class VelodataRegressionTest extends TestCase
         $this->assertNotContains($otherStudent->email, $emails);
     }
 
+    public function test_user_management_prefers_intake_code_when_intake_id_disagrees(): void
+    {
+        $codeIntakeId = $this->createIntake('TEST-CODE-WINS');
+        $staleIdIntakeId = $this->createIntake('TEST-STALE-ID');
+        $staffAdmin = $this->createStaffUser('code-wins-admin@example.test', 'Admin');
+        $codeStudent = $this->createGameUser('code-wins-student@example.test', 'Creator', 'active', $codeIntakeId);
+        $staleIdStudent = $this->createGameUser('stale-id-student@example.test', 'Creator', 'active', $staleIdIntakeId);
+
+        $response = $this->getJson('/api/v2/users?include=roles&game_intake_id=' . $staleIdIntakeId . '&game_intake_code=TEST-CODE-WINS&vmd_user_email=' . urlencode($staffAdmin->email))
+            ->assertOk();
+
+        $emails = collect($response->json('data'))
+            ->pluck('attributes.email')
+            ->all();
+
+        $this->assertContains($codeStudent->email, $emails);
+        $this->assertNotContains($staleIdStudent->email, $emails);
+    }
+
     public function test_staff_protectors_only_see_students_from_linked_intakes(): void
     {
         $linkedIntakeId = $this->createIntake('TEST-LINKED');
@@ -479,6 +515,45 @@ class VelodataRegressionTest extends TestCase
         $unlinkedEmails = collect($unlinkedResponse->json('data'))->pluck('attributes.email')->all();
 
         $this->assertNotContains($unlinkedStudent->email, $unlinkedEmails);
+    }
+
+    public function test_class_intake_management_loads_roster_with_second_code_based_request(): void
+    {
+        $staffAdmin = $this->createStaffUser('class-roster-admin@example.test', 'Admin');
+        $cyberIntakeId = $this->createIntake('TEST-CYBER-ROSTER');
+        $webIntakeId = $this->createIntake('TEST-WEB-ROSTER');
+        $cyberStudent = $this->createGameUser('cyber-roster-student@example.test', 'Creator', 'active', $cyberIntakeId);
+        $webStudent = $this->createGameUser('web-roster-student@example.test', 'Creator', 'active', $webIntakeId);
+
+        $managementResponse = $this->postJson('/api/v2/VMD-get-class-intake-management-data', [
+            'vmd_user_email' => $staffAdmin->email,
+        ])->assertOk();
+
+        $this->assertNull($managementResponse->json('data.rosters'));
+        $this->assertContains('TEST-CYBER-ROSTER', collect($managementResponse->json('data.intakes'))->pluck('code')->all());
+
+        $rosterResponse = $this->postJson('/api/v2/VMD-get-class-intake-roster', [
+            'vmd_user_email' => $staffAdmin->email,
+            'game_intake_code' => 'TEST-CYBER-ROSTER',
+        ])->assertOk();
+
+        $cyberEmails = collect($rosterResponse->json('data.roster'))
+            ->pluck('email')
+            ->all();
+
+        $webRosterResponse = $this->postJson('/api/v2/VMD-get-class-intake-roster', [
+            'vmd_user_email' => $staffAdmin->email,
+            'game_intake_code' => 'TEST-WEB-ROSTER',
+        ])->assertOk();
+
+        $webEmails = collect($webRosterResponse->json('data.roster'))
+            ->pluck('email')
+            ->all();
+
+        $this->assertContains($cyberStudent->email, $cyberEmails);
+        $this->assertNotContains($webStudent->email, $cyberEmails);
+        $this->assertContains($webStudent->email, $webEmails);
+        $this->assertNotContains($cyberStudent->email, $webEmails);
     }
 
     public function test_gmui_can_block_student_add_user_and_restrict_student_role_selection(): void
@@ -636,8 +711,10 @@ class VelodataRegressionTest extends TestCase
 
     public function test_students_can_read_their_own_gmui_0201_setting_for_user_management(): void
     {
-        $intakeId = $this->createIntake('TEST-GMUI-0201-READ');
-        $otherIntakeId = $this->createIntake('TEST-GMUI-0201-OTHER');
+        $intakeCode = 'TEST-GMUI-0201-READ';
+        $otherIntakeCode = 'TEST-GMUI-0201-OTHER';
+        $intakeId = $this->createIntake($intakeCode);
+        $otherIntakeId = $this->createIntake($otherIntakeCode);
         $creator = $this->createGameUser('gmui-0201-reader@example.test', 'Creator', 'active', $intakeId);
 
         $this->setIntakeGameSetting($intakeId, 'game_block_student_add_users', '1');
@@ -645,10 +722,10 @@ class VelodataRegressionTest extends TestCase
 
         $response = $this->postJson('/api/v2/VMD-get-intake-game-settings', [
             'vmd_user_email' => $creator->email,
-            'game_intake_id' => $intakeId,
+            'game_intake_code' => $intakeCode,
         ])
             ->assertOk()
-            ->assertJsonPath('selected_intake.id', $intakeId);
+            ->assertJsonPath('selected_intake.code', $intakeCode);
 
         $blockAddUsersSetting = collect($response->json('settings'))
             ->firstWhere('key', 'game_block_student_add_users');
@@ -657,7 +734,7 @@ class VelodataRegressionTest extends TestCase
 
         $this->postJson('/api/v2/VMD-get-intake-game-settings', [
             'vmd_user_email' => $creator->email,
-            'game_intake_id' => $otherIntakeId,
+            'game_intake_code' => $otherIntakeCode,
         ])->assertForbidden();
     }
 
@@ -684,11 +761,12 @@ class VelodataRegressionTest extends TestCase
     public function test_gmui_week_defaults_keep_0102_on_from_week_one(): void
     {
         $staffAdmin = $this->createStaffUser('week-default-admin@example.test', 'Admin');
-        $intakeId = $this->createIntake('TEST-WEEK-DEFAULT-0102');
+        $intakeCode = 'TEST-WEEK-DEFAULT-0102';
+        $intakeId = $this->createIntake($intakeCode);
 
         $this->postJson('/api/v2/VMD-get-intake-game-settings', [
             'vmd_user_email' => $staffAdmin->email,
-            'game_intake_id' => $intakeId,
+            'game_intake_code' => $intakeCode,
         ])->assertOk();
 
         $this->assertDatabaseHas('game_intake_settings', [
@@ -700,7 +778,8 @@ class VelodataRegressionTest extends TestCase
 
     public function test_gmui_pane_01_geo_lock_blocks_edit_user_actions_from_outside_australia(): void
     {
-        $intakeId = $this->createIntake('TEST-GMUI-0103');
+        $intakeCode = 'TEST-GMUI-0103';
+        $intakeId = $this->createIntake($intakeCode);
         $staffAdmin = $this->createStaffUser('geo-admin@example.test', 'Admin');
         $staffTarget = $this->createStaffUser('geo-staff-target@example.test', 'Member');
         $studentTarget = $this->createGameUser('geo-student-target@example.test', 'Member', 'active', $intakeId);
@@ -719,7 +798,7 @@ class VelodataRegressionTest extends TestCase
             'vmd_audit_reason' => 'Regression outside-AU Staff role change',
             'vmd_user_name' => $staffAdmin->name,
             'vmd_user_email' => $staffAdmin->email,
-            'game_intake_id' => $intakeId,
+            'game_intake_code' => $intakeCode,
             'vmd_test_country_code' => 'US',
         ])->assertForbidden();
 
@@ -739,7 +818,7 @@ class VelodataRegressionTest extends TestCase
             'vmd_audit_reason' => 'Regression outside-AU Staff Basic Info change',
             'vmd_user_name' => $staffAdmin->name,
             'vmd_user_email' => $staffAdmin->email,
-            'game_intake_id' => $intakeId,
+            'game_intake_code' => $intakeCode,
             'vmd_test_country_code' => 'US',
         ])->assertForbidden();
 
@@ -761,7 +840,7 @@ class VelodataRegressionTest extends TestCase
             'vmd_audit_reason' => 'Regression outside-AU Staff password change',
             'vmd_user_name' => $staffAdmin->name,
             'vmd_user_email' => $staffAdmin->email,
-            'game_intake_id' => $intakeId,
+            'game_intake_code' => $intakeCode,
             'vmd_test_country_code' => 'US',
         ])->assertForbidden();
 
@@ -773,7 +852,7 @@ class VelodataRegressionTest extends TestCase
             'vmd_user_email' => $staffAdmin->email,
             'vmd_user_name' => $staffAdmin->name,
             'vmd_audit_reason' => 'Regression outside-AU Staff avatar change',
-            'game_intake_id' => $intakeId,
+            'game_intake_code' => $intakeCode,
             'vmd_test_country_code' => 'US',
         ])->assertForbidden();
 
