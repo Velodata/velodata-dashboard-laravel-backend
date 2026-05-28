@@ -40,9 +40,11 @@ Route::prefix('v2')->group(function () {
     Route::post('/VMD-ban-game-user', [CustomController::class, 'F0_VMD_ban_game_user']);
     Route::post('/VMD-unban-game-user', [CustomController::class, 'F0_VMD_unban_game_user']);
     Route::post('/VMD-delete-game-user', [CustomController::class, 'F0_VMD_delete_game_user']);
+    Route::post('/VMD-permanently-delete-game-user', [CustomController::class, 'F0_VMD_permanently_delete_game_user']);
     Route::match(['get', 'post'], '/VMD-ban-user', [CustomController::class, 'F0_VMD_ban_user']);
     Route::post('/VMD-unbanUser', [CustomController::class, 'F0_VMD_unbanUser']);
     Route::match(['get', 'post'], '/VMD-delete-user', [CustomController::class, 'F0_VMD_delete_user']);
+    Route::post('/VMD-permanently-delete-user', [CustomController::class, 'F0_VMD_permanently_delete_user']);
     Route::post('/VMD-get-dashboard-settings', [CustomController::class, 'F0_VMD_get_dashboard_settings']);
     Route::post('/VMD-update-dashboard-settings', [CustomController::class, 'F0_VMD_update_dashboard_settings']);
     Route::post('/VMD-get-intake-game-settings', [CustomController::class, 'F0_VMD_get_intake_game_settings']);

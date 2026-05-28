@@ -422,6 +422,31 @@ class CustomController extends Controller
         return $this->canBanStaffUser($actorEmail, $targetUser);
     }
 
+    private function permanentDeleteAuditComment(string $baseComment, ?string $targetName, ?string $targetEmail): string
+    {
+        $cleanValue = fn ($value) => trim(str_replace(["\r", "\n", ';'], ' ', (string) $value));
+
+        return trim($baseComment)
+            . '; target_name=' . $cleanValue($targetName)
+            . '; target_email=' . $cleanValue($targetEmail);
+    }
+
+    private function permanentDeleteAuditTarget(?string $comments): array
+    {
+        if (! $comments) {
+            return ['target_name' => null, 'target_email' => null];
+        }
+
+        if (! preg_match('/;\s*target_name=([^;]*);\s*target_email=([^;]*)/i', $comments, $matches)) {
+            return ['target_name' => null, 'target_email' => null];
+        }
+
+        return [
+            'target_name' => trim($matches[1]) ?: null,
+            'target_email' => trim($matches[2]) ?: null,
+        ];
+    }
+
     private function staffRoleName(User $user): string
     {
         return (string) ($user->role_name ?: optional($user->roles()->first())->name);
@@ -2579,6 +2604,89 @@ class CustomController extends Controller
         return response()->json($response, 200);
     }
 
+    public function F0_VMD_permanently_delete_user(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'id' => 'required|integer',
+            'updated_by' => 'required|string|max:255',
+            'vmd_audit_reason' => 'nullable|string|max:255',
+            'vmd_user_name' => 'required|string|max:255',
+            'vmd_user_email' => 'required|email',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 422);
+        }
+
+        $data = $validator->validated();
+
+        if (! $this->canRestoreDeletedUsers($data['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Staff Admin or Staff Protector access required to permanently delete users.',
+            ], 403);
+        }
+
+        $user = User::where('id', $data['id'])->first();
+
+        if (! $user) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'User not found.',
+            ], 404);
+        }
+
+        if ((int) $user->id === 1 || strcasecmp((string) $user->email, 'admin@velodata.org') === 0) {
+            $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'permanently delete protected account');
+
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: The system Admin account cannot be permanently deleted.',
+            ], 403);
+        }
+
+        if ($this->isStaffAdmin($user)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Staff Admin users cannot be permanently deleted.',
+            ], 403);
+        }
+
+        if (strcasecmp((string) $user->status, 'DELETED') !== 0) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Only users already marked DELETED can be permanently deleted.',
+            ], 409);
+        }
+
+        DB::table('user_audit_history')->insert([
+            'custno' => $user->id + 100000,
+            'dteprfmd' => now(),
+            'comments' => $this->permanentDeleteAuditComment(
+                $data['vmd_audit_reason'] ?: 'User permanently deleted',
+                $user->name,
+                $user->email
+            ),
+            'clerk_id' => $data['vmd_user_name'],
+            'created_by_email' => $data['vmd_user_email'],
+            'created_by_ip_address' => $this->getRequestIpAddress($request),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $user->delete();
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'message' => 'User permanently deleted successfully.',
+            'id' => intval($data['id']),
+        ], 200);
+    }
+
 
 
 
@@ -2599,6 +2707,7 @@ class CustomController extends Controller
         $method = $request->input('method');
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
+        $ipAddressFilter = trim((string) ($request->input('ip_address') ?: $request->query('ip_address') ?: ''));
         $viewer = DB::table('users')->where('email', $email)->first();
         $viewerGameUser = $viewer ? null : DB::table('game_users')->where('email', $email)->first();
         $canViewSpyLoginRows =
@@ -2625,6 +2734,17 @@ class CustomController extends Controller
                     ->orWhereRaw('LOWER(COALESCE(users.role_name, game_users.game_role)) <> ?', ['spy']);
             });
         };
+        $applyIpAddressFilter = function ($query) use ($ipAddressFilter) {
+            if ($ipAddressFilter === '') {
+                return $query;
+            }
+
+            return $query->where(function ($query) use ($ipAddressFilter) {
+                $query
+                    ->where('user_login_history.ip_address_v4', $ipAddressFilter)
+                    ->orWhere('user_login_history.ip_address', $ipAddressFilter);
+            });
+        };
         $loginHistorySelect = [
             'user_login_history.*',
             'users.google_id',
@@ -2634,7 +2754,7 @@ class CustomController extends Controller
         // Apply filters based on method
         switch ($method) {
             case 'single user':
-                $login_history_list = $applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope))
+                $login_history_list = $applyIpAddressFilter($applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)))
                     ->where('user_login_history.email', $email)
                     ->select($loginHistorySelect)
                     ->orderBy('user_login_history.created_at', 'DESC')
@@ -2643,7 +2763,7 @@ class CustomController extends Controller
                 break;
 
             case 'Staff Logins':
-                $login_history_list = $applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope))
+                $login_history_list = $applyIpAddressFilter($applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)))
                     ->where(function ($query) {
                         $query->where('user_login_history.login_identity_type', 'staff')
                             ->orWhereNull('user_login_history.login_identity_type');
@@ -2656,7 +2776,7 @@ class CustomController extends Controller
                 break;
 
             case 'Student Logins':
-                $login_history_list = $applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope))
+                $login_history_list = $applyIpAddressFilter($applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)))
                     ->where('user_login_history.login_identity_type', 'student')
                     ->select($loginHistorySelect)
                     ->orderBy('user_login_history.created_at', 'DESC')
@@ -2666,7 +2786,7 @@ class CustomController extends Controller
                 break;
 
             default:
-                $login_history_list = $applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope))
+                $login_history_list = $applyIpAddressFilter($applySpyLoginVisibility($this->applyHistoryIntakeScope($newLoginHistoryQuery(), $historyIntakeScope)))
                     ->select($loginHistorySelect)
                     ->orderBy('user_login_history.created_at', 'DESC')
                     ->limit(100)
@@ -2736,6 +2856,7 @@ class CustomController extends Controller
         $requestEmail = $request->input('email') ?: $request->query('email');
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
+        $ipAddressFilter = trim((string) ($request->input('ip_address') ?: $request->query('ip_address') ?: ''));
         $viewer = $requestEmail ? DB::table('users')->where('email', $requestEmail)->first() : null;
         $viewerGameUser = ($requestEmail && ! $viewer) ? DB::table('game_users')->where('email', $requestEmail)->first() : null;
         $canViewProtectedSecurityAudits = $viewer && in_array($viewer->role_name, ['Admin', 'Protector', 'Trainer'], true);
@@ -2760,6 +2881,10 @@ class CustomController extends Controller
             );
 
         $auditHistoryQuery = $this->applyHistoryIntakeScope($auditHistoryQuery, $historyIntakeScope);
+
+        if ($ipAddressFilter !== '') {
+            $auditHistoryQuery->where('user_audit_history.created_by_ip_address', $ipAddressFilter);
+        }
 
         if (! $canViewProtectedSecurityAudits) {
             $auditHistoryQuery
@@ -2798,6 +2923,8 @@ class CustomController extends Controller
 
         // Transform data using collections
         $audit_history_array = $audit_history_list->map(function ($row) {
+            $permanentDeleteTarget = $this->permanentDeleteAuditTarget($row->comments);
+
             return [
                 "type" => 'user_audit_history',
                 "id" => $row->id, // Now using the actual record number
@@ -2807,8 +2934,8 @@ class CustomController extends Controller
                     "created_by_email" => $row->created_by_email,
                     "clerk_id" => $row->clerk_id,
                     "created_by_ip_address" => $row->created_by_ip_address,
-                    "target_name" => $row->target_name,
-                    "target_email" => $row->target_email,
+                    "target_name" => $row->target_name ?: $permanentDeleteTarget['target_name'],
+                    "target_email" => $row->target_email ?: $permanentDeleteTarget['target_email'],
                     "target_role_name" => $row->target_role_name,
                     "actor_role_name" => $row->actor_role_name,
                     // "user_city" => $row->user_city,
@@ -3654,6 +3781,72 @@ if ($validator->fails()) {
     public function F0_VMD_delete_game_user(Request $request)
     {
         return $this->updateGameUserStatus($request, 'DELETED', 'Game user deleted successfully.');
+    }
+
+    public function F0_VMD_permanently_delete_game_user(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'id' => 'required|integer',
+            'vmd_user_email' => 'required|email',
+            'vmd_user_name' => 'required|string|max:255',
+            'vmd_audit_reason' => 'nullable|string|max:255',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 422);
+        }
+
+        $data = $validator->validated();
+
+        if (! $this->canRestoreDeletedUsers($data['vmd_user_email'])) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Staff Admin or Staff Protector access required to permanently delete users.',
+            ], 403);
+        }
+
+        $gameUser = DB::table('game_users')->where('id', $data['id'])->first();
+
+        if (! $gameUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Game user not found.',
+            ], 404);
+        }
+
+        if (strcasecmp((string) $gameUser->game_status, 'DELETED') !== 0) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Only users already marked DELETED can be permanently deleted.',
+            ], 409);
+        }
+
+        DB::table('user_audit_history')->insert([
+            'custno' => 900000 + intval($gameUser->id),
+            'dteprfmd' => now(),
+            'comments' => $this->permanentDeleteAuditComment(
+                $data['vmd_audit_reason'] ?: 'Student permanently deleted',
+                $gameUser->display_name ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname),
+                $gameUser->email
+            ),
+            'clerk_id' => $data['vmd_user_name'],
+            'created_by_email' => $data['vmd_user_email'],
+            'created_by_ip_address' => $this->getRequestIpAddress($request),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        DB::table('game_users')->where('id', $data['id'])->delete();
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'message' => 'Game user permanently deleted successfully.',
+            'game_user_id' => intval($data['id']),
+        ], 200);
     }
 
 

@@ -126,6 +126,8 @@ Week Two currently contains:
 
 `02.05` allows deleted users to be restored, but restore permissions are deliberately narrow: only Staff Admins and Staff Protectors can restore deleted users.
 
+This setting also controls whether deleted users appear in User Management for restore work. If `02.05` is OFF, deleted users are hidden even from Staff Admin and Staff Protector viewers. If `02.05` is ON, eligible Staff Admin and Staff Protector users can see deleted users and restore them.
+
 ## Week Three
 
 Week Three currently contains:
@@ -247,3 +249,4 @@ The following behaviours are protected by regression tests and should be treated
 - Existing saved settings can override newly changed defaults.
 - Global Management controls should be tested with a real Trainer account and a real Staff Admin account after permission changes.
 - If a setting appears to save but does not change behaviour, check whether the selected Class Intake already has a saved value and whether Laravel has backend support for that setting.
+- If deleted users disappear from User Management, check Week Two setting `02.05` before treating it as a visibility bug.

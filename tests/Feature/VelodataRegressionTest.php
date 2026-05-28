@@ -387,6 +387,117 @@ class VelodataRegressionTest extends TestCase
         ]);
     }
 
+    public function test_only_staff_admin_or_staff_protector_can_permanently_delete_already_deleted_users(): void
+    {
+        $systemAdmin = $this->createSystemAdminAccount();
+        $staffAdmin = $this->createStaffUser('permanent-delete-admin@example.test', 'Admin');
+        $staffProtector = $this->createStaffUser('permanent-delete-protector@example.test', 'Protector');
+        $studentAdmin = $this->createGameUser('permanent-delete-student-admin@example.test', 'Admin');
+        $studentProtector = $this->createGameUser('permanent-delete-student-protector@example.test', 'Protector');
+        $deletedStaff = $this->createStaffUser('permanent-delete-staff-target@example.test', 'Member');
+        $deletedStudentByProtector = $this->createGameUser('permanent-delete-student-target@example.test', 'Member', 'DELETED');
+        $studentAdminTarget = $this->createGameUser('permanent-delete-student-admin-target@example.test', 'Member', 'DELETED');
+        $studentProtectorTarget = $this->createGameUser('permanent-delete-student-protector-target@example.test', 'Member', 'DELETED');
+        $activeStudentTarget = $this->createGameUser('permanent-delete-active-student-target@example.test', 'Member', 'ACTIVE');
+
+        DB::table('users')->where('id', $deletedStaff->id)->update(['status' => 'DELETED']);
+        DB::table('users')->where('id', $systemAdmin->id)->update(['status' => 'DELETED']);
+
+        $this->postJson('/api/v2/VMD-permanently-delete-game-user', [
+            'id' => $studentAdminTarget->id,
+            'vmd_user_email' => $studentAdmin->email,
+            'vmd_user_name' => $studentAdmin->display_name,
+            'vmd_audit_reason' => 'Student Admin attempted permanent delete',
+        ])->assertForbidden();
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $studentAdminTarget->id,
+            'game_status' => 'DELETED',
+        ]);
+
+        $this->postJson('/api/v2/VMD-permanently-delete-game-user', [
+            'id' => $studentProtectorTarget->id,
+            'vmd_user_email' => $studentProtector->email,
+            'vmd_user_name' => $studentProtector->display_name,
+            'vmd_audit_reason' => 'Student Protector attempted permanent delete',
+        ])->assertForbidden();
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $studentProtectorTarget->id,
+            'game_status' => 'DELETED',
+        ]);
+
+        $this->postJson('/api/v2/VMD-permanently-delete-game-user', [
+            'id' => $activeStudentTarget->id,
+            'vmd_user_email' => $staffAdmin->email,
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_audit_reason' => 'Staff Admin attempted permanent delete of active student',
+        ])->assertStatus(409);
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $activeStudentTarget->id,
+            'game_status' => 'ACTIVE',
+        ]);
+
+        $this->postJson('/api/v2/VMD-permanently-delete-user', [
+            'id' => $systemAdmin->id,
+            'updated_by' => $staffAdmin->name,
+            'vmd_user_email' => $staffAdmin->email,
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_audit_reason' => 'Staff Admin attempted permanent delete of system Admin',
+        ])->assertForbidden();
+
+        $this->assertDatabaseHas('users', [
+            'id' => $systemAdmin->id,
+            'email' => 'admin@velodata.org',
+        ]);
+
+        $this->postJson('/api/v2/VMD-permanently-delete-user', [
+            'id' => $deletedStaff->id,
+            'updated_by' => $staffAdmin->name,
+            'vmd_user_email' => $staffAdmin->email,
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_audit_reason' => 'Staff Admin permanently deleted Staff user',
+        ])->assertOk();
+
+        $this->assertDatabaseMissing('users', [
+            'id' => $deletedStaff->id,
+        ]);
+
+        $staffAuditResponse = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+        ])->assertOk();
+
+        $staffPermanentDeleteAudit = collect($staffAuditResponse->json('data'))
+            ->firstWhere('attributes.target_email', $deletedStaff->email);
+
+        $this->assertNotNull($staffPermanentDeleteAudit);
+        $this->assertSame($deletedStaff->name, $staffPermanentDeleteAudit['attributes']['target_name']);
+        $this->assertStringContainsString('target_email=' . $deletedStaff->email, $staffPermanentDeleteAudit['attributes']['comments']);
+
+        $this->postJson('/api/v2/VMD-permanently-delete-game-user', [
+            'id' => $deletedStudentByProtector->id,
+            'vmd_user_email' => $staffProtector->email,
+            'vmd_user_name' => $staffProtector->name,
+            'vmd_audit_reason' => 'Staff Protector permanently deleted Student user',
+        ])->assertOk();
+
+        $this->assertDatabaseMissing('game_users', [
+            'id' => $deletedStudentByProtector->id,
+        ]);
+
+        $studentAuditResponse = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+        ])->assertOk();
+
+        $studentPermanentDeleteAudit = collect($studentAuditResponse->json('data'))
+            ->firstWhere('attributes.target_email', $deletedStudentByProtector->email);
+
+        $this->assertNotNull($studentPermanentDeleteAudit);
+        $this->assertSame($deletedStudentByProtector->display_name, $studentPermanentDeleteAudit['attributes']['target_name']);
+        $this->assertStringContainsString('target_email=' . $deletedStudentByProtector->email, $studentPermanentDeleteAudit['attributes']['comments']);
+    }
+
     public function test_student_admin_cannot_delete_staff_users_or_ban_any_admin(): void
     {
         $studentAdmin = $this->createGameUser('student-admin-actions@example.test', 'Admin');

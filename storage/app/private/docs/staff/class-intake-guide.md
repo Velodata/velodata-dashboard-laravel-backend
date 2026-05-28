@@ -6,6 +6,7 @@
 - [Who Should Use It](#who-should-use-it)
 - [Class Intakes](#class-intakes)
 - [Staff Assignments](#staff-assignments)
+- [Add Student](#add-student)
 - [Linked Staff Visibility](#linked-staff-visibility)
 - [User Management Context](#user-management-context)
 - [Students And Fake Accounts](#students-and-fake-accounts)
@@ -45,6 +46,13 @@ Class Intake codes are important because numeric database IDs can differ between
 
 When code and ID are both available, the intake code should be treated as the stable identifier.
 
+Class Intake Management now loads roster data in two steps:
+
+- the first request loads the known Class Intake list and Staff assignment context
+- the roster request loads the selected class by intake code
+
+This avoids showing the wrong roster when numeric database IDs differ between development and production.
+
 ## Staff Assignments
 
 Staff Assignments link Staff users to a selected Class Intake.
@@ -60,6 +68,42 @@ The assignment workflow is:
 Only active Staff users should appear as candidates.
 
 Users marked as BANNED or DELETED are automatic non-qualifiers.
+
+## Add Student
+
+Staff Admin users can add a Student directly from Class Intake Management.
+
+The Add Student pane creates a Student game user in `game_users`. It does not create a Staff account in `users`.
+
+Use the Class Intake dropdown to choose the destination intake. The dropdown is code-based, so the selected intake is identified by a value such as `EQ-CYBER-26-04`.
+
+Required fields:
+
+- Class Intake
+- First name
+- Email Address
+- Password
+
+The email field is labelled `Email Address (can't be changed after Student is created)` because the email becomes the Student login identifier.
+
+Optional profile fields match the My Profile style:
+
+- Company Name
+- My Gender
+- My Location
+- Phone Number
+- My Languages
+
+Surname and Preferred name are not collected in this pane.
+
+New Students are created as:
+
+- Role: `Creator`
+- Status: `active`
+- Password: the password entered by the Staff Admin
+- Must change password: yes
+
+After adding a Student, select or refresh that Class Intake roster to confirm the Student appears in the expected class.
 
 ## Linked Staff Visibility
 
@@ -145,6 +189,14 @@ If a Student can see the wrong class:
 - treat it as an intake isolation bug
 - check whether frontend context was trusted instead of the logged-in Student's own intake
 - check whether backend filtering used intake ID instead of intake code
+
+If Add Student fails:
+
+- confirm a Class Intake was selected
+- confirm the request sent `game_intake_code`
+- confirm the email address is not already used by an existing Student or Staff account
+- confirm the latest Laravel migrations have run
+- confirm `game_users.company_name` exists and `game_users.surname` allows null values
 
 ## Troubleshooting
 
