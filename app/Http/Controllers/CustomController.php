@@ -720,10 +720,11 @@ class CustomController extends Controller
             ->values();
 
         $assignments = DB::table('staff_intake_assignments')
+            ->join('game_intakes', 'game_intakes.id', '=', 'staff_intake_assignments.game_intake_id')
             ->join('users', 'users.id', '=', 'staff_intake_assignments.staff_user_id')
             ->where('staff_intake_assignments.active', true)
             ->select(
-                'staff_intake_assignments.game_intake_id',
+                'game_intakes.code as game_intake_code',
                 'staff_intake_assignments.assignment_type',
                 'users.id',
                 'users.name',
@@ -733,7 +734,7 @@ class CustomController extends Controller
             )
             ->orderBy('users.name')
             ->get()
-            ->groupBy('game_intake_id')
+            ->groupBy('game_intake_code')
             ->map(function ($rows) {
                 return $rows->map(function ($row) {
                     return [
@@ -933,6 +934,91 @@ class CustomController extends Controller
             'outcome' => 'SUCCESS',
             'data' => $payload,
         ], 200);
+    }
+
+    public function F0_VMD_add_class_intake_student(Request $request)
+    {
+        $adminUser = $this->staffAdminFromRequest($request);
+        if (! $adminUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: only Staff users with Admin powers can add Students to a Class Intake.',
+            ], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
+            'first_name' => 'required|string|max:255',
+            'email' => 'required|email|max:255',
+            'password' => 'required|string|min:6|max:255',
+            'company_name' => 'nullable|string|max:255',
+            'gender' => 'nullable|string|max:50',
+            'location' => 'nullable|string|max:255',
+            'phone_no' => 'nullable|string|max:50',
+            'languages' => 'nullable|array',
+            'languages.*' => 'string|max:100',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 409);
+        }
+
+        $validated = $validator->validated();
+        $gameIntake = DB::table('game_intakes')->where('code', $validated['game_intake_code'])->first();
+
+        $existingStudent = DB::table('game_users')
+            ->join('game_intakes', 'game_intakes.id', '=', 'game_users.intake_id')
+            ->where('game_intakes.code', $validated['game_intake_code'])
+            ->where('game_users.email', $validated['email'])
+            ->exists();
+
+        if ($existingStudent) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'A Student with this email already exists in the selected Class Intake.',
+            ], 409);
+        }
+
+        $displayName = trim($validated['first_name']);
+
+        DB::transaction(function () use ($gameIntake, $validated, $displayName, $adminUser) {
+            DB::table('game_users')->insert([
+                'intake_id' => $gameIntake->id,
+                'first_name' => $validated['first_name'],
+                'surname' => null,
+                'preferred_name' => null,
+                'display_name' => $displayName,
+                'email' => $validated['email'],
+                'password' => Hash::make($validated['password']),
+                'must_change_password' => true,
+                'company_name' => $validated['company_name'] ?? $gameIntake->name,
+                'gender' => $validated['gender'] ?? null,
+                'location' => $validated['location'] ?? null,
+                'phone_no' => $validated['phone_no'] ?? null,
+                'languages' => json_encode($validated['languages'] ?? []),
+                'game_role' => 'Creator',
+                'game_status' => 'active',
+                'is_spy' => false,
+                'is_protector' => false,
+                'metadata' => json_encode([
+                    'source' => 'class_intake_management_add_student',
+                    'created_by_email' => $adminUser->email,
+                    'game_intake_code' => $gameIntake->code,
+                ]),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        });
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'message' => "{$displayName} has been added to {$gameIntake->code}.",
+            'data' => $this->classIntakeRosterPayload($validated['game_intake_code']),
+        ], 201);
     }
 
     public function F0_VMD_save_staff_intake_assignments(Request $request)

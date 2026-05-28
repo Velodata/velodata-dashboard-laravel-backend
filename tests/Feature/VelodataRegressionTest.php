@@ -556,6 +556,63 @@ class VelodataRegressionTest extends TestCase
         $this->assertNotContains($cyberStudent->email, $webEmails);
     }
 
+    public function test_class_intake_management_adds_student_by_intake_code(): void
+    {
+        $staffAdmin = $this->createStaffUser('class-add-student-admin@example.test', 'Admin');
+        $this->createIntake('TEST-ADD-STUDENT-TARGET');
+        $this->createIntake('TEST-ADD-STUDENT-OTHER');
+
+        $this->postJson('/api/v2/VMD-add-class-intake-student', [
+            'vmd_user_email' => $staffAdmin->email,
+            'game_intake_code' => 'TEST-ADD-STUDENT-TARGET',
+            'first_name' => 'New',
+            'email' => 'new-class-student@example.test',
+            'password' => 'student-start-password',
+            'company_name' => 'Equinim College',
+            'gender' => 'Female',
+            'location' => 'Sydney, Aus',
+            'phone_no' => '+61 400 000 000',
+            'languages' => ['javascript', 'react'],
+        ])
+            ->assertCreated()
+            ->assertJsonPath('data.intake.code', 'TEST-ADD-STUDENT-TARGET');
+
+        $targetStudents = DB::table('game_users')
+            ->join('game_intakes', 'game_intakes.id', '=', 'game_users.intake_id')
+            ->where('game_intakes.code', 'TEST-ADD-STUDENT-TARGET')
+            ->where('game_users.email', 'new-class-student@example.test')
+            ->where('game_users.display_name', 'New')
+            ->where('game_users.game_role', 'Creator')
+            ->where('game_users.game_status', 'active')
+            ->where('game_users.must_change_password', true)
+            ->where('game_users.company_name', 'Equinim College')
+            ->where('game_users.gender', 'Female')
+            ->where('game_users.location', 'Sydney, Aus')
+            ->where('game_users.phone_no', '+61 400 000 000')
+            ->count();
+
+        $otherIntakeStudents = DB::table('game_users')
+            ->join('game_intakes', 'game_intakes.id', '=', 'game_users.intake_id')
+            ->where('game_intakes.code', 'TEST-ADD-STUDENT-OTHER')
+            ->where('game_users.email', 'new-class-student@example.test')
+            ->count();
+
+        $this->assertSame(1, $targetStudents);
+        $this->assertSame(0, $otherIntakeStudents);
+        $this->assertNull(DB::table('game_users')->where('email', 'new-class-student@example.test')->value('surname'));
+        $this->assertNull(DB::table('game_users')->where('email', 'new-class-student@example.test')->value('preferred_name'));
+
+        $studentPassword = DB::table('game_users')
+            ->where('email', 'new-class-student@example.test')
+            ->value('password');
+
+        $this->assertTrue(Hash::check('student-start-password', $studentPassword));
+        $this->assertSame(
+            ['javascript', 'react'],
+            json_decode(DB::table('game_users')->where('email', 'new-class-student@example.test')->value('languages'), true)
+        );
+    }
+
     public function test_gmui_can_block_student_add_user_and_restrict_student_role_selection(): void
     {
         $intakeId = $this->createIntake('TEST-GMUI');
