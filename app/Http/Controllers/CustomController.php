@@ -2877,7 +2877,8 @@ class CustomController extends Controller
                 DB::raw("COALESCE(users.name, game_users.display_name, TRIM(CONCAT(COALESCE(game_users.preferred_name, game_users.first_name, ''), ' ', COALESCE(game_users.surname, '')))) as target_name"),
                 DB::raw('COALESCE(users.email, game_users.email) as target_email'),
                 DB::raw('COALESCE(users.role_name, game_users.game_role) as target_role_name'),
-                DB::raw('COALESCE(actor_users.role_name, actor_game_users.game_role) as actor_role_name')
+                DB::raw('COALESCE(actor_users.role_name, actor_game_users.game_role) as actor_role_name'),
+                DB::raw('COALESCE(actor_users.profile_image, actor_game_users.profile_image) as actor_profile_image')
             );
 
         $auditHistoryQuery = $this->applyHistoryIntakeScope($auditHistoryQuery, $historyIntakeScope);
@@ -2938,6 +2939,7 @@ class CustomController extends Controller
                     "target_email" => $row->target_email ?: $permanentDeleteTarget['target_email'],
                     "target_role_name" => $row->target_role_name,
                     "actor_role_name" => $row->actor_role_name,
+                    "actor_profile_image" => $row->actor_profile_image,
                     // "user_city" => $row->user_city,
                     // "user_region" => $row->user_region,
                     // "user_country" => $row->user_country,
