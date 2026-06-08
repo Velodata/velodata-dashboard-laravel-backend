@@ -93,6 +93,46 @@ class VelodataRegressionTest extends TestCase
         $this->assertSame('student_fake_account', json_decode($metadata, true)['source'] ?? null);
     }
 
+    public function test_student_cannot_create_fake_account_for_existing_staff_user(): void
+    {
+        $intakeId = $this->createIntake('TEST-FAKE-STAFF-COLLISION');
+        $creator = $this->createGameUser('staff-collision-creator@example.test', 'Creator', 'active', $intakeId);
+        $staffUser = $this->createStaffUser('existing-staff@example.test', 'Member');
+        $adminRoleId = $this->roleId('Admin');
+
+        $this->postJson('/api/v2/users', [
+            'data' => [
+                'type' => 'users',
+                'attributes' => [
+                    'name' => 'Fake Staff',
+                    'email' => $staffUser->email,
+                    'password' => 'secret-password',
+                    'vmd_user_email' => $creator->email,
+                    'vmd_user_name' => $creator->display_name,
+                ],
+                'relationships' => [
+                    'roles' => [
+                        'data' => [
+                            ['type' => 'roles', 'id' => (string) $adminRoleId],
+                        ],
+                    ],
+                ],
+            ],
+        ])
+            ->assertStatus(409)
+            ->assertJsonPath('email_exists', 'true');
+
+        $this->assertDatabaseMissing('game_users', [
+            'email' => $staffUser->email,
+            'intake_id' => $intakeId,
+        ]);
+
+        $this->assertDatabaseHas('users', [
+            'email' => $staffUser->email,
+            'is_game_user' => false,
+        ]);
+    }
+
     public function test_seeded_student_accounts_have_usable_default_passwords(): void
     {
         $seededStudents = DB::table('game_users')
@@ -722,6 +762,32 @@ class VelodataRegressionTest extends TestCase
             ['javascript', 'react'],
             json_decode(DB::table('game_users')->where('email', 'new-class-student@example.test')->value('languages'), true)
         );
+    }
+
+    public function test_class_intake_management_cannot_add_student_with_existing_staff_email(): void
+    {
+        $staffAdmin = $this->createStaffUser('class-add-staff-collision-admin@example.test', 'Admin');
+        $staffUser = $this->createStaffUser('class-add-existing-staff@example.test', 'Member');
+        $this->createIntake('TEST-ADD-STUDENT-STAFF-COLLISION');
+
+        $this->postJson('/api/v2/VMD-add-class-intake-student', [
+            'vmd_user_email' => $staffAdmin->email,
+            'game_intake_code' => 'TEST-ADD-STUDENT-STAFF-COLLISION',
+            'first_name' => 'Fake',
+            'email' => $staffUser->email,
+            'password' => 'student-start-password',
+        ])
+            ->assertStatus(409)
+            ->assertJsonPath('message', 'A Staff user with this email already exists.');
+
+        $this->assertDatabaseMissing('game_users', [
+            'email' => $staffUser->email,
+        ]);
+
+        $this->assertDatabaseHas('users', [
+            'email' => $staffUser->email,
+            'is_game_user' => false,
+        ]);
     }
 
     public function test_gmui_can_block_student_add_user_and_restrict_student_role_selection(): void

@@ -995,6 +995,17 @@ class CustomController extends Controller
         $validated = $validator->validated();
         $gameIntake = DB::table('game_intakes')->where('code', $validated['game_intake_code'])->first();
 
+        $existingStaffUser = DB::table('users')
+            ->where('email', $validated['email'])
+            ->exists();
+
+        if ($existingStaffUser) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'A Staff user with this email already exists.',
+            ], 409);
+        }
+
         $existingStudent = DB::table('game_users')
             ->join('game_intakes', 'game_intakes.id', '=', 'game_users.intake_id')
             ->where('game_intakes.code', $validated['game_intake_code'])
