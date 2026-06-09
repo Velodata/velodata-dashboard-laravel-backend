@@ -262,6 +262,24 @@ class CustomController extends Controller
         $actorGameUser->action_locked_by_game_user_id = $targetGameUserId;
         $actorGameUser->save();
 
+        $this->createPersistedNotification([
+            'recipient_email' => $actorGameUser->email,
+            'actor_email' => $actorGameUser->email,
+            'type' => 'warning',
+            'title' => 'User Management timeout',
+            'message' => "You are in timeout for {$minutes} minutes, until {$lockedUntil->toDateTimeString()}, because you banned or deleted another user.",
+            'source' => 'user-management',
+            'dedupe_key' => 'game-user-timeout-' . intval($actorGameUser->id) . '-' . $lockedUntil->format('YmdHis'),
+            'metadata' => [
+                'game_user_id' => intval($actorGameUser->id),
+                'identity_type' => 'student',
+                'duration_minutes' => $minutes,
+                'action_locked_until' => $lockedUntil->toDateTimeString(),
+                'reason' => $reason,
+                'target_game_user_id' => $targetGameUserId,
+            ],
+        ]);
+
         return $lockedUntil;
     }
 
@@ -1418,6 +1436,185 @@ class CustomController extends Controller
         return DB::table('user_notifications')->where('id', $notificationId)->first();
     }
 
+    private function auditNotificationDetails(?string $comments): array
+    {
+        $commentText = trim((string) $comments);
+        $lowerComment = strtolower($commentText);
+
+        if (str_contains($lowerComment, 'protected account')) {
+            return [
+                'type' => 'warning',
+                'title' => 'Security notice',
+                'message' => $commentText ?: 'A protected account security event was recorded.',
+            ];
+        }
+
+        if (str_contains($lowerComment, 'password')) {
+            return [
+                'type' => 'warning',
+                'title' => 'Password changed',
+                'message' => $commentText ?: 'Your password was changed.',
+            ];
+        }
+
+        if (str_contains($lowerComment, 'role')) {
+            return [
+                'type' => 'warning',
+                'title' => 'Role changed',
+                'message' => $commentText ?: 'Your role or permissions were changed.',
+            ];
+        }
+
+        if (str_contains($lowerComment, 'unbanned') || str_contains($lowerComment, 'restored')) {
+            return [
+                'type' => 'success',
+                'title' => 'Account restored',
+                'message' => $commentText ?: 'Your account access was restored.',
+            ];
+        }
+
+        if (str_contains($lowerComment, 'banned') || str_contains($lowerComment, 'deleted')) {
+            return [
+                'type' => 'error',
+                'title' => 'Account access changed',
+                'message' => $commentText ?: 'Your account access was changed.',
+            ];
+        }
+
+        if (
+            str_contains($lowerComment, 'profile') ||
+            str_contains($lowerComment, 'basic info') ||
+            str_contains($lowerComment, 'avatar')
+        ) {
+            return [
+                'type' => 'info',
+                'title' => 'Profile updated',
+                'message' => $commentText ?: 'Your profile was updated.',
+            ];
+        }
+
+        return [
+            'type' => 'info',
+            'title' => 'Account activity',
+            'message' => $commentText ?: 'Account activity was recorded.',
+        ];
+    }
+
+    private function createAuditBackfillNotificationsForEmail(string $email): void
+    {
+        if (! Schema::hasTable('user_notifications') || ! Schema::hasTable('user_audit_history')) {
+            return;
+        }
+
+        $normalizedEmail = strtolower(trim($email));
+        if ($normalizedEmail === '') {
+            return;
+        }
+
+        $auditRows = DB::table('user_audit_history')
+            ->leftJoin('users', 'users.id', '=', DB::raw('user_audit_history.custno - 100000'))
+            ->leftJoin('game_users', 'game_users.id', '=', DB::raw('user_audit_history.custno - 900000'))
+            ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+            ->leftJoin('users as actor_users', 'actor_users.email', '=', 'user_audit_history.created_by_email')
+            ->leftJoin('game_users as actor_game_users', 'actor_game_users.email', '=', 'user_audit_history.created_by_email')
+            ->select(
+                'user_audit_history.*',
+                DB::raw("COALESCE(users.name, game_users.display_name, TRIM(CONCAT(COALESCE(game_users.preferred_name, game_users.first_name, ''), ' ', COALESCE(game_users.surname, '')))) as target_name"),
+                DB::raw('COALESCE(users.email, game_users.email) as target_email'),
+                DB::raw('COALESCE(users.role_name, game_users.game_role) as target_role_name'),
+                DB::raw('COALESCE(actor_users.name, actor_game_users.display_name) as actor_name'),
+                DB::raw('COALESCE(actor_users.role_name, actor_game_users.game_role) as actor_role_name'),
+                DB::raw("CASE WHEN actor_users.id IS NOT NULL THEN 'staff' WHEN actor_game_users.id IS NOT NULL THEN 'student' ELSE NULL END as actor_identity_type"),
+                DB::raw('actor_game_intakes.code as actor_intake_code'),
+                DB::raw('game_intakes.code as intake_code')
+            )
+            ->leftJoin('game_intakes as actor_game_intakes', 'actor_game_users.intake_id', '=', 'actor_game_intakes.id')
+            ->whereRaw('LOWER(COALESCE(users.email, game_users.email)) = ?', [$normalizedEmail])
+            ->orderBy('user_audit_history.created_at', 'DESC')
+            ->limit(100)
+            ->get();
+
+        foreach ($auditRows as $auditRow) {
+            $details = $this->auditNotificationDetails($auditRow->comments);
+            $targetEmail = $auditRow->target_email ?: $email;
+
+            if ($this->hasDirectStatusNotificationNearAuditRow($targetEmail, $auditRow, $details)) {
+                continue;
+            }
+
+            $metadata = [
+                'audit_history_id' => intval($auditRow->id),
+                'targetEmail' => $targetEmail,
+                'targetName' => $auditRow->target_name,
+                'targetRole' => $auditRow->target_role_name,
+                'actorName' => $auditRow->actor_name ?: $auditRow->clerk_id,
+                'actorEmail' => $auditRow->created_by_email,
+                'actorRole' => $auditRow->actor_role_name,
+                'actorIdentityType' => $auditRow->actor_identity_type,
+                'actorIntakeCode' => $auditRow->actor_intake_code,
+                'ipAddress' => $auditRow->created_by_ip_address,
+                'auditReason' => $auditRow->comments,
+            ];
+
+            if ($auditRow->custno >= 900000) {
+                $metadata['identity_type'] = 'student';
+                $metadata['game_user_id'] = intval($auditRow->custno) - 900000;
+                $metadata['intake_code'] = $auditRow->intake_code;
+            } else {
+                $metadata['identity_type'] = 'staff';
+                $metadata['user_id'] = intval($auditRow->custno) - 100000;
+            }
+
+            $this->createPersistedNotification([
+                'recipient_email' => $targetEmail,
+                'actor_email' => $auditRow->created_by_email,
+                'type' => $details['type'],
+                'title' => $details['title'],
+                'message' => $details['message'],
+                'source' => 'audit-history',
+                'related_audit_history_id' => intval($auditRow->id),
+                'dedupe_key' => 'audit-history-' . intval($auditRow->id) . '-' . $normalizedEmail,
+                'metadata' => $metadata,
+                'created_at' => $auditRow->created_at ?: now(),
+                'updated_at' => $auditRow->updated_at ?: ($auditRow->created_at ?: now()),
+            ]);
+        }
+    }
+
+    private function hasDirectStatusNotificationNearAuditRow(string $recipientEmail, object $auditRow, array $details): bool
+    {
+        $statusTitles = [
+            'Account deleted',
+            'Account undeleted',
+            'Account unbanned',
+            'You have been unbanned',
+        ];
+
+        $auditText = strtolower((string) ($auditRow->comments ?? '') . ' ' . ($details['title'] ?? ''));
+        $isStatusAudit =
+            str_contains($auditText, 'deleted') ||
+            str_contains($auditText, 'undeleted') ||
+            str_contains($auditText, 'banned') ||
+            str_contains($auditText, 'unbanned') ||
+            str_contains($auditText, 'restored');
+
+        if (! $isStatusAudit) {
+            return false;
+        }
+
+        $auditTime = $auditRow->created_at ?: now();
+
+        return DB::table('user_notifications')
+            ->where('recipient_email', $recipientEmail)
+            ->where('source', 'user-management')
+            ->whereIn('title', $statusTitles)
+            ->whereBetween('created_at', [
+                Carbon::parse($auditTime)->subMinutes(2),
+                Carbon::parse($auditTime)->addMinutes(2),
+            ])
+            ->exists();
+    }
+
     private function isProfileWatcherStudentUnbanArtifact(array $notification): bool
     {
         if (($notification['source'] ?? '') !== 'profile-watcher') {
@@ -1452,6 +1649,23 @@ class CustomController extends Controller
             ->where('comments', 'like', '%UNBANNED%')
             ->where('created_at', '>=', now()->subMinutes(10))
             ->exists();
+    }
+
+    private function isRedundantProfileWatcherUserChangeNotification(array $notification): bool
+    {
+        if (($notification['source'] ?? '') !== 'profile-watcher') {
+            return false;
+        }
+
+        $combinedText = strtolower(
+            (string) ($notification['title'] ?? '') . ' ' .
+            (string) ($notification['message'] ?? '') . ' ' .
+            (string) (($notification['metadata']['auditReason'] ?? '') ?: '')
+        );
+
+        return str_contains($combinedText, 'role') ||
+            str_contains($combinedText, 'basic info') ||
+            str_contains($combinedText, 'profile');
     }
 
     private function createProtectedAccountWarningNotifications(int $auditHistoryId, array $event): void
@@ -1491,17 +1705,50 @@ class CustomController extends Controller
 
     private function transformNotificationRow($row): array
     {
-        $actor = $row->actor_email
+        $actorUser = $row->actor_email
             ? DB::table('users')->where('email', $row->actor_email)->first()
+            : null;
+        $actorGameUser = (! $actorUser && $row->actor_email)
+            ? DB::table('game_users')
+                ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+                ->where('game_users.email', $row->actor_email)
+                ->select(
+                    'game_users.*',
+                    'game_intakes.code as intake_code'
+                )
+                ->first()
             : null;
         $metadata = $this->normalizeNotificationMetadata($row->metadata);
 
-        if ($actor && empty($metadata['actorImage'])) {
-            $metadata['actorImage'] = $actor->profile_image ?? '';
+        if ($row->actor_email && empty($metadata['actorEmail'])) {
+            $metadata['actorEmail'] = $row->actor_email;
         }
 
-        if ($actor && empty($metadata['updatedBy'])) {
-            $metadata['updatedBy'] = $actor->email;
+        if (($actorUser || $actorGameUser) && empty($metadata['actorName'])) {
+            $metadata['actorName'] = $actorUser->name
+                ?? $actorGameUser->display_name
+                ?? trim(($actorGameUser->preferred_name ?? $actorGameUser->first_name ?? '') . ' ' . ($actorGameUser->surname ?? ''))
+                ?: null;
+        }
+
+        if (($actorUser || $actorGameUser) && empty($metadata['actorImage'])) {
+            $metadata['actorImage'] = $actorUser->profile_image ?? $actorGameUser->profile_image ?? '';
+        }
+
+        if (($actorUser || $actorGameUser) && empty($metadata['actorRole'])) {
+            $metadata['actorRole'] = $actorUser->role_name ?? $actorGameUser->game_role ?? '';
+        }
+
+        if (($actorUser || $actorGameUser) && empty($metadata['actorIdentityType'])) {
+            $metadata['actorIdentityType'] = $actorUser ? 'staff' : 'student';
+        }
+
+        if ($actorGameUser && empty($metadata['actorIntakeCode'])) {
+            $metadata['actorIntakeCode'] = $actorGameUser->intake_code ?? '';
+        }
+
+        if (($actorUser || $actorGameUser) && empty($metadata['updatedBy'])) {
+            $metadata['updatedBy'] = $actorUser->email ?? $actorGameUser->email;
         }
 
         return [
@@ -2441,7 +2688,9 @@ class CustomController extends Controller
             return response()->json($response, 403);
         }
 
-        if (in_array($user->status, ['BANNED', 'DELETED'], true)) {
+        $previousStatus = strtoupper((string) $user->status);
+
+        if (in_array($previousStatus, ['BANNED', 'DELETED'], true)) {
             $user->status = 'Active';
             $user->updated_by = $data['updated_by'] ?? $user->updated_by;
             $user->save();
@@ -2458,6 +2707,25 @@ class CustomController extends Controller
                 'created_by_ip_address' => $this->getRequestIpAddress($request),
                 'created_at' => now(),
                 'updated_at' => now(),
+            ]);
+
+            $wasDeleted = $previousStatus === 'DELETED';
+            $this->createPersistedNotification([
+                'recipient_email' => $user->email,
+                'actor_email' => $data['vmd_user_email'],
+                'type' => 'info',
+                'title' => $wasDeleted ? 'Account undeleted' : 'Account unbanned',
+                'message' => $wasDeleted
+                    ? "Your account was undeleted by {$data['vmd_user_name']}."
+                    : "Your account was unbanned by {$data['vmd_user_name']}.",
+                'source' => 'user-management',
+                'dedupe_key' => 'staff-' . ($wasDeleted ? 'undeleted' : 'unbanned') . '-' . intval($user->id) . '-' . now()->format('YmdHis'),
+                'metadata' => [
+                    'user_id' => intval($user->id),
+                    'identity_type' => 'staff',
+                    'previous_status' => $previousStatus,
+                    'status' => 'Active',
+                ],
             ]);
         }
 
@@ -2576,6 +2844,21 @@ class CustomController extends Controller
                 'created_by_ip_address' => $this->getRequestIpAddress($request),
                 'created_at' => now(),
                 'updated_at' => now(),
+            ]);
+
+            $this->createPersistedNotification([
+                'recipient_email' => $user->email,
+                'actor_email' => $data['vmd_user_email'],
+                'type' => 'error',
+                'title' => 'Account deleted',
+                'message' => "Your account was deleted by {$data['vmd_user_name']}.",
+                'source' => 'user-management',
+                'dedupe_key' => 'staff-deleted-' . intval($user->id) . '-' . now()->format('YmdHis'),
+                'metadata' => [
+                    'user_id' => intval($user->id),
+                    'identity_type' => 'staff',
+                    'status' => 'DELETED',
+                ],
             ]);
 
 
@@ -2986,6 +3269,8 @@ class CustomController extends Controller
             return response()->json(['error' => 'Missing email parameter.'], 400);
         }
 
+        $this->createAuditBackfillNotificationsForEmail($email);
+
         $notifications = DB::table('user_notifications')
             ->where('recipient_email', $email)
             ->whereNull('dismissed_at')
@@ -3051,6 +3336,14 @@ class CustomController extends Controller
             ], 200);
         }
 
+        if ($this->isRedundantProfileWatcherUserChangeNotification($notificationInput)) {
+            return response()->json([
+                'outcome' => 'SUPPRESSED',
+                'message' => 'Profile watcher user-change notification suppressed; authoritative notification is created by user management.',
+                'data' => null,
+            ], 200);
+        }
+
         $notification = $this->createPersistedNotification($notificationInput);
 
         return response()->json([
@@ -3084,6 +3377,30 @@ class CustomController extends Controller
         return response()->json([
             'outcome' => 'SUCCESS',
             'updated' => $updated,
+        ], 200);
+    }
+
+    public function F0_VMD_dismiss_notification(Request $request)
+    {
+        $email = $request->input('email');
+        $id = $request->input('id');
+
+        if (! $email || ! $id) {
+            return response()->json(['error' => 'Missing email or notification id.'], 400);
+        }
+
+        $dismissed = DB::table('user_notifications')
+            ->where('recipient_email', $email)
+            ->where('id', $id)
+            ->whereNull('dismissed_at')
+            ->update([
+                'dismissed_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'dismissed' => $dismissed,
         ], 200);
     }
 
@@ -3716,7 +4033,8 @@ if ($validator->fails()) {
             ], 403);
         }
 
-        $targetWasActive = strcasecmp((string) $gameUser->game_status, 'ACTIVE') === 0;
+        $previousStatus = strtoupper((string) $gameUser->game_status);
+        $targetWasActive = $previousStatus === 'ACTIVE';
 
         DB::table('game_users')->where('id', $data['id'])->update([
             'game_status' => $status,
@@ -3745,17 +4063,42 @@ if ($validator->fails()) {
         if ($status === 'ACTIVE') {
             $displayName = $gameUser->display_name
                 ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname);
+            $wasDeleted = $previousStatus === 'DELETED';
 
             $this->createPersistedNotification([
                 'recipient_email' => $gameUser->email,
                 'actor_email' => $data['vmd_user_email'],
                 'type' => 'info',
-                'title' => 'You have been unbanned',
-                'message' => "{$displayName}, your account has been unbanned by {$data['vmd_user_name']}.",
+                'title' => $wasDeleted ? 'Account undeleted' : 'You have been unbanned',
+                'message' => $wasDeleted
+                    ? "{$displayName}, your account was undeleted by {$data['vmd_user_name']}."
+                    : "{$displayName}, your account has been unbanned by {$data['vmd_user_name']}.",
                 'source' => 'user-management',
-                'dedupe_key' => 'student-unbanned-' . intval($gameUser->id) . '-' . now()->format('YmdHis'),
+                'dedupe_key' => 'student-' . ($wasDeleted ? 'undeleted' : 'unbanned') . '-' . intval($gameUser->id) . '-' . now()->format('YmdHis'),
                 'metadata' => [
                     'game_user_id' => intval($gameUser->id),
+                    'identity_type' => 'student',
+                    'previous_status' => $previousStatus,
+                    'game_status' => $status,
+                    'intake_code' => $gameUser->intake_code,
+                ],
+            ]);
+        } elseif ($status === 'DELETED') {
+            $displayName = $gameUser->display_name
+                ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname);
+
+            $this->createPersistedNotification([
+                'recipient_email' => $gameUser->email,
+                'actor_email' => $data['vmd_user_email'],
+                'type' => 'error',
+                'title' => 'Account deleted',
+                'message' => "{$displayName}, your account was deleted by {$data['vmd_user_name']}.",
+                'source' => 'user-management',
+                'dedupe_key' => 'student-deleted-' . intval($gameUser->id) . '-' . now()->format('YmdHis'),
+                'metadata' => [
+                    'game_user_id' => intval($gameUser->id),
+                    'identity_type' => 'student',
+                    'previous_status' => $previousStatus,
                     'game_status' => $status,
                     'intake_code' => $gameUser->intake_code,
                 ],

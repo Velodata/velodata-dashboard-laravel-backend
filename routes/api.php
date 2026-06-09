@@ -33,6 +33,7 @@ Route::prefix('v2')->group(function () {
     Route::post('/VMD-save-staff-intake-assignments', [CustomController::class, 'F0_VMD_save_staff_intake_assignments']);
     Route::post('/VMD-create-notification', [CustomController::class, 'F0_VMD_create_notification']);
     Route::post('/VMD-mark-notifications-read', [CustomController::class, 'F0_VMD_mark_notifications_read']);
+    Route::post('/VMD-dismiss-notification', [CustomController::class, 'F0_VMD_dismiss_notification']);
     Route::post('/VMD-clear-notifications', [CustomController::class, 'F0_VMD_clear_notifications']);
     Route::match(['get', 'post'], '/VMD-updateUser', [CustomController::class, 'F0_VMD_updateUser']);
     Route::post('/VMD-update-game-user-basic-info', [CustomController::class, 'F0_VMD_update_game_user_basic_info']);

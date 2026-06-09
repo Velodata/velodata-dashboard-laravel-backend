@@ -335,6 +335,117 @@ class VelodataRegressionTest extends TestCase
         ]);
     }
 
+    public function test_notification_refresh_backfills_matching_audit_history_for_student(): void
+    {
+        $intakeId = $this->createIntake('TEST-NOTIFICATION-BACKFILL');
+        $staffAdmin = $this->createStaffUser('notification-backfill-admin@example.test', 'Admin');
+        $student = $this->createGameUser('notification-backfill-student@example.test', 'Member', 'active', $intakeId);
+
+        $auditHistoryId = DB::table('user_audit_history')->insertGetId([
+            'custno' => 900000 + intval($student->id),
+            'dteprfmd' => now()->subHour(),
+            'comments' => 'Regression historical password change',
+            'clerk_id' => $staffAdmin->name,
+            'created_by_email' => $staffAdmin->email,
+            'created_by_ip_address' => '127.0.0.1',
+            'created_at' => now()->subHour(),
+            'updated_at' => now()->subHour(),
+        ]);
+
+        $this->assertDatabaseMissing('user_notifications', [
+            'recipient_email' => $student->email,
+            'related_audit_history_id' => $auditHistoryId,
+        ]);
+
+        $this->postJson('/api/v2/VMD-get-notifications', [
+            'email' => $student->email,
+        ])
+            ->assertOk()
+            ->assertJsonPath('recordsTotal', 1)
+            ->assertJsonPath('data.0.title', 'Password changed')
+            ->assertJsonPath('data.0.source', 'audit-history');
+
+        $this->assertDatabaseHas('user_notifications', [
+            'recipient_email' => $student->email,
+            'actor_email' => $staffAdmin->email,
+            'title' => 'Password changed',
+            'source' => 'audit-history',
+            'related_audit_history_id' => $auditHistoryId,
+        ]);
+
+        $this->postJson('/api/v2/VMD-get-notifications', [
+            'email' => $student->email,
+        ])->assertOk();
+
+        $this->assertSame(1, DB::table('user_notifications')
+            ->where('recipient_email', $student->email)
+            ->where('related_audit_history_id', $auditHistoryId)
+            ->count());
+    }
+
+    public function test_staff_and_student_users_receive_notifications_when_deleted_or_undeleted(): void
+    {
+        $staffAdmin = $this->createStaffUser('delete-restore-admin@example.test', 'Admin');
+        $staffTarget = $this->createStaffUser('delete-restore-staff-target@example.test', 'Member');
+        $studentTarget = $this->createGameUser('delete-restore-student-target@example.test', 'Member');
+
+        $this->postJson('/api/v2/VMD-delete-user', [
+            'id' => $staffTarget->id,
+            'updated_by' => $staffAdmin->email,
+            'vmd_audit_reason' => 'Regression Staff deleted',
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_user_email' => $staffAdmin->email,
+        ])->assertOk();
+
+        $this->assertDatabaseHas('user_notifications', [
+            'recipient_email' => $staffTarget->email,
+            'actor_email' => $staffAdmin->email,
+            'title' => 'Account deleted',
+            'source' => 'user-management',
+        ]);
+
+        $this->postJson('/api/v2/VMD-unbanUser', [
+            'id' => $staffTarget->id,
+            'updated_by' => $staffAdmin->email,
+            'vmd_audit_reason' => 'Regression Staff undeleted',
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_user_email' => $staffAdmin->email,
+        ])->assertOk();
+
+        $this->assertDatabaseHas('user_notifications', [
+            'recipient_email' => $staffTarget->email,
+            'actor_email' => $staffAdmin->email,
+            'title' => 'Account undeleted',
+            'source' => 'user-management',
+        ]);
+
+        $this->postJson('/api/v2/VMD-delete-game-user', [
+            'id' => $studentTarget->id,
+            'vmd_user_email' => $staffAdmin->email,
+            'vmd_user_name' => $staffAdmin->name,
+        ])->assertOk();
+
+        $this->assertDatabaseHas('user_notifications', [
+            'recipient_email' => $studentTarget->email,
+            'actor_email' => $staffAdmin->email,
+            'title' => 'Account deleted',
+            'source' => 'user-management',
+        ]);
+
+        $this->postJson('/api/v2/VMD-unban-game-user', [
+            'id' => $studentTarget->id,
+            'vmd_user_email' => $staffAdmin->email,
+            'vmd_user_name' => $staffAdmin->name,
+        ])->assertOk();
+
+        $this->assertDatabaseHas('user_notifications', [
+            'recipient_email' => $studentTarget->email,
+            'actor_email' => $staffAdmin->email,
+            'title' => 'Account undeleted',
+            'source' => 'user-management',
+        ]);
+    }
+
     public function test_game_user_spy_has_admin_like_power_to_edit_other_students(): void
     {
         $intakeId = $this->createIntake('TEST-SPY-ADMIN-POWERS');
@@ -902,6 +1013,16 @@ class VelodataRegressionTest extends TestCase
 
         $this->assertNotNull($studentBanResponse->json('actor_action_locked_until'));
         $this->assertNotNull(DB::table('game_users')->where('id', $studentAdmin->id)->value('action_locked_until'));
+        $this->assertDatabaseHas('user_notifications', [
+            'recipient_email' => $studentAdmin->email,
+            'type' => 'warning',
+            'title' => 'User Management timeout',
+            'source' => 'user-management',
+        ]);
+        $this->assertDatabaseHas('user_notifications', [
+            'recipient_email' => $studentAdmin->email,
+            'message' => 'You are in timeout for 5 minutes, until ' . $studentBanResponse->json('actor_action_locked_until') . ', because you banned or deleted another user.',
+        ]);
 
         $this->postJson('/api/v2/VMD-update-game-user-basic-info', [
             'id' => $studentEditTarget->id,
