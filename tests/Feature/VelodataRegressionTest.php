@@ -84,6 +84,7 @@ class VelodataRegressionTest extends TestCase
             'email' => 'fake-admin@example.test',
             'intake_id' => $intakeId,
             'game_role' => 'Admin',
+            'created_by_email' => $creator->email,
         ]);
 
         $metadata = DB::table('game_users')
@@ -91,6 +92,226 @@ class VelodataRegressionTest extends TestCase
             ->value('metadata');
 
         $this->assertSame('student_fake_account', json_decode($metadata, true)['source'] ?? null);
+    }
+
+    public function test_staff_created_accounts_store_immediate_creator_email(): void
+    {
+        $staffAdmin = $this->createStaffUser('staff-account-creator@example.test', 'Admin');
+        $memberRoleId = $this->roleId('Member');
+
+        $this->postJson('/api/v2/users', [
+            'data' => [
+                'type' => 'users',
+                'attributes' => [
+                    'name' => 'Staff Created Member',
+                    'email' => 'staff-created-member@example.test',
+                    'password' => 'secret-password',
+                    'vmd_user_email' => $staffAdmin->email,
+                    'vmd_user_name' => $staffAdmin->name,
+                ],
+                'relationships' => [
+                    'roles' => [
+                        'data' => [
+                            ['type' => 'roles', 'id' => (string) $memberRoleId],
+                        ],
+                    ],
+                ],
+            ],
+        ])->assertCreated();
+
+        $this->assertDatabaseHas('users', [
+            'email' => 'staff-created-member@example.test',
+            'created_by_email' => $staffAdmin->email,
+        ]);
+    }
+
+    public function test_account_drill_down_follows_nested_fake_account_ownership(): void
+    {
+        $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN');
+        $staffAdmin = $this->createStaffUser('account-drill-down-admin@example.test', 'Admin');
+        $creator = $this->createGameUser('account-drill-down-creator@example.test', 'Creator', 'active', $intakeId);
+        $adminRoleId = $this->roleId('Admin');
+        $this->setIntakeGameSetting($intakeId, 'game_account_drill_down_enabled', '1');
+
+        $this->postJson(
+            '/api/v2/users',
+            $this->studentCreateUserPayload($creator, 'account-drill-down-fake-one@example.test', 'Fake One', $adminRoleId)
+        )->assertCreated();
+
+        $fakeOne = DB::table('game_users')->where('email', 'account-drill-down-fake-one@example.test')->first();
+
+        $this->postJson(
+            '/api/v2/users',
+            $this->studentCreateUserPayload($fakeOne, 'account-drill-down-fake-two@example.test', 'Fake Two', $adminRoleId)
+        )->assertCreated();
+
+        $fakeTwo = DB::table('game_users')->where('email', 'account-drill-down-fake-two@example.test')->first();
+
+        $response = $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $staffAdmin->email,
+            'target_identity_type' => 'student',
+            'target_id' => $fakeTwo->id,
+            'target_email' => $fakeTwo->email,
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN',
+        ])->assertOk();
+
+        $this->assertSame([
+            'account-drill-down-fake-two@example.test',
+            'account-drill-down-fake-one@example.test',
+            'account-drill-down-creator@example.test',
+        ], collect($response->json('data.chain'))->pluck('email')->all());
+        $this->assertSame(2, $response->json('data.chain_depth'));
+        $this->assertSame('root_account', $response->json('data.stop_reason'));
+        $this->assertSame($creator->email, $response->json('data.root.email'));
+    }
+
+    public function test_account_drill_down_hides_spy_chain_nodes_from_non_protectors(): void
+    {
+        $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN-SPY');
+        $staffAdmin = $this->createStaffUser('account-drill-down-spy-admin@example.test', 'Admin');
+        $spy = $this->createGameUser('account-drill-down-spy@example.test', 'Spy', 'active', $intakeId);
+        $target = $this->createGameUser('account-drill-down-spy-made@example.test', 'Admin', 'active', $intakeId);
+        $this->setIntakeGameSetting($intakeId, 'game_account_drill_down_enabled', '1');
+
+        DB::table('game_users')
+            ->where('id', $target->id)
+            ->update(['created_by_email' => $spy->email]);
+
+        $response = $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $staffAdmin->email,
+            'target_identity_type' => 'student',
+            'target_id' => $target->id,
+            'target_email' => $target->email,
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-SPY',
+        ])->assertOk();
+
+        $this->assertSame('hidden_spy', $response->json('data.stop_reason'));
+        $this->assertSame($target->email, $response->json('data.chain.0.email'));
+        $this->assertNull($response->json('data.chain.1.email'));
+        $this->assertTrue($response->json('data.chain.1.redacted'));
+    }
+
+    public function test_admin_notification_recipient_can_drill_down_matching_actor_when_enabled(): void
+    {
+        $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN-NOTIFICATION');
+        $adminRecipient = $this->createGameUser('account-drill-down-admin-recipient@example.test', 'Admin', 'active', $intakeId);
+        $studentActor = $this->createGameUser('account-drill-down-notification-actor@example.test', 'Admin', 'active', $intakeId);
+        $this->setIntakeGameSetting($intakeId, 'game_account_drill_down_enabled', '1');
+
+        DB::table('user_notifications')->insert([
+            'recipient_email' => $adminRecipient->email,
+            'actor_email' => $studentActor->email,
+            'type' => 'info',
+            'title' => 'Role changed',
+            'message' => 'Your role was changed by a Student actor.',
+            'source' => 'user-management',
+            'metadata' => json_encode([
+                'actorEmail' => $studentActor->email,
+            ]),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $adminRecipient->email,
+            'target_email' => $studentActor->email,
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-NOTIFICATION',
+            'context' => 'user_notifications',
+        ])->assertOk();
+
+        $this->assertSame($studentActor->email, $response->json('data.chain.0.email'));
+        $this->assertSame('student', $response->json('data.chain.0.identity_type'));
+
+        $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $adminRecipient->email,
+            'target_email' => 'unrelated-actor@example.test',
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-NOTIFICATION',
+            'context' => 'user_notifications',
+        ])->assertNotFound();
+    }
+
+    public function test_notification_drill_down_reveals_the_matching_actor_even_when_actor_is_spy(): void
+    {
+        $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN-NOTIFICATION-SPY');
+        $adminRecipient = $this->createGameUser('account-drill-down-spy-recipient@example.test', 'Admin', 'active', $intakeId);
+        $spyActor = $this->createGameUser('account-drill-down-visible-spy-actor@example.test', 'Spy', 'active', $intakeId);
+        $this->setIntakeGameSetting($intakeId, 'game_account_drill_down_enabled', '1');
+
+        DB::table('user_notifications')->insert([
+            'recipient_email' => $adminRecipient->email,
+            'actor_email' => $spyActor->email,
+            'type' => 'info',
+            'title' => 'Role changed',
+            'message' => 'Your role was changed by Ariel.',
+            'source' => 'user-management',
+            'metadata' => json_encode([
+                'actorEmail' => $spyActor->email,
+            ]),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $adminRecipient->email,
+            'target_email' => $spyActor->email,
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-NOTIFICATION-SPY',
+            'context' => 'user_notifications',
+        ])->assertOk();
+
+        $this->assertSame($spyActor->email, $response->json('data.chain.0.email'));
+        $this->assertSame('Spy', $response->json('data.chain.0.role_name'));
+        $this->assertFalse((bool) $response->json('data.chain.0.redacted'));
+    }
+
+    public function test_account_drill_down_requires_enabled_intake_setting(): void
+    {
+        $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN-OFF');
+        $studentAdmin = $this->createGameUser('account-drill-down-disabled-admin@example.test', 'Admin', 'active', $intakeId);
+        $target = $this->createGameUser('account-drill-down-disabled-target@example.test', 'Member', 'active', $intakeId);
+
+        $this->setIntakeGameSetting($intakeId, 'game_account_drill_down_enabled', '0');
+
+        $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $studentAdmin->email,
+            'target_identity_type' => 'student',
+            'target_id' => $target->id,
+            'target_email' => $target->email,
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-OFF',
+        ])
+            ->assertForbidden()
+            ->assertJsonPath('message', 'Permission Denied: account drill down is not enabled for this Class Intake.');
+    }
+
+    public function test_matching_notification_does_not_grant_non_admin_account_drill_down(): void
+    {
+        $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN-NON-ADMIN');
+        $memberRecipient = $this->createGameUser('account-drill-down-member-recipient@example.test', 'Member', 'active', $intakeId);
+        $studentActor = $this->createGameUser('account-drill-down-non-admin-actor@example.test', 'Admin', 'active', $intakeId);
+
+        $this->setIntakeGameSetting($intakeId, 'game_account_drill_down_enabled', '1');
+
+        DB::table('user_notifications')->insert([
+            'recipient_email' => $memberRecipient->email,
+            'actor_email' => $studentActor->email,
+            'type' => 'info',
+            'title' => 'Role changed',
+            'message' => 'Your role was changed by a Student actor.',
+            'source' => 'user-management',
+            'metadata' => json_encode([
+                'actorEmail' => $studentActor->email,
+            ]),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $memberRecipient->email,
+            'target_email' => $studentActor->email,
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-NON-ADMIN',
+            'context' => 'user_notifications',
+        ])
+            ->assertForbidden()
+            ->assertJsonPath('message', 'Permission Denied: account drill down requires Admin access.');
     }
 
     public function test_student_cannot_create_fake_account_for_existing_staff_user(): void
@@ -844,6 +1065,7 @@ class VelodataRegressionTest extends TestCase
             ->where('game_intakes.code', 'TEST-ADD-STUDENT-TARGET')
             ->where('game_users.email', 'new-class-student@example.test')
             ->where('game_users.display_name', 'New')
+            ->where('game_users.created_by_email', $staffAdmin->email)
             ->where('game_users.game_role', 'Creator')
             ->where('game_users.game_status', 'active')
             ->where('game_users.must_change_password', true)
@@ -1390,6 +1612,42 @@ class VelodataRegressionTest extends TestCase
             ->all();
         $this->assertContains($spyUser->email, $studentProtectorLoginEmails);
         $this->assertContains($normalUser->email, $studentProtectorLoginEmails);
+    }
+
+    public function test_login_history_returns_joined_profile_images_without_frontend_user_data_lookup(): void
+    {
+        $intakeId = $this->createIntake('TEST-LOGIN-HISTORY-PROFILE-IMAGE');
+        $staffAdmin = $this->createStaffUser('login-history-profile-admin@example.test', 'Admin');
+        $student = $this->createGameUser('login-history-profile-student@example.test', 'Member', 'active', $intakeId);
+
+        DB::table('game_users')
+            ->where('id', $student->id)
+            ->update(['profile_image' => 'https://dashboard.velodata.org/storage/student-avatar.png']);
+
+        DB::table('user_login_history')->insert([
+            'custno' => 900000 + $student->id,
+            'email' => $student->email,
+            'name' => $student->display_name,
+            'ip_address' => '127.0.0.1',
+            'ip_address_v4' => '127.0.0.1',
+            'created_at' => now(),
+            'login_identity_type' => 'student',
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-login-history', [
+            'email' => $staffAdmin->email,
+            'method' => 'all users',
+            'game_intake_id' => $intakeId,
+        ])->assertOk();
+
+        $loginRow = collect($response->json('data'))
+            ->firstWhere('attributes.email', $student->email);
+
+        $this->assertNotNull($loginRow);
+        $this->assertSame(
+            'https://dashboard.velodata.org/storage/student-avatar.png',
+            $loginRow['attributes']['profile_image'] ?? null
+        );
     }
 
     public function test_system_admin_user_id_one_can_never_be_edited(): void

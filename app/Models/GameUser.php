@@ -18,6 +18,7 @@ class GameUser extends Model
         'preferred_name',
         'display_name',
         'email',
+        'created_by_email',
         'profile_image',
         'password',
         'must_change_password',

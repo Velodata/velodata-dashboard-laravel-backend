@@ -124,15 +124,31 @@ Some actions may trigger notifications or audit records.
 
 ## Notifications
 
-The system sends notifications for important account changes.
+The system sends notifications for important account changes. Notifications are part of the game evidence trail, not just pop-up messages.
 
 Users should receive notifications when their:
 
 - Role is changed.
 - Password is changed.
 - Basic Info is changed.
+- Account is banned, unbanned, deleted, or undeleted.
+- User Management access is placed into timeout.
+- Account access or protected-account activity creates a security warning.
 
 This applies to both Staff users and Student game users.
+
+The bell icon shows recent notifications. The User Notifications screen gives a searchable history so you can review older events and work out what happened.
+
+Useful notification filters include:
+
+- `Role` for role changes.
+- `Password` for password changes.
+- `Profile` for basic-info, profile, or avatar changes.
+- `Ban/Unban` for account ban and unban records.
+- `Timeout` for User Management timeout notices.
+- `Security` for protected-account warnings.
+
+Do not assume a fake account hides everything. If an action affects your account, the notification history may still show who performed it, when it happened, and what changed.
 
 ## Audit And Login History
 
@@ -147,6 +163,8 @@ This means Spy is not invisible to everyone. It is invisible to the wrong defend
 From Week One onward, banned Students cannot log in.
 
 If the delete timeout setting is enabled, Students who ban or delete another user can be locked out of further User Management edits for a period of time. This only affects Student users, not Staff users.
+
+Timeout notifications show how long the timeout lasts and when it ends. During timeout you may still be able to view parts of the dashboard, but User Management write actions are blocked.
 
 When undelete is enabled, deleted users can only be restored by Staff Admins or Staff Protectors.
 

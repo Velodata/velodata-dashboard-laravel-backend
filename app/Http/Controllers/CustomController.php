@@ -375,6 +375,296 @@ class CustomController extends Controller
         return in_array(strtolower((string) $roleName), ['admin', 'protector', 'spy'], true);
     }
 
+    private function canViewAccountDrillDown(?string $email): bool
+    {
+        if (! $email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+        if ($user && strcasecmp($this->staffRoleName($user), 'Admin') === 0) {
+            return true;
+        }
+
+        $gameUser = $this->actorGameUser($email);
+
+        return $gameUser && strcasecmp((string) $gameUser->game_role, 'Admin') === 0;
+    }
+
+    private function accountDrillDownIntakeId(Request $request, ?array $target): ?int
+    {
+        $requestedIntakeCode = $request->input('game_intake_code')
+            ? trim((string) $request->input('game_intake_code'))
+            : null;
+
+        if ($requestedIntakeCode) {
+            $intakeId = DB::table('game_intakes')->where('code', $requestedIntakeCode)->value('id');
+
+            return $intakeId ? (int) $intakeId : null;
+        }
+
+        $targetIntakeCode = $target['game_intake_code'] ?? null;
+        if ($targetIntakeCode) {
+            $intakeId = DB::table('game_intakes')->where('code', $targetIntakeCode)->value('id');
+
+            return $intakeId ? (int) $intakeId : null;
+        }
+
+        return null;
+    }
+
+    private function accountDrillDownEnabledForRequest(Request $request, ?array $target): bool
+    {
+        $intakeId = $this->accountDrillDownIntakeId($request, $target);
+
+        return $this->intakeGameSettingBoolean($intakeId, 'game_account_drill_down_enabled', false);
+    }
+
+    private function canViewNotificationActorDrillDown(?string $viewerEmail, ?string $targetEmail): bool
+    {
+        if (! $viewerEmail || ! $targetEmail) {
+            return false;
+        }
+
+        return DB::table('user_notifications')
+            ->where('recipient_email', $viewerEmail)
+            ->where('actor_email', $targetEmail)
+            ->whereNull('dismissed_at')
+            ->exists();
+    }
+
+    private function canViewSpyAccountDrillDownRows(?string $email): bool
+    {
+        $staffUser = $email ? User::where('email', $email)->first() : null;
+        if ($staffUser && strcasecmp($this->staffRoleName($staffUser), 'Protector') === 0) {
+            return true;
+        }
+
+        $gameUser = $this->actorGameUser($email);
+
+        return $gameUser && strcasecmp((string) $gameUser->game_role, 'Protector') === 0;
+    }
+
+    private function accountDrillDownNodeFromUser(User $user): array
+    {
+        return [
+            'identity_type' => 'staff',
+            'id' => (int) $user->id,
+            'email' => $user->email,
+            'name' => $user->name,
+            'role_name' => $this->staffRoleName($user),
+            'status' => $user->status,
+            'created_by_email' => $user->created_by_email,
+            'created_at' => optional($user->created_at)->toDateTimeString(),
+            'game_intake_code' => null,
+            'game_intake_name' => null,
+            'is_spy' => strcasecmp($this->staffRoleName($user), 'Spy') === 0,
+        ];
+    }
+
+    private function accountDrillDownNodeFromGameUser(GameUser $gameUser): array
+    {
+        $intake = $gameUser->intake_id
+            ? DB::table('game_intakes')->where('id', $gameUser->intake_id)->first()
+            : null;
+
+        return [
+            'identity_type' => 'student',
+            'id' => (int) $gameUser->id,
+            'email' => $gameUser->email,
+            'name' => $gameUser->display_name ?: trim(($gameUser->preferred_name ?: $gameUser->first_name) . ' ' . $gameUser->surname),
+            'role_name' => $gameUser->game_role,
+            'status' => strtoupper((string) $gameUser->game_status),
+            'created_by_email' => $gameUser->created_by_email,
+            'created_at' => optional($gameUser->created_at)->toDateTimeString(),
+            'game_intake_code' => $intake->code ?? null,
+            'game_intake_name' => $intake->name ?? null,
+            'is_spy' => strcasecmp((string) $gameUser->game_role, 'Spy') === 0 || (bool) $gameUser->is_spy,
+        ];
+    }
+
+    private function redactedSpyAccountDrillDownNode(): array
+    {
+        return [
+            'identity_type' => 'hidden',
+            'id' => null,
+            'email' => null,
+            'name' => 'Hidden Spy account',
+            'role_name' => 'Spy',
+            'status' => null,
+            'created_by_email' => null,
+            'created_at' => null,
+            'game_intake_code' => null,
+            'game_intake_name' => null,
+            'is_spy' => true,
+            'redacted' => true,
+        ];
+    }
+
+    private function accountDrillDownTargetFromRequest(Request $request): ?array
+    {
+        $identityType = strtolower((string) $request->input('target_identity_type'));
+        $targetId = $request->input('target_id');
+        $targetEmail = $request->input('target_email');
+
+        if ($identityType === 'student' && $targetId) {
+            $gameUser = GameUser::find($targetId);
+
+            return $gameUser ? $this->accountDrillDownNodeFromGameUser($gameUser) : null;
+        }
+
+        if ($identityType === 'staff' && $targetId) {
+            $user = User::find($targetId);
+
+            return $user ? $this->accountDrillDownNodeFromUser($user) : null;
+        }
+
+        if ($targetEmail) {
+            return $this->accountDrillDownNodeByEmail($targetEmail);
+        }
+
+        return null;
+    }
+
+    private function accountDrillDownNodeByEmail(?string $email): ?array
+    {
+        if (! $email) {
+            return null;
+        }
+
+        $gameUser = GameUser::where('email', $email)->first();
+        if ($gameUser) {
+            return $this->accountDrillDownNodeFromGameUser($gameUser);
+        }
+
+        $user = User::where('email', $email)->first();
+
+        return $user ? $this->accountDrillDownNodeFromUser($user) : null;
+    }
+
+    public function F0_VMD_get_account_drill_down(Request $request)
+    {
+        $viewerEmail = $request->input('vmd_user_email');
+
+        $validator = Validator::make($request->all(), [
+            'vmd_user_email' => 'required|email',
+            'game_intake_code' => 'nullable|string|exists:game_intakes,code',
+            'target_email' => 'nullable|email',
+            'target_identity_type' => 'nullable|string|in:staff,student',
+            'target_id' => 'nullable|integer',
+            'context' => 'nullable|string|in:user_management,user_notifications',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors()->toArray(),
+            ], 409);
+        }
+
+        $targetEmail = $request->input('target_email');
+        $context = $request->input('context') ?: 'user_management';
+        $canViewNotificationActor = $context === 'user_notifications'
+            && $this->canViewNotificationActorDrillDown($viewerEmail, $targetEmail);
+        $target = $this->accountDrillDownTargetFromRequest($request);
+
+        if (! $target) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Account not found.',
+            ], 404);
+        }
+
+        $requestedIntakeCode = $request->input('game_intake_code')
+            ? trim((string) $request->input('game_intake_code'))
+            : null;
+        if (
+            $requestedIntakeCode &&
+            ($target['game_intake_code'] ?? null) &&
+            $requestedIntakeCode !== $target['game_intake_code']
+        ) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: target account is not in the requested Class Intake.',
+            ], 403);
+        }
+
+        if (! $this->canViewAccountDrillDown($viewerEmail)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: account drill down requires Admin access.',
+            ], 403);
+        }
+
+        if (! $this->accountDrillDownEnabledForRequest($request, $target)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: account drill down is not enabled for this Class Intake.',
+            ], 403);
+        }
+
+        $canViewSpyRows = $this->canViewSpyAccountDrillDownRows($viewerEmail);
+
+        $chain = [];
+        $visitedEmails = [];
+        $current = $target;
+        $stopReason = 'root_account';
+        $maxDepth = 25;
+
+        for ($depth = 0; $depth < $maxDepth && $current; $depth++) {
+            $currentEmailKey = strtolower((string) ($current['email'] ?? ''));
+
+            if (! $canViewSpyRows && ($current['is_spy'] ?? false) && ! ($depth === 0 && $canViewNotificationActor)) {
+                $chain[] = $this->redactedSpyAccountDrillDownNode();
+                $stopReason = 'hidden_spy';
+                break;
+            }
+
+            if ($currentEmailKey !== '') {
+                if (isset($visitedEmails[$currentEmailKey])) {
+                    $stopReason = 'loop_detected';
+                    break;
+                }
+
+                $visitedEmails[$currentEmailKey] = true;
+            }
+
+            $chain[] = $current;
+            $createdByEmail = $current['created_by_email'] ?? null;
+
+            if (! $createdByEmail) {
+                $stopReason = 'root_account';
+                break;
+            }
+
+            $next = $this->accountDrillDownNodeByEmail($createdByEmail);
+            if (! $next) {
+                $stopReason = 'creator_not_found';
+                break;
+            }
+
+            $current = $next;
+        }
+
+        if (count($chain) >= $maxDepth && $stopReason === 'root_account') {
+            $stopReason = 'max_depth_reached';
+        }
+
+        $root = count($chain) > 0 ? $chain[count($chain) - 1] : null;
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'data' => [
+                'target' => $target,
+                'chain' => $chain,
+                'root' => $root,
+                'chain_depth' => max(0, count($chain) - 1),
+                'stop_reason' => $stopReason,
+            ],
+        ], 200);
+    }
+
     private function canRestoreDeletedUsers(?string $email): bool
     {
         return $this->isStaffRoleEmail($email, ['Admin', 'Protector']);
@@ -1047,6 +1337,7 @@ class CustomController extends Controller
                 'preferred_name' => null,
                 'display_name' => $displayName,
                 'email' => $validated['email'],
+                'created_by_email' => $adminUser->email,
                 'password' => Hash::make($validated['password']),
                 'must_change_password' => true,
                 'company_name' => $validated['company_name'] ?? $gameIntake->name,
@@ -4597,6 +4888,7 @@ if ($validator->fails()) {
             'game_allow_undelete' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Deleted players can be restored by defenders', 'sort' => 140],
             'game_protector_spy_controls' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Protector spy controls are enabled', 'sort' => 150],
             'game_spy_audit_impersonation' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Spies can appear as other users in audit screens', 'sort' => 160],
+            'game_account_drill_down_enabled' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Admins can trace fake-account ownership', 'sort' => 165],
             'game_last_man_standing_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Winner is the last active eligible player', 'sort' => 170],
             'game_auto_detect_winner' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Automatically detect a winner when one player remains', 'sort' => 180],
             'game_baseline_reset_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Class baseline reset is enabled', 'sort' => 190],
@@ -4615,6 +4907,7 @@ if ($validator->fails()) {
             'game_allow_undelete' => false,
             'game_protector_spy_controls' => false,
             'game_spy_audit_impersonation' => false,
+            'game_account_drill_down_enabled' => false,
             'game_last_man_standing_enabled' => true,
             'game_auto_detect_winner' => false,
             'game_baseline_reset_enabled' => true,
@@ -4640,6 +4933,7 @@ if ($validator->fails()) {
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
+                'game_account_drill_down_enabled' => true,
                 'game_auto_detect_winner' => true,
             ],
             'week_5' => [
@@ -4651,6 +4945,7 @@ if ($validator->fails()) {
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
                 'game_spy_audit_impersonation' => true,
+                'game_account_drill_down_enabled' => true,
                 'game_auto_detect_winner' => true,
             ],
             'week_6' => [
@@ -4663,6 +4958,7 @@ if ($validator->fails()) {
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
                 'game_spy_audit_impersonation' => true,
+                'game_account_drill_down_enabled' => true,
                 'game_auto_detect_winner' => true,
             ],
         ];

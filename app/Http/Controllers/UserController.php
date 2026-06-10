@@ -467,13 +467,15 @@ class UserController extends Controller
         }
 
         // Create and save the new user
-        $user = User::create([
+        $user = new User([
             'name' => $name,
             'email' => $email,
+            'created_by_email' => $createdByEmail,
             'role_id' => $roleId,
         ]);
-
         $user->password = $password;
+        $user->save();
+
         $user->custno = $user->id + 100000;
         $user->save();
 
@@ -562,6 +564,7 @@ class UserController extends Controller
             'preferred_name' => $name,
             'display_name' => $name,
             'email' => $email,
+            'created_by_email' => $createdByEmail,
             'password' => Hash::make($password),
             'must_change_password' => false,
             'profile_image' => $attributes['profile_image'] ?? null,

@@ -32,6 +32,7 @@ class User extends Authenticatable
     protected $fillable = [
         'name',
         'email',
+        'created_by_email',
         'profile_image',
         'role_id', // Allow mass assignment for role_id
         'is_system_user',
