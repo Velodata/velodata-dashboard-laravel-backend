@@ -15,6 +15,19 @@ use Illuminate\Support\Str;
 
 class UserController extends Controller
 {
+    private function isSacrosanctStaffUser(?User $user): bool
+    {
+        if (! $user) {
+            return false;
+        }
+
+        return in_array((int) $user->id, [1, 4], true)
+            || in_array(strtolower((string) $user->email), [
+                'admin@velodata.org',
+                'ivanvetsich@gmail.com',
+            ], true);
+    }
+
     private function getAuditIpAddress(Request $request): string
     {
         $clientIpv4 = $request->input('vmd_ip_address_v4')
@@ -699,11 +712,11 @@ class UserController extends Controller
             return $geoLockResponse;
         }
 
-        if ((int) $user->id === 1 || strcasecmp((string) $user->email, 'admin@velodata.org') === 0) {
+        if ($this->isSacrosanctStaffUser($user)) {
             return response()->json([
                 'error' => [
                     'title' => 'Permission Denied',
-                    'detail' => 'The System Admin avatar cannot be changed.',
+                    'detail' => 'This protected system account avatar cannot be changed.',
                     'status' => 403,
                 ]
             ], 403);

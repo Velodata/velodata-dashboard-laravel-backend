@@ -33,6 +33,24 @@ use App\Models\Role;
 
 class CustomController extends Controller
 {
+    private function protectedStaffAccountEmails(): array
+    {
+        return [
+            'admin@velodata.org',
+            'ivanvetsich@gmail.com',
+        ];
+    }
+
+    private function isSacrosanctStaffUser(?User $user): bool
+    {
+        if (! $user) {
+            return false;
+        }
+
+        return in_array((int) $user->id, [1, 4], true)
+            || in_array(strtolower((string) $user->email), $this->protectedStaffAccountEmails(), true);
+    }
+
     private function dashboardSettingValue(string $key, $default = null)
     {
         $setting = DB::table('dashboard_settings')->where('key', $key)->first();
@@ -688,6 +706,10 @@ class CustomController extends Controller
 
     private function canBanStaffUser(?string $actorEmail, User $targetUser): bool
     {
+        if ($this->isSacrosanctStaffUser($targetUser)) {
+            return false;
+        }
+
         if ($this->isStaffAdmin($targetUser)) {
             return false;
         }
@@ -707,6 +729,10 @@ class CustomController extends Controller
 
     private function canDeleteStaffUser(?string $actorEmail, User $targetUser): bool
     {
+        if ($this->isSacrosanctStaffUser($targetUser)) {
+            return false;
+        }
+
         if ($this->isStaffAdmin($targetUser)) {
             return false;
         }
@@ -2858,9 +2884,11 @@ class CustomController extends Controller
             $targetWasActive = ! in_array(strtoupper((string) $user->status), ['BANNED', 'DELETED'], true);
 
             if (! $this->canBanStaffUser($data['vmd_user_email'], $user)) {
-                if ($this->isStaffAdmin($user)) {
+                if ($this->isSacrosanctStaffUser($user) || $this->isStaffAdmin($user)) {
                     $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'ban protected account');
-                    $response['message'] = "Permission Denied: Staff Admin users cannot be banned.";
+                    $response['message'] = $this->isSacrosanctStaffUser($user)
+                        ? "Permission Denied: Protected system accounts cannot be banned."
+                        : "Permission Denied: Staff Admin users cannot be banned.";
                 } else {
                     $response['message'] = "Permission Denied: You do not have permission to ban this Staff user.";
                 }
@@ -3100,9 +3128,11 @@ class CustomController extends Controller
 
         if ($user) {
             if (! $this->canDeleteStaffUser($data['vmd_user_email'], $user)) {
-                if ($this->isStaffAdmin($user)) {
+                if ($this->isSacrosanctStaffUser($user) || $this->isStaffAdmin($user)) {
                     $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'delete protected account');
-                    $response['message'] = "Permission Denied: Staff Admin users cannot be deleted.";
+                    $response['message'] = $this->isSacrosanctStaffUser($user)
+                        ? "Permission Denied: Protected system accounts cannot be deleted."
+                        : "Permission Denied: Staff Admin users cannot be deleted.";
                 } elseif ($this->actorGameUser($data['vmd_user_email'])) {
                     $response['message'] = "Permission Denied: Students cannot delete Staff users.";
                 } else {
@@ -3225,12 +3255,12 @@ class CustomController extends Controller
             ], 404);
         }
 
-        if ((int) $user->id === 1 || strcasecmp((string) $user->email, 'admin@velodata.org') === 0) {
+        if ($this->isSacrosanctStaffUser($user)) {
             $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'permanently delete protected account');
 
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: The system Admin account cannot be permanently deleted.',
+                'message' => 'Permission Denied: This protected system account cannot be permanently deleted.',
             ], 403);
         }
 
@@ -3782,7 +3812,6 @@ if ($validator->fails()) {
 
         // Extract validated data
         $data = $validator->validated();
-        $protectedAdminSelfAvatarUpdate = false;
         if ($timeoutResponse = $this->userManagementTimeoutResponse($data['vmd_user_email'])) {
             return $timeoutResponse;
         }
@@ -3800,24 +3829,12 @@ if ($validator->fails()) {
             return $geoLockResponse;
         }
 
-        if ($data['id'] === 1) {
-            $targetAdmin = User::where('id', 1)->first();
-            $protectedAdminSelfAvatarUpdate = $targetAdmin
-                && strcasecmp((string) $targetAdmin->email, (string) ($data['vmd_user_email'] ?? '')) === 0
-                && strcasecmp((string) ($data['vmd_audit_reason'] ?? ''), 'Profile image updated') === 0;
-
-            if ($protectedAdminSelfAvatarUpdate) {
-                // Allow the protected Admin account to update its own avatar.
-            } else {
+        $targetAdmin = User::where('id', $data['id'])->first();
+        if ($this->isSacrosanctStaffUser($targetAdmin)) {
             $this->logProtectedAccountEditBlocked($request, $data, $data['vmd_audit_reason'] ?? 'update protected account');
             $response['outcome'] = "FAIL";
             $response['message'] = "Permission Denied:  (You can NEVER EVER edit the Admin account.)";
             return response()->json($response, 403);
-            }
-        }
-
-        if ($data['id'] == 1 && ! $protectedAdminSelfAvatarUpdate) {
-            return response()->json(['errors' => "Permission Denied:  (You cannot edit the Admin account)"], 403);
         }
 
         if ($this->nonAdminStaffAssigningAdmin($data['vmd_user_email'], $data['role_id'] ?? null, $data['role_name'] ?? null)) {
@@ -4658,17 +4675,19 @@ if ($validator->fails()) {
             ]);
         }
 
-        if (!$this->canAccessGlobalManagement($email)) {
-            return response()->json([
-                'outcome' => 'ERROR: Staff Admin or Trainer access required.',
-            ], 403);
-        }
-
         $user = User::where('email', $email)->first();
         if (! $user) {
             return response()->json([
                 'outcome' => 'ERROR: Staff user not found.',
             ], 404);
+        }
+
+        if (! $this->canAccessGlobalManagement($email)) {
+            if (! $requestedIntakeCode || ! $this->staffCanAccessIntake($user, null, $requestedIntakeCode)) {
+                return response()->json([
+                    'outcome' => 'ERROR: Staff Admin, Trainer, or assigned staff access required.',
+                ], 403);
+            }
         }
 
         $intakes = $this->staffVisibleIntakes($user);
@@ -5455,30 +5474,44 @@ if ($validator->fails()) {
 
         $gameUserColumns = collect(Schema::getColumnListing('game_users'))->flip();
 
-        $result = DB::transaction(function () use ($baseline, $gameUserColumns) {
+        $result = DB::transaction(function () use ($baseline, $intake, $gameUserColumns) {
             $rows = DB::table('game_baseline_users')->where('baseline_id', $baseline->id)->get();
-            $baselineGameUserIds = $rows->pluck('game_user_id')->map(fn ($id) => (int) $id)->all();
-            $deleted = DB::table('game_users')
-                ->where('intake_id', $baseline->intake_id)
-                ->whereNotIn('id', $baselineGameUserIds)
-                ->delete();
+            $baselineEmails = $rows
+                ->pluck('email')
+                ->map(fn ($email) => trim((string) $email))
+                ->filter()
+                ->values()
+                ->all();
+            $targetIntakeId = (int) $intake->id;
+            $extraGameUsers = DB::table('game_users')->where('intake_id', $targetIntakeId);
+            $deleted = empty($baselineEmails)
+                ? $extraGameUsers->delete()
+                : $extraGameUsers->whereNotIn('email', $baselineEmails)->delete();
             $updated = 0;
             $created = 0;
+            $skipped = 0;
 
             foreach ($rows as $row) {
+                $studentEmail = trim((string) $row->email);
+
+                if ($studentEmail === '') {
+                    $skipped += 1;
+                    continue;
+                }
+
                 $snapshot = json_decode($row->snapshot ?: '{}', true) ?: [];
                 $values = collect($snapshot)
                     ->only($gameUserColumns->keys()->all())
-                    ->except(['id', 'created_at', 'updated_at'])
+                    ->except(['id', 'intake_id', 'created_at', 'updated_at'])
                     ->toArray();
 
                 $values = array_merge($values, [
-                    'intake_id' => $baseline->intake_id,
+                    'intake_id' => $targetIntakeId,
                     'first_name' => $row->first_name,
                     'surname' => $row->surname,
                     'preferred_name' => $row->preferred_name,
                     'display_name' => $row->display_name,
-                    'email' => $row->email,
+                    'email' => $studentEmail,
                     'special_needs' => $row->special_needs,
                     'game_role' => $row->game_role,
                     'game_status' => $row->game_status,
@@ -5490,20 +5523,24 @@ if ($validator->fails()) {
                     'eliminated_at' => $row->eliminated_at,
                     'eliminated_by_game_user_id' => $row->eliminated_by_game_user_id,
                     'metadata' => $row->metadata,
-                    'updated_at' => now(),
+                    'updated_at' => now()->toDateTimeString(),
                 ]);
 
                 $values = collect($values)
                     ->map(fn ($value) => is_array($value) || is_object($value) ? json_encode($value) : $value)
                     ->toArray();
 
-                if (DB::table('game_users')->where('id', $row->game_user_id)->exists()) {
-                    DB::table('game_users')->where('id', $row->game_user_id)->update($values);
+                $existingStudent = DB::table('game_users')
+                    ->where('intake_id', $targetIntakeId)
+                    ->where('email', $studentEmail)
+                    ->first();
+
+                if ($existingStudent) {
+                    DB::table('game_users')->where('id', $existingStudent->id)->update($values);
                     $updated += 1;
                 } else {
                     DB::table('game_users')->insert(array_merge([
-                        'id' => $row->game_user_id,
-                        'created_at' => now(),
+                        'created_at' => now()->toDateTimeString(),
                     ], $values));
                     $created += 1;
                 }
@@ -5514,6 +5551,7 @@ if ($validator->fails()) {
                 'updated' => $updated,
                 'created' => $created,
                 'total' => $rows->count(),
+                'skipped' => $skipped,
             ];
         });
 
@@ -5525,6 +5563,7 @@ if ($validator->fails()) {
             'updated_rows' => $result['updated'],
             'created_rows' => $result['created'],
             'deleted_extra_rows' => $result['deleted'],
+            'skipped_rows' => $result['skipped'],
         ], 200);
     }
 

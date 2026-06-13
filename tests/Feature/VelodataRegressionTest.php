@@ -371,6 +371,76 @@ class VelodataRegressionTest extends TestCase
         }
     }
 
+    public function test_student_baseline_restore_matches_students_by_intake_code_and_email(): void
+    {
+        $intakeCode = 'TEST-BASELINE-RESTORE-EMAIL';
+        $intakeId = $this->createIntake($intakeCode);
+        $staffAdmin = $this->createStaffUser('baseline-restore-admin@example.test', 'Admin');
+        $alpha = $this->createGameUser('baseline-alpha@example.test', 'Creator', 'active', $intakeId);
+        $beta = $this->createGameUser('baseline-beta@example.test', 'Member', 'active', $intakeId);
+
+        $captureResponse = $this->postJson('/api/v2/VMD-capture-game-user-baseline', [
+            'vmd_user_email' => $staffAdmin->email,
+            'game_intake_code' => $intakeCode,
+            'name' => 'Email identity restore baseline',
+        ])->assertOk();
+
+        $baselineId = (int) $captureResponse->json('baseline_id');
+
+        DB::table('game_baseline_users')
+            ->where('baseline_id', $baselineId)
+            ->update([
+                'game_user_id' => DB::raw('game_user_id + 10000'),
+            ]);
+
+        DB::table('game_users')
+            ->where('id', $alpha->id)
+            ->update([
+                'game_role' => 'Spy',
+                'display_name' => 'Changed Alpha',
+                'updated_at' => now(),
+            ]);
+
+        $this->createGameUser('baseline-extra-one@example.test', 'Member', 'active', $intakeId);
+        $this->createGameUser('baseline-extra-two@example.test', 'Member', 'active', $intakeId);
+
+        $restoreResponse = $this->postJson('/api/v2/VMD-restore-game-user-baseline', [
+            'vmd_user_email' => $staffAdmin->email,
+            'game_intake_code' => $intakeCode,
+            'baseline_id' => $baselineId,
+        ])->assertOk();
+
+        $restoreResponse
+            ->assertJsonPath('restored_rows', 2)
+            ->assertJsonPath('updated_rows', 2)
+            ->assertJsonPath('created_rows', 0)
+            ->assertJsonPath('deleted_extra_rows', 2);
+
+        $remainingStudents = DB::table('game_users')
+            ->where('intake_id', $intakeId)
+            ->orderBy('email')
+            ->get();
+
+        $this->assertSame([
+            'baseline-alpha@example.test',
+            'baseline-beta@example.test',
+        ], $remainingStudents->pluck('email')->all());
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $alpha->id,
+            'intake_id' => $intakeId,
+            'email' => $alpha->email,
+            'display_name' => $alpha->display_name,
+            'game_role' => 'Creator',
+        ]);
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $beta->id,
+            'intake_id' => $intakeId,
+            'email' => $beta->email,
+        ]);
+    }
+
     public function test_student_role_change_creates_persisted_notification_for_that_game_user(): void
     {
         $staffAdmin = $this->createStaffUser('role-admin@example.test', 'Admin');
@@ -1315,6 +1385,36 @@ class VelodataRegressionTest extends TestCase
         ])->assertForbidden();
     }
 
+    public function test_assigned_staff_protector_can_read_intake_game_settings(): void
+    {
+        $intakeCode = 'TEST-GMUI-PROTECTOR-READ';
+        $otherIntakeCode = 'TEST-GMUI-PROTECTOR-OTHER';
+        $intakeId = $this->createIntake($intakeCode);
+        $otherIntakeId = $this->createIntake($otherIntakeCode);
+        $staffProtector = $this->createStaffUser('gmui-protector-reader@example.test', 'Protector');
+
+        $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_allow_undelete', '1');
+        $this->setIntakeGameSetting($otherIntakeId, 'game_allow_undelete', '0');
+
+        $response = $this->postJson('/api/v2/VMD-get-intake-game-settings', [
+            'vmd_user_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+        ])
+            ->assertOk()
+            ->assertJsonPath('selected_intake.code', $intakeCode);
+
+        $allowUndeleteSetting = collect($response->json('settings'))
+            ->firstWhere('key', 'game_allow_undelete');
+
+        $this->assertSame(true, $allowUndeleteSetting['value'] ?? null);
+
+        $this->postJson('/api/v2/VMD-get-intake-game-settings', [
+            'vmd_user_email' => $staffProtector->email,
+            'game_intake_code' => $otherIntakeCode,
+        ])->assertForbidden();
+    }
+
     public function test_gmui_pane_01_option_0102_blocks_banned_students_from_logging_in(): void
     {
         $intakeId = $this->createIntake('TEST-GMUI-0102');
@@ -1721,6 +1821,86 @@ class VelodataRegressionTest extends TestCase
         ]);
     }
 
+    public function test_ivan_user_id_four_is_sacrosanct_like_system_admin(): void
+    {
+        $ivanAccount = $this->createIvanProtectedAccount();
+        $staffAdmin = $this->createStaffUser('ivan-protected-attacker@example.test', 'Admin');
+        $studentSpy = $this->createGameUser('ivan-protected-spy-attacker@example.test', 'Spy');
+        $protectorRoleId = $this->roleId('Protector');
+
+        $this->postJson('/api/v2/VMD-updateUser', [
+            'id' => $ivanAccount->id,
+            'custno' => $ivanAccount->custno,
+            'email' => $ivanAccount->email,
+            'name' => 'Compromised Ivan',
+            'role_id' => $protectorRoleId,
+            'role_name' => 'Protector',
+            'password' => 'changed-password',
+            'password_confirmation' => 'changed-password',
+            'updated_by' => $staffAdmin->email,
+            'vmd_audit_reason' => 'Regression attempted Ivan account edit',
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_user_email' => $staffAdmin->email,
+        ])->assertForbidden();
+
+        $this->postJson('/api/v2/VMD-ban-user', [
+            'id' => $ivanAccount->id,
+            'updated_by' => $studentSpy->email,
+            'vmd_audit_reason' => 'Regression attempted Ivan account ban',
+            'vmd_user_name' => $studentSpy->display_name,
+            'vmd_user_email' => $studentSpy->email,
+        ])->assertForbidden();
+
+        $this->postJson('/api/v2/VMD-delete-user', [
+            'id' => $ivanAccount->id,
+            'updated_by' => $staffAdmin->email,
+            'vmd_audit_reason' => 'Regression attempted Ivan account delete',
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_user_email' => $staffAdmin->email,
+        ])->assertForbidden();
+
+        DB::table('users')
+            ->where('id', $ivanAccount->id)
+            ->update(['status' => 'DELETED']);
+
+        $this->postJson('/api/v2/VMD-permanently-delete-user', [
+            'id' => $ivanAccount->id,
+            'updated_by' => $staffAdmin->email,
+            'vmd_audit_reason' => 'Regression attempted Ivan permanent delete',
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_user_email' => $staffAdmin->email,
+        ])->assertForbidden();
+
+        DB::table('users')
+            ->where('id', $ivanAccount->id)
+            ->update(['status' => 'Active']);
+
+        $this->post('/api/v2/uploads/users/' . $ivanAccount->id . '/profile-image', [
+            'attachment' => UploadedFile::fake()->create('ivan-protected.jpg', 1, 'image/jpeg'),
+            'vmd_user_email' => $staffAdmin->email,
+            'vmd_user_name' => $staffAdmin->name,
+            'vmd_audit_reason' => 'Regression attempted Ivan avatar',
+        ])->assertForbidden();
+
+        $unchangedPassword = DB::table('users')->where('id', $ivanAccount->id)->value('password');
+        $this->assertTrue(Hash::check('password', $unchangedPassword));
+
+        $this->assertDatabaseHas('users', [
+            'id' => 4,
+            'email' => 'ivanvetsich@gmail.com',
+            'name' => 'Ivan Vetsich',
+            'role_name' => 'Admin',
+            'status' => 'Active',
+            'is_system_user' => true,
+            'profile_image' => null,
+        ]);
+
+        $this->assertDatabaseHas('user_audit_history', [
+            'custno' => 100004,
+            'created_by_email' => $staffAdmin->email,
+        ]);
+    }
+
     public function test_only_system_admin_email_can_change_role_management_view_permission(): void
     {
         $staffAdmin = $this->createStaffUser('ordinary-admin@example.test', 'Admin');
@@ -1924,6 +2104,28 @@ class VelodataRegressionTest extends TestCase
         ]);
 
         return DB::table('users')->where('id', 1)->first();
+    }
+
+    private function createIvanProtectedAccount(): object
+    {
+        $roleId = $this->roleId('Admin');
+        DB::table('users')->insert([
+            'id' => 4,
+            'custno' => 100004,
+            'name' => 'Ivan Vetsich',
+            'email' => 'ivanvetsich@gmail.com',
+            'password' => Hash::make('password'),
+            'role_id' => $roleId,
+            'role_name' => 'Admin',
+            'status' => 'Active',
+            'is_system_user' => true,
+            'is_game_user' => false,
+            'profile_image' => null,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        return DB::table('users')->where('id', 4)->first();
     }
 
     private function createGameUser(
