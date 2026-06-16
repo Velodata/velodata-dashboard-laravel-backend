@@ -382,15 +382,23 @@ class CustomController extends Controller
         $user = User::where('email', $email)->first();
 
         if ($user) {
-            $roleName = $user->role_name ?: optional($user->roles()->first())->name;
+            $roleName = trim((string) ($user->role_name ?: optional($user->roles()->first())->name));
 
-            return in_array(strtolower((string) $roleName), ['admin', 'protector', 'trainer'], true);
+            if (in_array(strtolower($roleName), ['admin', 'protector', 'trainer'], true)) {
+                return true;
+            }
         }
 
         $gameUser = GameUser::where('email', $email)->first();
-        $roleName = $gameUser?->game_role;
+        if (! $gameUser) {
+            return false;
+        }
 
-        return in_array(strtolower((string) $roleName), ['admin', 'protector', 'spy'], true);
+        $roleName = strtolower(trim((string) $gameUser->game_role));
+
+        return in_array($roleName, ['admin', 'protector', 'spy'], true)
+            || (bool) $gameUser->is_protector
+            || (bool) $gameUser->is_spy;
     }
 
     private function canViewAccountDrillDown(?string $email): bool
@@ -454,13 +462,13 @@ class CustomController extends Controller
     private function canViewSpyAccountDrillDownRows(?string $email): bool
     {
         $staffUser = $email ? User::where('email', $email)->first() : null;
-        if ($staffUser && strcasecmp($this->staffRoleName($staffUser), 'Protector') === 0) {
-            return true;
+        if ($staffUser) {
+            return in_array(strtolower($this->staffRoleName($staffUser)), ['admin', 'protector'], true);
         }
 
         $gameUser = $this->actorGameUser($email);
 
-        return $gameUser && strcasecmp((string) $gameUser->game_role, 'Protector') === 0;
+        return $gameUser && in_array(strtolower((string) $gameUser->game_role), ['admin', 'protector'], true);
     }
 
     private function accountDrillDownNodeFromUser(User $user): array

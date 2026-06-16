@@ -79,15 +79,23 @@ class UserController extends Controller
         $user = User::where('email', $email)->first();
 
         if ($user) {
-            $roleName = $user->role_name ?: optional($user->roles()->first())->name;
+            $roleName = trim((string) ($user->role_name ?: optional($user->roles()->first())->name));
 
-            return in_array(strtolower((string) $roleName), ['admin', 'protector', 'trainer'], true);
+            if (in_array(strtolower($roleName), ['admin', 'protector', 'trainer'], true)) {
+                return true;
+            }
         }
 
         $gameUser = GameUser::where('email', $email)->first();
-        $roleName = $gameUser?->game_role;
+        if (! $gameUser) {
+            return false;
+        }
 
-        return in_array(strtolower((string) $roleName), ['admin', 'protector', 'spy'], true);
+        $roleName = strtolower(trim((string) $gameUser->game_role));
+
+        return in_array($roleName, ['admin', 'protector', 'spy'], true)
+            || (bool) $gameUser->is_protector
+            || (bool) $gameUser->is_spy;
     }
 
     private function staffRoleName(User $user): string

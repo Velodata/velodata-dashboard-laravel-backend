@@ -165,7 +165,7 @@ class VelodataRegressionTest extends TestCase
         $this->assertSame($creator->email, $response->json('data.root.email'));
     }
 
-    public function test_account_drill_down_hides_spy_chain_nodes_from_non_protectors(): void
+    public function test_account_drill_down_admins_can_see_spy_chain_nodes(): void
     {
         $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN-SPY');
         $staffAdmin = $this->createStaffUser('account-drill-down-spy-admin@example.test', 'Admin');
@@ -185,10 +185,11 @@ class VelodataRegressionTest extends TestCase
             'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-SPY',
         ])->assertOk();
 
-        $this->assertSame('hidden_spy', $response->json('data.stop_reason'));
+        $this->assertSame('root_account', $response->json('data.stop_reason'));
         $this->assertSame($target->email, $response->json('data.chain.0.email'));
-        $this->assertNull($response->json('data.chain.1.email'));
-        $this->assertTrue($response->json('data.chain.1.redacted'));
+        $this->assertSame($spy->email, $response->json('data.chain.1.email'));
+        $this->assertSame('Spy', $response->json('data.chain.1.role_name'));
+        $this->assertFalse((bool) $response->json('data.chain.1.redacted'));
     }
 
     public function test_admin_notification_recipient_can_drill_down_matching_actor_when_enabled(): void
@@ -760,6 +761,31 @@ class VelodataRegressionTest extends TestCase
             'id' => $studentTarget->id,
             'display_name' => 'Spy Edited Student',
             'game_role' => 'Member',
+            'updated_by' => $spy->email,
+        ]);
+    }
+
+    public function test_game_user_spy_flag_can_manage_student_status_even_with_staff_email_collision(): void
+    {
+        $intakeId = $this->createIntake('TEST-SPY-FLAG-STATUS');
+        $spy = $this->createGameUser('spy-flag-status@example.test', 'Member', 'active', $intakeId);
+        $target = $this->createGameUser('spy-flag-status-target@example.test', 'Member', 'active', $intakeId);
+        $this->createStaffUser($spy->email, 'Member');
+
+        DB::table('game_users')
+            ->where('id', $spy->id)
+            ->update(['is_spy' => true]);
+
+        $this->postJson('/api/v2/VMD-ban-game-user', [
+            'id' => $target->id,
+            'vmd_user_email' => $spy->email,
+            'vmd_user_name' => $spy->display_name,
+            'vmd_audit_reason' => 'Regression Spy flag banned another Student',
+        ])->assertOk();
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $target->id,
+            'game_status' => 'BANNED',
             'updated_by' => $spy->email,
         ]);
     }
