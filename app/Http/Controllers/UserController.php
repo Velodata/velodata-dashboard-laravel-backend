@@ -98,6 +98,54 @@ class UserController extends Controller
             || (bool) $gameUser->is_spy;
     }
 
+    private function intakeGameSettingBoolean(?int $intakeId, string $key, bool $default = false): bool
+    {
+        if (! $intakeId || ! \Illuminate\Support\Facades\Schema::hasTable('game_intake_settings')) {
+            return $default;
+        }
+
+        $value = DB::table('game_intake_settings')
+            ->where('game_intake_id', $intakeId)
+            ->where('key', $key)
+            ->value('value');
+
+        return $value === null ? $default : filter_var($value, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    private function isProtectorEmail(?string $email): bool
+    {
+        if (! $email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+        if ($user && strcasecmp($this->staffRoleName($user), 'Protector') === 0) {
+            return true;
+        }
+
+        $gameUser = GameUser::where('email', $email)->first();
+
+        return $gameUser && strcasecmp((string) $gameUser->game_role, 'Protector') === 0;
+    }
+
+    private function canIdentifySpyUsers(?string $viewerEmail, ?int $intakeId): bool
+    {
+        return $this->isProtectorEmail($viewerEmail)
+            && $this->intakeGameSettingBoolean($intakeId, 'game_protector_spy_visibility', false);
+    }
+
+    private function canUseProtectorSpyControls(?string $viewerEmail, ?int $intakeId): bool
+    {
+        return $this->isProtectorEmail($viewerEmail)
+            && $this->intakeGameSettingBoolean($intakeId, 'game_protector_spy_controls', false);
+    }
+
+    private function isSpyGameUser(object $gameUser): bool
+    {
+        return strcasecmp((string) ($gameUser->game_role ?? ''), 'Spy') === 0
+            || (bool) ($gameUser->is_spy ?? false);
+    }
+
     private function staffRoleName(User $user): string
     {
         return (string) ($user->role_name ?: optional($user->roles()->first())->name);
@@ -194,24 +242,6 @@ class UserController extends Controller
         ], 423);
     }
 
-    private function intakeGameSettingBoolean(?int $intakeId, string $key, bool $default = false): bool
-    {
-        if (! $intakeId) {
-            return $default;
-        }
-
-        $value = DB::table('game_intake_settings')
-            ->where('game_intake_id', $intakeId)
-            ->where('key', $key)
-            ->value('value');
-
-        if ($value === null) {
-            return $default;
-        }
-
-        return filter_var($value, FILTER_VALIDATE_BOOLEAN);
-    }
-
     private function geoLockUserEditResponse(Request $request, ?int $intakeId, string $context)
     {
         if (! $intakeId || ! $this->intakeGameSettingBoolean($intakeId, 'security_geo_lock_user_edits', false)) {
@@ -264,6 +294,7 @@ class UserController extends Controller
         $viewer = $viewerEmail ? User::where('email', $viewerEmail)->first() : null;
         $viewerGameUser = (! $viewer && $viewerEmail) ? GameUser::where('email', $viewerEmail)->first() : null;
         $viewerCanAccessRequestedIntake = false;
+        $requestedIntakeId = $gameIntakeId ? (int) $gameIntakeId : null;
 
         if (! $gameIntakeId && ! $gameIntakeCode) {
             $viewerCanAccessRequestedIntake = true;
@@ -271,9 +302,16 @@ class UserController extends Controller
             $viewerCanAccessRequestedIntake = $this->staffCanAccessIntake($viewer, $gameIntakeId ? (int) $gameIntakeId : null, $gameIntakeCode);
         } elseif ($viewerGameUser) {
             $gameIntakeId = $viewerGameUser->intake_id;
+            $requestedIntakeId = (int) $viewerGameUser->intake_id;
             $gameIntakeCode = null;
             $viewerCanAccessRequestedIntake = true;
         }
+
+        if (! $requestedIntakeId && $gameIntakeCode) {
+            $requestedIntakeId = (int) DB::table('game_intakes')->where('code', $gameIntakeCode)->value('id') ?: null;
+        }
+
+        $viewerCanIdentifySpies = $this->canIdentifySpyUsers($viewerEmail, $requestedIntakeId);
 
         // Check if the include query parameter is set to roles
         $includeRoles = $request->query('include') === 'roles';
@@ -292,7 +330,13 @@ class UserController extends Controller
             ->keyBy(fn ($role) => strtolower($role->name));
         $fallbackGameUserRole = $rolesByName->get('creator') ?: $rolesByName->get('member');
 
-        $staffRows = $users->map(function ($user) {
+        $staffRows = $users
+            ->filter(function ($user) use ($viewerCanIdentifySpies) {
+                $roleName = $user->roles->name ?? $user->role_name;
+
+                return $viewerCanIdentifySpies || strcasecmp((string) $roleName, 'Spy') !== 0;
+            })
+            ->map(function ($user) {
             return [
                 'type' => 'users',
                 'id' => (string) $user->id,
@@ -344,6 +388,17 @@ class UserController extends Controller
                 $gameUsersQuery->where('game_intakes.code', $gameIntakeCode);
             } elseif ($gameIntakeId) {
                 $gameUsersQuery->where('game_users.intake_id', $gameIntakeId);
+            }
+
+            if (! $viewerCanIdentifySpies) {
+                $gameUsersQuery->where(function ($query) {
+                    $query
+                        ->whereRaw("LOWER(COALESCE(game_users.game_role, '')) <> ?", ['spy'])
+                        ->where(function ($query) {
+                            $query->whereNull('game_users.is_spy')
+                                ->orWhere('game_users.is_spy', false);
+                        });
+                });
             }
 
             $gameRows = $gameUsersQuery
@@ -830,6 +885,17 @@ class UserController extends Controller
             return response()->json([
                 'outcome' => 'FAIL',
                 'message' => 'Permission Denied: You can only update your own student profile unless you are Admin, Protector, Trainer, or Spy.',
+            ], 403);
+        }
+
+        if (
+            ! $isSelfUpdate &&
+            $this->isSpyGameUser($gameUser) &&
+            ! $this->canUseProtectorSpyControls($actorEmail, $gameUser->intake_id ? (int) $gameUser->intake_id : null)
+        ) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Protector spy controls must be enabled before Spy users can be edited.',
             ], 403);
         }
 

@@ -1479,6 +1479,314 @@ class VelodataRegressionTest extends TestCase
         ]);
     }
 
+    public function test_gmui_0303_protector_actor_impersonation_setting_can_be_saved(): void
+    {
+        $staffAdmin = $this->createStaffUser('gmui-0303-admin@example.test', 'Admin');
+        $intakeCode = 'TEST-GMUI-0303';
+        $intakeId = $this->createIntake($intakeCode);
+
+        $response = $this->postJson('/api/v2/VMD-save-intake-game-settings', [
+            'vmd_user_email' => $staffAdmin->email,
+            'game_intake_code' => $intakeCode,
+            'active_week' => 'week_3',
+            'settings' => [
+                'game_protector_actor_impersonation' => true,
+            ],
+        ])
+            ->assertOk()
+            ->assertJsonPath('selected_intake.activeWeek', 'week_3');
+
+        $setting = collect($response->json('settings'))
+            ->firstWhere('key', 'game_protector_actor_impersonation');
+
+        $this->assertSame(true, $setting['value'] ?? null);
+        $this->assertDatabaseHas('game_intake_settings', [
+            'game_intake_id' => $intakeId,
+            'key' => 'game_protector_actor_impersonation',
+            'value' => '1',
+        ]);
+
+        $this->postJson('/api/v2/VMD-save-intake-game-settings', [
+            'vmd_user_email' => $staffAdmin->email,
+            'game_intake_code' => $intakeCode,
+            'active_week' => 'week_3',
+            'settings' => [
+                'game_protector_actor_impersonation' => false,
+            ],
+        ])->assertOk();
+
+        $this->assertDatabaseHas('game_intake_settings', [
+            'game_intake_id' => $intakeId,
+            'key' => 'game_protector_actor_impersonation',
+            'value' => '0',
+        ]);
+    }
+
+    public function test_protector_actor_mask_is_email_based_and_requires_gmui_0303(): void
+    {
+        $intakeCode = 'TEST-PROTECTOR-MASK';
+        $otherIntakeCode = 'TEST-PROTECTOR-MASK-OTHER';
+        $intakeId = $this->createIntake($intakeCode);
+        $otherIntakeId = $this->createIntake($otherIntakeCode);
+        $staffProtector = $this->createStaffUser('mask-protector@example.test', 'Protector');
+        $student = $this->createGameUser('mask-student@example.test', 'Member', 'active', $intakeId);
+        $otherStudent = $this->createGameUser('mask-other-student@example.test', 'Member', 'active', $otherIntakeId);
+        $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '0', 'roles-spies');
+
+        $this->postJson('/api/v2/VMD-get-protector-actor-mask', [
+            'vmd_user_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+        ])->assertForbidden();
+
+        $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '1', 'roles-spies');
+
+        $loadResponse = $this->postJson('/api/v2/VMD-get-protector-actor-mask', [
+            'vmd_user_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+        ])->assertOk();
+
+        $studentEmails = collect($loadResponse->json('students'))->pluck('email')->all();
+        $this->assertContains($student->email, $studentEmails);
+        $this->assertNotContains($otherStudent->email, $studentEmails);
+
+        $this->postJson('/api/v2/VMD-save-protector-actor-mask', [
+            'vmd_user_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+            'masked_as_email' => $otherStudent->email,
+        ])->assertStatus(422);
+
+        $this->postJson('/api/v2/VMD-save-protector-actor-mask', [
+            'vmd_user_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+            'masked_as_email' => $student->email,
+        ])
+            ->assertOk()
+            ->assertJsonPath('enabled', true)
+            ->assertJsonPath('masked_as_email', $student->email);
+
+        $this->assertDatabaseHas('protector_actor_masks', [
+            'protector_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+            'masked_as_email' => $student->email,
+            'enabled' => 1,
+        ]);
+
+        $this->postJson('/api/v2/VMD-save-protector-actor-mask', [
+            'vmd_user_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+            'masked_as_email' => '',
+        ])
+            ->assertOk()
+            ->assertJsonPath('enabled', false);
+
+        $this->assertDatabaseHas('protector_actor_masks', [
+            'protector_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+            'masked_as_email' => null,
+            'enabled' => 0,
+        ]);
+    }
+
+    public function test_audit_history_displays_enabled_protector_actor_mask_without_rewriting_audit_row(): void
+    {
+        $intakeCode = 'TEST-PROTECTOR-AUDIT-MASK';
+        $intakeId = $this->createIntake($intakeCode);
+        $staffAdmin = $this->createStaffUser('audit-mask-admin@example.test', 'Admin');
+        $staffProtector = $this->createStaffUser('audit-mask-protector@example.test', 'Protector');
+        $target = $this->createGameUser('audit-mask-target@example.test', 'Member', 'active', $intakeId);
+        $maskedStudent = $this->createGameUser('audit-mask-student@example.test', 'Member', 'active', $intakeId);
+
+        $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '1', 'roles-spies');
+
+        DB::table('protector_actor_masks')->insert([
+            'protector_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+            'masked_as_email' => $maskedStudent->email,
+            'enabled' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $auditHistoryId = DB::table('user_audit_history')->insertGetId([
+            'custno' => 900000 + (int) $target->id,
+            'comments' => 'Protector edited target while masked',
+            'clerk_id' => $staffProtector->name,
+            'created_by_email' => $staffProtector->email,
+            'created_by_ip_address' => '127.0.0.1',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+            'game_intake_code' => $intakeCode,
+        ])->assertOk();
+
+        $row = collect($response->json('data'))
+            ->firstWhere('id', $auditHistoryId);
+
+        $this->assertSame($maskedStudent->email, $row['attributes']['created_by_email'] ?? null);
+        $this->assertSame($maskedStudent->display_name, $row['attributes']['clerk_id'] ?? null);
+        $this->assertSame($staffProtector->email, $row['attributes']['actual_created_by_email'] ?? null);
+        $this->assertSame($staffProtector->name, $row['attributes']['actual_clerk_id'] ?? null);
+        $this->assertTrue($row['attributes']['actor_appearance_applied'] ?? false);
+
+        $this->assertDatabaseHas('user_audit_history', [
+            'id' => $auditHistoryId,
+            'created_by_email' => $staffProtector->email,
+            'clerk_id' => $staffProtector->name,
+        ]);
+
+        $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '0', 'roles-spies');
+
+        $unmaskedResponse = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+            'game_intake_code' => $intakeCode,
+        ])->assertOk();
+
+        $unmaskedRow = collect($unmaskedResponse->json('data'))
+            ->firstWhere('id', $auditHistoryId);
+
+        $this->assertSame($staffProtector->email, $unmaskedRow['attributes']['created_by_email'] ?? null);
+        $this->assertSame($staffProtector->name, $unmaskedRow['attributes']['clerk_id'] ?? null);
+        $this->assertFalse($unmaskedRow['attributes']['actor_appearance_applied'] ?? true);
+    }
+
+    public function test_online_users_response_displays_enabled_protector_actor_mask_for_requested_intake(): void
+    {
+        $intakeCode = 'TEST-PROTECTOR-ONLINE-MASK';
+        $intakeId = $this->createIntake($intakeCode);
+        $staffProtector = $this->createStaffUser('online-mask-protector@example.test', 'Protector');
+        $maskedStudent = $this->createGameUser('online-mask-student@example.test', 'Member', 'active', $intakeId);
+
+        $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '1', 'roles-spies');
+
+        DB::table('protector_actor_masks')->insert([
+            'protector_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+            'masked_as_email' => $maskedStudent->email,
+            'enabled' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        DB::table('user_presence')->insert([
+            'identity_type' => 'staff',
+            'user_id' => $staffProtector->id,
+            'game_user_id' => null,
+            'presence_key' => 'staff:' . $staffProtector->id,
+            'email' => $staffProtector->email,
+            'name' => $staffProtector->name,
+            'ip_address' => '127.0.0.1',
+            'ip_address_v4' => '127.0.0.1',
+            'current_path' => '/examples-api/user-management',
+            'last_seen_at' => now(),
+            'heartbeat_count' => 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-online-users', [
+            'game_intake_code' => $intakeCode,
+        ])->assertOk();
+
+        $presence = collect($response->json('data'))
+            ->firstWhere('presence_key', 'staff:' . $staffProtector->id);
+
+        $this->assertSame($staffProtector->email, $presence['email'] ?? null);
+        $this->assertSame($staffProtector->name, $presence['name'] ?? null);
+        $this->assertSame($maskedStudent->email, $presence['display_email'] ?? null);
+        $this->assertSame($maskedStudent->display_name, $presence['display_name'] ?? null);
+        $this->assertSame($staffProtector->email, $presence['actual_email'] ?? null);
+        $this->assertTrue($presence['actor_appearance_applied'] ?? false);
+
+        $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '0', 'roles-spies');
+
+        $unmaskedResponse = $this->postJson('/api/v2/VMD-get-online-users', [
+            'game_intake_code' => $intakeCode,
+        ])->assertOk();
+
+        $unmaskedPresence = collect($unmaskedResponse->json('data'))
+            ->firstWhere('presence_key', 'staff:' . $staffProtector->id);
+
+        $this->assertSame($staffProtector->email, $unmaskedPresence['display_email'] ?? null);
+        $this->assertSame($staffProtector->name, $unmaskedPresence['display_name'] ?? null);
+        $this->assertFalse($unmaskedPresence['actor_appearance_applied'] ?? true);
+    }
+
+    public function test_user_notifications_display_enabled_protector_actor_mask_without_rewriting_notification(): void
+    {
+        $intakeCode = 'TEST-PROTECTOR-NOTIFICATION-MASK';
+        $intakeId = $this->createIntake($intakeCode);
+        $staffProtector = $this->createStaffUser('notification-mask-protector@example.test', 'Protector');
+        $recipient = $this->createGameUser('notification-mask-recipient@example.test', 'Member', 'active', $intakeId);
+        $maskedStudent = $this->createGameUser('notification-mask-student@example.test', 'Spy', 'active', $intakeId);
+
+        $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '1', 'roles-spies');
+
+        DB::table('protector_actor_masks')->insert([
+            'protector_email' => $staffProtector->email,
+            'game_intake_code' => $intakeCode,
+            'masked_as_email' => $maskedStudent->email,
+            'enabled' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $notificationId = DB::table('user_notifications')->insertGetId([
+            'recipient_email' => $recipient->email,
+            'actor_email' => $staffProtector->email,
+            'type' => 'info',
+            'title' => 'Role changed',
+            'message' => "Your role was changed from Member to Creator by {$staffProtector->name}.",
+            'source' => 'user-management',
+            'metadata' => json_encode([
+                'actorEmail' => $staffProtector->email,
+                'actorName' => $staffProtector->name,
+                'actorIntakeCode' => $intakeCode,
+            ]),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-notifications', [
+            'email' => $recipient->email,
+        ])->assertOk();
+
+        $notification = collect($response->json('data'))
+            ->firstWhere('id', (string) $notificationId);
+
+        $this->assertSame($maskedStudent->email, $notification['metadata']['actorEmail'] ?? null);
+        $this->assertSame($maskedStudent->display_name, $notification['metadata']['actorName'] ?? null);
+        $this->assertSame('student', $notification['metadata']['actorIdentityType'] ?? null);
+        $this->assertSame($staffProtector->email, $notification['metadata']['actualActorEmail'] ?? null);
+        $this->assertStringContainsString("by {$maskedStudent->display_name}", $notification['message'] ?? '');
+        $this->assertTrue($notification['metadata']['actor_appearance_applied'] ?? false);
+
+        $this->assertDatabaseHas('user_notifications', [
+            'id' => $notificationId,
+            'actor_email' => $staffProtector->email,
+            'message' => "Your role was changed from Member to Creator by {$staffProtector->name}.",
+        ]);
+
+        $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '0', 'roles-spies');
+
+        $unmaskedResponse = $this->postJson('/api/v2/VMD-get-notifications', [
+            'email' => $recipient->email,
+        ])->assertOk();
+
+        $unmaskedNotification = collect($unmaskedResponse->json('data'))
+            ->firstWhere('id', (string) $notificationId);
+
+        $this->assertSame($staffProtector->email, $unmaskedNotification['metadata']['actorEmail'] ?? null);
+        $this->assertSame($staffProtector->name, $unmaskedNotification['metadata']['actorName'] ?? null);
+        $this->assertStringContainsString("by {$staffProtector->name}", $unmaskedNotification['message'] ?? '');
+    }
+
     public function test_gmui_pane_01_geo_lock_blocks_edit_user_actions_from_outside_australia(): void
     {
         $intakeCode = 'TEST-GMUI-0103';
@@ -1606,7 +1914,7 @@ class VelodataRegressionTest extends TestCase
         $this->assertNull(DB::table('game_users')->where('id', $studentTarget->id)->value('profile_image'));
     }
 
-    public function test_spy_actors_are_hidden_from_audit_history_performed_by_unless_viewer_is_protector(): void
+    public function test_spy_actors_are_hidden_from_audit_history_until_spy_visibility_is_enabled(): void
     {
         $intakeId = $this->createIntake('TEST-SPY-AUDIT-ACTOR');
         $staffAdmin = $this->createStaffUser('spy-audit-admin@example.test', 'Admin');
@@ -1616,6 +1924,7 @@ class VelodataRegressionTest extends TestCase
         $normalActor = $this->createGameUser('normal-audit-actor@example.test', 'Creator', 'active', $intakeId);
         $target = $this->createGameUser('spy-audit-target@example.test', 'Creator', 'active', $intakeId);
         $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_protector_spy_visibility', '0', 'roles-spies');
 
         DB::table('user_audit_history')->insert([
             [
@@ -1657,8 +1966,21 @@ class VelodataRegressionTest extends TestCase
         $protectorActorEmails = collect($protectorResponse->json('data'))
             ->pluck('attributes.created_by_email')
             ->all();
-        $this->assertContains($spyActor->email, $protectorActorEmails);
+        $this->assertNotContains($spyActor->email, $protectorActorEmails);
         $this->assertContains($normalActor->email, $protectorActorEmails);
+
+        $this->setIntakeGameSetting($intakeId, 'game_protector_spy_visibility', '1', 'roles-spies');
+
+        $protectorVisibilityResponse = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffProtector->email,
+            'game_intake_id' => $intakeId,
+        ])->assertOk();
+
+        $protectorVisibleActorEmails = collect($protectorVisibilityResponse->json('data'))
+            ->pluck('attributes.created_by_email')
+            ->all();
+        $this->assertContains($spyActor->email, $protectorVisibleActorEmails);
+        $this->assertContains($normalActor->email, $protectorVisibleActorEmails);
 
         $studentProtectorResponse = $this->postJson('/api/v2/VMD-get-audit-history', [
             'email' => $studentProtector->email,
@@ -1672,7 +1994,7 @@ class VelodataRegressionTest extends TestCase
         $this->assertContains($normalActor->email, $studentProtectorActorEmails);
     }
 
-    public function test_spy_users_are_hidden_from_login_history_unless_viewer_is_protector(): void
+    public function test_spy_users_are_hidden_from_login_history_until_spy_visibility_is_enabled(): void
     {
         $intakeId = $this->createIntake('TEST-SPY-LOGIN-HISTORY');
         $staffAdmin = $this->createStaffUser('spy-login-admin@example.test', 'Admin');
@@ -1681,6 +2003,7 @@ class VelodataRegressionTest extends TestCase
         $spyUser = $this->createGameUser('spy-login-user@example.test', 'Spy', 'active', $intakeId);
         $normalUser = $this->createGameUser('normal-login-user@example.test', 'Creator', 'active', $intakeId);
         $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_protector_spy_visibility', '0', 'roles-spies');
 
         DB::table('user_login_history')->insert([
             [
@@ -1724,8 +2047,22 @@ class VelodataRegressionTest extends TestCase
         $protectorLoginEmails = collect($protectorResponse->json('data'))
             ->pluck('attributes.email')
             ->all();
-        $this->assertContains($spyUser->email, $protectorLoginEmails);
+        $this->assertNotContains($spyUser->email, $protectorLoginEmails);
         $this->assertContains($normalUser->email, $protectorLoginEmails);
+
+        $this->setIntakeGameSetting($intakeId, 'game_protector_spy_visibility', '1', 'roles-spies');
+
+        $protectorVisibilityResponse = $this->postJson('/api/v2/VMD-get-login-history', [
+            'email' => $staffProtector->email,
+            'method' => 'all users',
+            'game_intake_id' => $intakeId,
+        ])->assertOk();
+
+        $protectorVisibleLoginEmails = collect($protectorVisibilityResponse->json('data'))
+            ->pluck('attributes.email')
+            ->all();
+        $this->assertContains($spyUser->email, $protectorVisibleLoginEmails);
+        $this->assertContains($normalUser->email, $protectorVisibleLoginEmails);
 
         $studentProtectorResponse = $this->postJson('/api/v2/VMD-get-login-history', [
             'email' => $studentProtector->email,
@@ -1738,6 +2075,97 @@ class VelodataRegressionTest extends TestCase
             ->all();
         $this->assertContains($spyUser->email, $studentProtectorLoginEmails);
         $this->assertContains($normalUser->email, $studentProtectorLoginEmails);
+    }
+
+    public function test_spy_users_are_hidden_from_user_management_until_spy_visibility_is_enabled(): void
+    {
+        $intakeId = $this->createIntake('TEST-SPY-USER-MANAGEMENT');
+        $staffProtector = $this->createStaffUser('spy-user-management-protector@example.test', 'Protector');
+        $staffSpy = $this->createStaffUser('spy-user-management-staff-spy@example.test', 'Spy');
+        $spyUser = $this->createGameUser('spy-user-management-spy@example.test', 'Spy', 'active', $intakeId);
+        $normalUser = $this->createGameUser('spy-user-management-normal@example.test', 'Creator', 'active', $intakeId);
+        $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_protector_spy_visibility', '0', 'roles-spies');
+
+        $hiddenResponse = $this->getJson('/api/v2/users?include=roles&game_intake_id=' . $intakeId . '&vmd_user_email=' . urlencode($staffProtector->email))
+            ->assertOk();
+
+        $hiddenEmails = collect($hiddenResponse->json('data'))
+            ->pluck('attributes.email')
+            ->all();
+        $this->assertNotContains($staffSpy->email, $hiddenEmails);
+        $this->assertNotContains($spyUser->email, $hiddenEmails);
+        $this->assertContains($normalUser->email, $hiddenEmails);
+
+        $this->setIntakeGameSetting($intakeId, 'game_protector_spy_visibility', '1', 'roles-spies');
+
+        $visibleResponse = $this->getJson('/api/v2/users?include=roles&game_intake_id=' . $intakeId . '&vmd_user_email=' . urlencode($staffProtector->email))
+            ->assertOk();
+
+        $visibleEmails = collect($visibleResponse->json('data'))
+            ->pluck('attributes.email')
+            ->all();
+        $this->assertContains($staffSpy->email, $visibleEmails);
+        $this->assertContains($spyUser->email, $visibleEmails);
+        $this->assertContains($normalUser->email, $visibleEmails);
+    }
+
+    public function test_protectors_cannot_edit_ban_or_delete_spies_until_protector_spy_controls_are_enabled(): void
+    {
+        $intakeId = $this->createIntake('TEST-SPY-ACTION-CONTROLS');
+        $staffProtector = $this->createStaffUser('spy-action-protector@example.test', 'Protector');
+        $spyUser = $this->createGameUser('spy-action-target@example.test', 'Spy', 'active', $intakeId);
+        $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
+        $this->setIntakeGameSetting($intakeId, 'game_protector_spy_controls', '0', 'roles-spies');
+
+        $this->postJson('/api/v2/VMD-update-game-user-basic-info', [
+            'id' => $spyUser->id,
+            'email' => $spyUser->email,
+            'name' => 'Blocked Spy Edit',
+            'gender' => 'Other',
+            'location' => 'Blocked',
+            'phone_no' => '0400000000',
+            'languages' => ['English'],
+            'role_name' => 'Spy',
+            'vmd_audit_reason' => 'Regression blocked Spy edit',
+            'vmd_user_email' => $staffProtector->email,
+            'vmd_user_name' => $staffProtector->name,
+        ])->assertForbidden();
+
+        $this->postJson('/api/v2/VMD-ban-game-user', [
+            'id' => $spyUser->id,
+            'vmd_user_email' => $staffProtector->email,
+            'vmd_user_name' => $staffProtector->name,
+            'vmd_audit_reason' => 'Regression blocked Spy ban',
+        ])->assertForbidden();
+
+        $this->postJson('/api/v2/VMD-delete-game-user', [
+            'id' => $spyUser->id,
+            'vmd_user_email' => $staffProtector->email,
+            'vmd_user_name' => $staffProtector->name,
+            'vmd_audit_reason' => 'Regression blocked Spy delete',
+        ])->assertForbidden();
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $spyUser->id,
+            'display_name' => $spyUser->display_name,
+            'game_status' => 'active',
+        ]);
+
+        $this->setIntakeGameSetting($intakeId, 'game_protector_spy_controls', '1', 'roles-spies');
+
+        $this->postJson('/api/v2/VMD-ban-game-user', [
+            'id' => $spyUser->id,
+            'vmd_user_email' => $staffProtector->email,
+            'vmd_user_name' => $staffProtector->name,
+            'vmd_audit_reason' => 'Regression allowed Spy ban',
+        ])->assertOk();
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $spyUser->id,
+            'game_status' => 'BANNED',
+            'updated_by' => $staffProtector->email,
+        ]);
     }
 
     public function test_login_history_returns_joined_profile_images_without_frontend_user_data_lookup(): void

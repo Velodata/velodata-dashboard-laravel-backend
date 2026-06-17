@@ -401,6 +401,99 @@ class CustomController extends Controller
             || (bool) $gameUser->is_spy;
     }
 
+    private function isProtectorEmail(?string $email): bool
+    {
+        if (! $email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+        if ($user && strcasecmp($this->staffRoleName($user), 'Protector') === 0) {
+            return true;
+        }
+
+        $gameUser = $this->actorGameUser($email);
+
+        return $gameUser && strcasecmp((string) $gameUser->game_role, 'Protector') === 0;
+    }
+
+    private function isSpyGameUser(object $gameUser): bool
+    {
+        return strcasecmp((string) ($gameUser->game_role ?? ''), 'Spy') === 0
+            || (bool) ($gameUser->is_spy ?? false);
+    }
+
+    private function canIdentifySpyUsers(?string $viewerEmail, ?int $intakeId): bool
+    {
+        return $this->isProtectorEmail($viewerEmail)
+            && $this->intakeGameSettingBoolean($intakeId, 'game_protector_spy_visibility', false);
+    }
+
+    private function canUseProtectorSpyControls(?string $viewerEmail, ?int $intakeId): bool
+    {
+        return $this->isProtectorEmail($viewerEmail)
+            && $this->intakeGameSettingBoolean($intakeId, 'game_protector_spy_controls', false);
+    }
+
+    private function canUseProtectorActorImpersonation(?string $viewerEmail, ?int $intakeId): bool
+    {
+        return $this->isProtectorEmail($viewerEmail)
+            && $this->intakeGameSettingBoolean($intakeId, 'game_protector_actor_impersonation', false);
+    }
+
+    private function protectorActorMaskForDisplay(?string $actorEmail, ?string $intakeCode): ?array
+    {
+        $actorEmail = $actorEmail ? strtolower(trim($actorEmail)) : '';
+        $intakeCode = $intakeCode ? trim($intakeCode) : '';
+
+        if ($actorEmail === '' || $intakeCode === '' || ! Schema::hasTable('protector_actor_masks')) {
+            return null;
+        }
+
+        $intake = DB::table('game_intakes')->where('code', $intakeCode)->first();
+        if (! $intake || ! $this->canUseProtectorActorImpersonation($actorEmail, (int) $intake->id)) {
+            return null;
+        }
+
+        $mask = DB::table('protector_actor_masks')
+            ->where('protector_email', $actorEmail)
+            ->where('game_intake_code', $intakeCode)
+            ->where('enabled', true)
+            ->first();
+
+        if (! $mask || ! $mask->masked_as_email) {
+            return null;
+        }
+
+        $maskedStudent = DB::table('game_users')
+            ->where('intake_id', $intake->id)
+            ->where('email', strtolower(trim($mask->masked_as_email)))
+            ->first();
+
+        if (! $maskedStudent) {
+            return null;
+        }
+
+        $displayName = $maskedStudent->display_name
+            ?: trim(($maskedStudent->preferred_name ?: $maskedStudent->first_name) . ' ' . $maskedStudent->surname);
+
+        return [
+            'name' => $displayName ?: $maskedStudent->email,
+            'email' => $maskedStudent->email,
+            'role_name' => $maskedStudent->game_role,
+            'profile_image' => $maskedStudent->profile_image,
+        ];
+    }
+
+    private function intakeCodeFromHistoryScope(array $scope): ?string
+    {
+        return match ($scope['mode'] ?? 'none') {
+            'single_code' => $scope['code'],
+            'single_id' => DB::table('game_intakes')->where('id', (int) $scope['id'])->value('code'),
+            default => null,
+        };
+    }
+
     private function canViewAccountDrillDown(?string $email): bool
     {
         if (! $email) {
@@ -983,6 +1076,15 @@ class CustomController extends Controller
                 }
             });
         });
+    }
+
+    private function intakeIdFromHistoryScope(array $scope): ?int
+    {
+        return match ($scope['mode'] ?? 'none') {
+            'single_id' => (int) $scope['id'],
+            'single_code' => (int) DB::table('game_intakes')->where('code', $scope['code'])->value('id') ?: null,
+            default => null,
+        };
     }
 
     public function F0_VMD_get_staff_game_intakes(Request $request)
@@ -2076,11 +2178,42 @@ class CustomController extends Controller
             $metadata['updatedBy'] = $actorUser->email ?? $actorGameUser->email;
         }
 
+        $actorMask = $this->protectorActorMaskForDisplay(
+            $row->actor_email,
+            $metadata['actorIntakeCode']
+                ?? $metadata['targetIntakeCode']
+                ?? $metadata['gameIntakeCode']
+                ?? $metadata['game_intake_code']
+                ?? $metadata['intake_code']
+                ?? null
+        );
+        $message = $row->message ?? '';
+
+        if ($actorMask) {
+            $actualActorEmail = $metadata['actorEmail'] ?? $row->actor_email;
+            $actualActorName = $metadata['actorName'] ?? $row->actor_email;
+            $displayActor = $actorMask['name'] ?: $actorMask['email'];
+
+            $metadata['actualActorEmail'] = $actualActorEmail;
+            $metadata['actualActorName'] = $actualActorName;
+            $metadata['actorEmail'] = $actorMask['email'];
+            $metadata['updatedBy'] = $actorMask['email'];
+            $metadata['actorName'] = $actorMask['name'];
+            $metadata['actorRole'] = $actorMask['role_name'];
+            $metadata['actorIdentityType'] = 'student';
+            $metadata['actorImage'] = $actorMask['profile_image'] ?? '';
+            $metadata['actor_appearance_applied'] = true;
+
+            foreach (array_filter([$actualActorEmail, $actualActorName]) as $actualActorLabel) {
+                $message = str_replace("by {$actualActorLabel}", "by {$displayActor}", $message);
+            }
+        }
+
         return [
             'id' => (string) $row->id,
             'type' => $row->type,
             'title' => $row->title,
-            'message' => $row->message ?? '',
+            'message' => $message,
             'source' => $row->source,
             'metadata' => $metadata,
             'read' => $row->read_at !== null,
@@ -3331,12 +3464,11 @@ class CustomController extends Controller
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
         $ipAddressFilter = trim((string) ($request->input('ip_address') ?: $request->query('ip_address') ?: ''));
-        $viewer = DB::table('users')->where('email', $email)->first();
-        $viewerGameUser = $viewer ? null : DB::table('game_users')->where('email', $email)->first();
-        $canViewSpyLoginRows =
-            ($viewer && strcasecmp((string) $viewer->role_name, 'Protector') === 0) ||
-            ($viewerGameUser && strcasecmp((string) $viewerGameUser->game_role, 'Protector') === 0);
         $historyIntakeScope = $this->historyIntakeScope($email, $gameIntakeId, $gameIntakeCode);
+        $canViewSpyLoginRows = $this->canIdentifySpyUsers(
+            $email,
+            $this->intakeIdFromHistoryScope($historyIntakeScope)
+        );
 
         // Get the total number of records in the table
         $recordsTotal = DB::table('user_login_history')->count();
@@ -3481,12 +3613,12 @@ class CustomController extends Controller
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
         $ipAddressFilter = trim((string) ($request->input('ip_address') ?: $request->query('ip_address') ?: ''));
         $viewer = $requestEmail ? DB::table('users')->where('email', $requestEmail)->first() : null;
-        $viewerGameUser = ($requestEmail && ! $viewer) ? DB::table('game_users')->where('email', $requestEmail)->first() : null;
         $canViewProtectedSecurityAudits = $viewer && in_array($viewer->role_name, ['Admin', 'Protector', 'Trainer'], true);
-        $canViewSpyAuditRows =
-            ($viewer && strcasecmp((string) $viewer->role_name, 'Protector') === 0) ||
-            ($viewerGameUser && strcasecmp((string) $viewerGameUser->game_role, 'Protector') === 0);
         $historyIntakeScope = $this->historyIntakeScope($requestEmail, $gameIntakeId, $gameIntakeCode);
+        $canViewSpyAuditRows = $this->canIdentifySpyUsers(
+            $requestEmail,
+            $this->intakeIdFromHistoryScope($historyIntakeScope)
+        );
 
 
         $auditHistoryQuery = DB::table('user_audit_history')
@@ -3501,7 +3633,8 @@ class CustomController extends Controller
                 DB::raw('COALESCE(users.email, game_users.email) as target_email'),
                 DB::raw('COALESCE(users.role_name, game_users.game_role) as target_role_name'),
                 DB::raw('COALESCE(actor_users.role_name, actor_game_users.game_role) as actor_role_name'),
-                DB::raw('COALESCE(actor_users.profile_image, actor_game_users.profile_image) as actor_profile_image')
+                DB::raw('COALESCE(actor_users.profile_image, actor_game_users.profile_image) as actor_profile_image'),
+                DB::raw('game_intakes.code as target_intake_code')
             );
 
         $auditHistoryQuery = $this->applyHistoryIntakeScope($auditHistoryQuery, $historyIntakeScope);
@@ -3546,8 +3679,14 @@ class CustomController extends Controller
         }
 
         // Transform data using collections
-        $audit_history_array = $audit_history_list->map(function ($row) {
+        $scopeIntakeCode = $this->intakeCodeFromHistoryScope($historyIntakeScope);
+
+        $audit_history_array = $audit_history_list->map(function ($row) use ($scopeIntakeCode) {
             $permanentDeleteTarget = $this->permanentDeleteAuditTarget($row->comments);
+            $actorMask = $this->protectorActorMaskForDisplay(
+                $row->created_by_email,
+                $row->target_intake_code ?: $scopeIntakeCode
+            );
 
             return [
                 "type" => 'user_audit_history',
@@ -3555,14 +3694,17 @@ class CustomController extends Controller
                 'attributes' => [
                     "custno" => $row->custno,
                     "comments" => $row->comments,
-                    "created_by_email" => $row->created_by_email,
-                    "clerk_id" => $row->clerk_id,
+                    "created_by_email" => $actorMask['email'] ?? $row->created_by_email,
+                    "clerk_id" => $actorMask['name'] ?? $row->clerk_id,
+                    "actual_created_by_email" => $actorMask ? $row->created_by_email : null,
+                    "actual_clerk_id" => $actorMask ? $row->clerk_id : null,
                     "created_by_ip_address" => $row->created_by_ip_address,
                     "target_name" => $row->target_name ?: $permanentDeleteTarget['target_name'],
                     "target_email" => $row->target_email ?: $permanentDeleteTarget['target_email'],
                     "target_role_name" => $row->target_role_name,
-                    "actor_role_name" => $row->actor_role_name,
-                    "actor_profile_image" => $row->actor_profile_image,
+                    "actor_role_name" => $actorMask['role_name'] ?? $row->actor_role_name,
+                    "actor_profile_image" => $actorMask['profile_image'] ?? $row->actor_profile_image,
+                    "actor_appearance_applied" => (bool) $actorMask,
                     // "user_city" => $row->user_city,
                     // "user_region" => $row->user_region,
                     // "user_country" => $row->user_country,
@@ -4050,6 +4192,17 @@ if ($validator->fails()) {
             ], 403);
         }
 
+        if (
+            ! $isSelfUpdate &&
+            $this->isSpyGameUser($gameUser) &&
+            ! $this->canUseProtectorSpyControls($data['vmd_user_email'], $gameUser->intake_id ? (int) $gameUser->intake_id : null)
+        ) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Protector spy controls must be enabled before Spy users can be edited.',
+            ], 403);
+        }
+
         if (isset($data['role_name']) && strcasecmp((string) $data['role_name'], 'Trainer') === 0) {
             return response()->json([
                 'outcome' => 'FAIL',
@@ -4349,6 +4502,17 @@ if ($validator->fails()) {
             ], 403);
         }
 
+        if (
+            in_array($status, ['BANNED', 'DELETED'], true)
+            && $this->isSpyGameUser($gameUser)
+            && ! $this->canUseProtectorSpyControls($data['vmd_user_email'], $gameUser->intake_id ? (int) $gameUser->intake_id : null)
+        ) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Protector spy controls must be enabled before Spy users can be banned or deleted.',
+            ], 403);
+        }
+
         $previousStatus = strtoupper((string) $gameUser->game_status);
         $targetWasActive = $previousStatus === 'ACTIVE';
 
@@ -4495,6 +4659,16 @@ if ($validator->fails()) {
                 'outcome' => 'FAIL',
                 'message' => 'Only users already marked DELETED can be permanently deleted.',
             ], 409);
+        }
+
+        if (
+            $this->isSpyGameUser($gameUser) &&
+            ! $this->canUseProtectorSpyControls($data['vmd_user_email'], $gameUser->intake_id ? (int) $gameUser->intake_id : null)
+        ) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Protector spy controls must be enabled before Spy users can be deleted.',
+            ], 403);
         }
 
         DB::table('user_audit_history')->insert([
@@ -4828,6 +5002,144 @@ if ($validator->fails()) {
         ]);
     }
 
+    public function F0_VMD_get_protector_actor_mask(Request $request)
+    {
+        $request->validate([
+            'vmd_user_email' => 'required|email',
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
+        ]);
+
+        if (! Schema::hasTable('protector_actor_masks')) {
+            return response()->json([
+                'outcome' => 'ERROR: Protector actor mask table is missing.',
+                'message' => 'Protector actor mask table is missing. Run migrations.',
+            ], 500);
+        }
+
+        $protectorEmail = strtolower(trim($request->input('vmd_user_email')));
+        $gameIntakeCode = trim($request->input('game_intake_code'));
+        $intake = DB::table('game_intakes')->where('code', $gameIntakeCode)->first();
+
+        if (! $intake || ! $this->canUseProtectorActorImpersonation($protectorEmail, (int) $intake->id)) {
+            return response()->json([
+                'outcome' => 'ERROR: Protector appearance is not available.',
+                'message' => 'Protector appearance requires Protector access and GMUI 03.03.',
+            ], 403);
+        }
+
+        $staffProtector = User::where('email', $protectorEmail)->first();
+        if ($staffProtector && ! $this->staffCanAccessIntake($staffProtector, null, $gameIntakeCode)) {
+            return response()->json([
+                'outcome' => 'ERROR: Class Intake not available.',
+                'message' => 'You do not have access to that Class Intake.',
+            ], 403);
+        }
+
+        $mask = DB::table('protector_actor_masks')
+            ->where('protector_email', $protectorEmail)
+            ->where('game_intake_code', $gameIntakeCode)
+            ->first();
+
+        $students = DB::table('game_users')
+            ->where('intake_id', $intake->id)
+            ->orderBy('display_name')
+            ->orderBy('email')
+            ->get(['email', 'display_name', 'game_role', 'game_status'])
+            ->map(function ($student) {
+                return [
+                    'email' => $student->email,
+                    'name' => $student->display_name ?: $student->email,
+                    'role_name' => $student->game_role,
+                    'status' => strtoupper((string) $student->game_status),
+                ];
+            })
+            ->values();
+
+        $maskEnabled = (bool) ($mask->enabled ?? false);
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Protector actor mask loaded.',
+            'game_intake_code' => $gameIntakeCode,
+            'enabled' => $maskEnabled,
+            'masked_as_email' => $maskEnabled ? ($mask->masked_as_email ?? '') : '',
+            'students' => $students,
+        ]);
+    }
+
+    public function F0_VMD_save_protector_actor_mask(Request $request)
+    {
+        $request->validate([
+            'vmd_user_email' => 'required|email',
+            'game_intake_code' => 'required|string|exists:game_intakes,code',
+            'masked_as_email' => 'nullable|email',
+        ]);
+
+        if (! Schema::hasTable('protector_actor_masks')) {
+            return response()->json([
+                'outcome' => 'ERROR: Protector actor mask table is missing.',
+                'message' => 'Protector actor mask table is missing. Run migrations.',
+            ], 500);
+        }
+
+        $protectorEmail = strtolower(trim($request->input('vmd_user_email')));
+        $gameIntakeCode = trim($request->input('game_intake_code'));
+        $maskedAsEmail = strtolower(trim((string) $request->input('masked_as_email', '')));
+        $intake = DB::table('game_intakes')->where('code', $gameIntakeCode)->first();
+
+        if (! $intake || ! $this->canUseProtectorActorImpersonation($protectorEmail, (int) $intake->id)) {
+            return response()->json([
+                'outcome' => 'ERROR: Protector appearance is not available.',
+                'message' => 'Protector appearance requires Protector access and GMUI 03.03.',
+            ], 403);
+        }
+
+        $staffProtector = User::where('email', $protectorEmail)->first();
+        if ($staffProtector && ! $this->staffCanAccessIntake($staffProtector, null, $gameIntakeCode)) {
+            return response()->json([
+                'outcome' => 'ERROR: Class Intake not available.',
+                'message' => 'You do not have access to that Class Intake.',
+            ], 403);
+        }
+
+        $maskedStudent = null;
+        if ($maskedAsEmail !== '') {
+            $maskedStudent = DB::table('game_users')
+                ->where('intake_id', $intake->id)
+                ->where('email', $maskedAsEmail)
+                ->first();
+
+            if (! $maskedStudent) {
+                return response()->json([
+                    'outcome' => 'ERROR: Invalid Protector appearance.',
+                    'message' => 'Choose a Student email from this Class Intake.',
+                ], 422);
+            }
+        }
+
+        DB::table('protector_actor_masks')->updateOrInsert(
+            [
+                'protector_email' => $protectorEmail,
+                'game_intake_code' => $gameIntakeCode,
+            ],
+            [
+                'masked_as_email' => $maskedAsEmail ?: null,
+                'enabled' => $maskedAsEmail !== '',
+                'updated_at' => now(),
+                'created_at' => now(),
+            ]
+        );
+
+        return response()->json([
+            'outcome' => 'SUCCESS: Protector actor mask saved.',
+            'game_intake_code' => $gameIntakeCode,
+            'enabled' => $maskedAsEmail !== '',
+            'masked_as_email' => $maskedAsEmail,
+            'masked_as_name' => $maskedStudent
+                ? ($maskedStudent->display_name ?: $maskedStudent->email)
+                : '',
+        ]);
+    }
+
     public function F0_VMD_get_user_table_baselines(Request $request)
     {
         $request->validate([
@@ -4914,6 +5226,8 @@ if ($validator->fails()) {
             'game_delete_cooldown_minutes' => ['type' => 'integer', 'group' => 'elimination-recovery', 'label' => 'Delete timeout minutes', 'sort' => 130],
             'game_allow_undelete' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Deleted players can be restored by defenders', 'sort' => 140],
             'game_protector_spy_controls' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Protector spy controls are enabled', 'sort' => 150],
+            'game_protector_spy_visibility' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Protectors can identify spies', 'sort' => 155],
+            'game_protector_actor_impersonation' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Protectors can now appear as other users', 'sort' => 157],
             'game_spy_audit_impersonation' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Spies can appear as other users in audit screens', 'sort' => 160],
             'game_account_drill_down_enabled' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Admins can trace fake-account ownership', 'sort' => 165],
             'game_last_man_standing_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Winner is the last active eligible player', 'sort' => 170],
@@ -4933,6 +5247,8 @@ if ($validator->fails()) {
             'game_delete_cooldown_enabled' => false,
             'game_allow_undelete' => false,
             'game_protector_spy_controls' => false,
+            'game_protector_spy_visibility' => false,
+            'game_protector_actor_impersonation' => false,
             'game_spy_audit_impersonation' => false,
             'game_account_drill_down_enabled' => false,
             'game_last_man_standing_enabled' => true,
@@ -4952,6 +5268,8 @@ if ($validator->fails()) {
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
+                'game_protector_spy_visibility' => true,
+                'game_protector_actor_impersonation' => true,
                 'game_auto_detect_winner' => true,
             ],
             'week_4' => [
@@ -4960,6 +5278,8 @@ if ($validator->fails()) {
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
+                'game_protector_spy_visibility' => true,
+                'game_protector_actor_impersonation' => true,
                 'game_account_drill_down_enabled' => true,
                 'game_auto_detect_winner' => true,
             ],
@@ -4971,6 +5291,8 @@ if ($validator->fails()) {
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
+                'game_protector_spy_visibility' => true,
+                'game_protector_actor_impersonation' => true,
                 'game_spy_audit_impersonation' => true,
                 'game_account_drill_down_enabled' => true,
                 'game_auto_detect_winner' => true,
@@ -4984,6 +5306,8 @@ if ($validator->fails()) {
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
                 'game_protector_spy_controls' => true,
+                'game_protector_spy_visibility' => true,
+                'game_protector_actor_impersonation' => true,
                 'game_spy_audit_impersonation' => true,
                 'game_account_drill_down_enabled' => true,
                 'game_auto_detect_winner' => true,
@@ -5969,9 +6293,16 @@ if ($validator->fails()) {
 
     public function F0_VMD_get_online_users(Request $request)
     {
+        $request->validate([
+            'game_intake_code' => 'nullable|string|exists:game_intakes,code',
+        ]);
+
         $onlineWindowSeconds = 120;
         $cutoff = Carbon::now()->subSeconds($onlineWindowSeconds);
         $serverTime = Carbon::now();
+        $gameIntakeCode = $request->input('game_intake_code')
+            ? trim((string) $request->input('game_intake_code'))
+            : null;
 
         $onlineUsers = DB::table('user_presence')
             ->leftJoin('users', function ($join) {
@@ -6012,7 +6343,20 @@ if ($validator->fails()) {
                 'user_presence.heartbeat_count'
             )
             ->orderBy('user_presence.last_seen_at', 'DESC')
-            ->get();
+            ->get()
+            ->map(function ($presence) use ($gameIntakeCode) {
+                $actorMask = $this->protectorActorMaskForDisplay($presence->email, $gameIntakeCode);
+
+                $presence->actor_appearance_applied = (bool) $actorMask;
+                $presence->display_name = $actorMask['name'] ?? $presence->name;
+                $presence->display_email = $actorMask['email'] ?? $presence->email;
+                $presence->display_role_name = $actorMask['role_name'] ?? null;
+                $presence->display_profile_image = $actorMask['profile_image'] ?? null;
+                $presence->actual_email = $actorMask ? $presence->email : null;
+                $presence->actual_name = $actorMask ? $presence->name : null;
+
+                return $presence;
+            });
 
         return response()->json([
             'ok' => true,

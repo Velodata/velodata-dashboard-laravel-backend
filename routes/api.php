@@ -51,6 +51,8 @@ Route::prefix('v2')->group(function () {
     Route::post('/VMD-update-dashboard-settings', [CustomController::class, 'F0_VMD_update_dashboard_settings']);
     Route::post('/VMD-get-intake-game-settings', [CustomController::class, 'F0_VMD_get_intake_game_settings']);
     Route::post('/VMD-save-intake-game-settings', [CustomController::class, 'F0_VMD_save_intake_game_settings']);
+    Route::post('/VMD-get-protector-actor-mask', [CustomController::class, 'F0_VMD_get_protector_actor_mask']);
+    Route::post('/VMD-save-protector-actor-mask', [CustomController::class, 'F0_VMD_save_protector_actor_mask']);
     Route::post('/VMD-get-user-table-baselines', [CustomController::class, 'F0_VMD_get_user_table_baselines']);
     Route::post('/VMD-get-baseline-management-data', [CustomController::class, 'F0_VMD_get_baseline_management_data']);
     Route::post('/VMD-capture-user-table-baseline', [CustomController::class, 'F0_VMD_capture_user_table_baseline']);
