@@ -10,6 +10,7 @@
 - [Linked Staff Visibility](#linked-staff-visibility)
 - [User Management Context](#user-management-context)
 - [Students And Fake Accounts](#students-and-fake-accounts)
+- [Account Drill Down](#account-drill-down)
 - [Admin And Trainer Responsibilities](#admin-and-trainer-responsibilities)
 - [Notifications](#notifications)
 - [Common Checks](#common-checks)
@@ -126,6 +127,8 @@ For Staff Admin users:
 - changing intake changes the Student rows shown in User Management
 - Staff rows still come from `users`
 - Student rows come from `game_users` for the selected intake
+- the Search box matches both user names and email addresses
+- the Search box shows a clear icon when search text is present
 
 For Student/game users:
 
@@ -147,6 +150,29 @@ When a Student creates a fake account through Add User:
 - the fake account remains inside the same intake boundary as the creator
 
 This is intentional game behaviour, not normal Staff account creation.
+
+## Account Drill Down
+
+Account Drill Down helps Staff Admin users trace fake-account ownership.
+
+The drilldown view can be opened from eligible User Management and User Notifications rows when the selected intake allows account drilldown.
+
+In User Management, the Account Drill Down icon appears beside the User identity details. It is intentionally not grouped with edit, ban, delete, or restore row actions.
+
+The chain is shown from the selected account back to the root origin:
+
+- the bottom/root row is Level 1
+- each row above increments in level number
+- the selected account is the highest level
+
+The root origin may be a Staff-created Student. For example, a Staff Admin may manually add a Student, and that Student may later create a fake account. In that case, Account Drill Down shows both steps in the chain.
+
+If the icon is not available, check that:
+
+- the logged-in user is a Staff Admin
+- the actor is a Student/fake account with resolvable lineage
+- the selected intake has account drilldown enabled in Global Management
+- the row has enough actor/intake metadata to resolve the chain
 
 ## Admin And Trainer Responsibilities
 
@@ -173,6 +199,8 @@ Current direction:
 - A Staff user should receive a notification when linked to a new Class Intake.
 - A Staff user should receive a notification when access to a Class Intake is removed.
 - Assignment save feedback should be clear to the Staff Admin performing the change.
+- User Notifications includes a Time Zone selector for Date / Time display, with Perth, Sydney, Brisbane, and UTC options.
+- User Notifications no longer shows the old Total / Unread / Shown summary pane.
 
 ## Common Checks
 

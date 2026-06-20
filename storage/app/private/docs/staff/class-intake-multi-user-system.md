@@ -31,7 +31,7 @@ As more detail is supplied, this file should be updated so the recovered design,
 
 ## Current Implementation Snapshot
 
-Last updated: 2026-05-15.
+Last updated: 2026-06-20.
 
 Current working direction:
 
@@ -44,10 +44,15 @@ Current working direction:
 - If a Protector or Trainer has no linked Class Intake, User Management shows an info-gradient warning and no Students.
 - Staff-to-intake linking is many-to-many through `staff_intake_assignments`.
 - The old `game_intakes.trainer_user_id` field is treated as a legacy fallback, not the final assignment model.
+- Account Drill Down traces eligible Student/fake-account ownership chains from the selected account back to the root origin.
+- User Management search includes names and email addresses, and the search field has a clear icon.
+- User Notifications includes a Time Zone selector for Date / Time display and no longer shows the older Total / Unread / Shown summary pane.
+- Global Management remembers the last selected Class Intake per logged-in Staff user by `game_intake_code`.
 
 Current frontend implementation points:
 
 - `src/cruds/user-management/index.js` controls User Management intake visibility, linked-intake warnings, timeout feedback, and Staff/Admin selector visibility.
+- `src/components/AccountDrillDownModal/index.js` renders the shared Account Drill Down chain UI used by User Management and User Notifications.
 - `src/components/GameIntakeSelector/index.js` can now render an API-provided intake list.
 - `src/cruds/class-intake-management/index.js` has an initial Staff Assignments pane for linking Staff users to the selected intake.
 - `src/cruds/documentation/MarkdownRenderer.jsx` renders Markdown docs and now supports same-page index links without opening a new tab.
@@ -221,6 +226,8 @@ User Management filter direction:
 - Button four: `Online Users`.
 - `Staff Users` and `Student Users` make the split between `users` and `game_users` visible to players.
 - `Online Users` remains important because it supports elimination and "last player on air" gameplay.
+- User Management search should match both user names and email addresses.
+- The search box should expose a clear icon when text is present.
 
 UI placement correction:
 
@@ -333,6 +340,8 @@ Recovered design intent:
 - Students may attempt to create fake accounts, including accounts that impersonate staff.
 - A major intentionally preserved bug/vulnerability in the game is the Add User flow.
 - That Add User weakness is deliberate because it allows players to create accounts with Admin privileges as part of the challenge.
+- Account Drill Down exposes the creator chain for eligible fake accounts. The root/origin row is Level 1 and each row above increments until the selected account.
+- In User Management, the Account Drill Down icon belongs beside the User identity details rather than in the edit/ban/delete row action group.
 
 Storage rule for student-created fake accounts:
 
@@ -608,3 +617,8 @@ The following should be filled in as the design is retold:
 - 2026-05-15: Noted a future discussion point for a higher `Super Admin` role.
 - 2026-05-15: Added the Staff-intake assignment direction: only Staff users with Admin powers see the User Management Class Intake selector, Protectors/Trainers use linked intakes, unlinked Protectors/Trainers receive an info-gradient warning, and `staff_intake_assignments` replaces the legacy single-trainer assumption for future work.
 - 2026-05-15: Added the first Class Intake Management assignment operation: Staff users with Admin powers can load real intake/staff assignment data and save the assigned Staff list for a selected intake.
+- 2026-06-20: Recorded the shared Account Drill Down modal, root-up level numbering, and Admin/intake-gated fake-account ownership tracing.
+- 2026-06-20: Recorded GMUI refinements: the last selected Class Intake is remembered by `game_intake_code`, and Reset Baseline restore shows local success/error feedback.
+- 2026-06-20: Recorded User Management search refinements and Account Drill Down icon placement beside the User identity.
+- 2026-06-20: Recorded User Notifications Time Zone selector support and removal of the old Total / Unread / Shown pane.
+- 2026-06-20: Clarified that `admin@velodata.org` and `ivanvetsich@gmail.com` are hard-coded protected Staff accounts, while `is_system_user` is broader and not a unique Super Admin flag.

@@ -139,6 +139,8 @@ This applies to both Staff users and Student game users.
 
 The bell icon shows recent notifications. The User Notifications screen gives a searchable history so you can review older events and work out what happened.
 
+The User Notifications screen also has a Time Zone selector. Use it to view notification Date / Time values in Perth, Sydney, Brisbane, or UTC time.
+
 Useful notification filters include:
 
 - `Role` for role changes.

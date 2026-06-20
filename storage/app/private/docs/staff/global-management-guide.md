@@ -49,6 +49,8 @@ Rules:
 - Select the Class Intake first.
 - The week pane settings are scoped to the selected intake.
 - Changing intake loads that intake's current saved settings.
+- The Dashboard remembers the last Class Intake you selected in Global Management for your logged-in account.
+- If that intake still exists, returning to Global Management should reopen on that same intake.
 - Trainers should only tune intakes they are linked to.
 - Staff Admin users can manage broader intake settings.
 - Existing saved intake settings override the defaults shown by new week presets.
@@ -201,6 +203,9 @@ Current direction:
 - Users table baselines can be captured and restored.
 - Student intake baselines can be captured or restored independently.
 - Baseline operations should be handled carefully because they can delete extra records and recreate missing snapshot records.
+- Restore actions show a local success or error alert under the Reset And Baseline selection area.
+- A successful restore alert reports the restored row count and any extra rows removed when that information is returned by the server.
+- Student Intake restores are tied to the selected Class Intake code, not a numeric intake id.
 
 ## Login Security
 
