@@ -24,6 +24,7 @@ Route::prefix('v2')->group(function () {
 
     Route::match(['get', 'post'], '/VMD-get-login-history', [CustomController::class, 'F0_VMD_get_login_history']);
     Route::match(['get', 'post'], '/VMD-get-audit-history', [CustomController::class, 'F0_VMD_get_audit_history']);
+    Route::post('/VMD-delete-audit-history-records', [CustomController::class, 'F0_VMD_delete_audit_history_records']);
     Route::post('/VMD-get-account-drill-down', [CustomController::class, 'F0_VMD_get_account_drill_down']);
     Route::match(['get', 'post'], '/VMD-get-notifications', [CustomController::class, 'F0_VMD_get_notifications']);
     Route::match(['get', 'post'], '/VMD-get-documentation', [CustomController::class, 'F0_VMD_get_documentation']);

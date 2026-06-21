@@ -3606,8 +3606,6 @@ class CustomController extends Controller
     {
 
 
-        // Get the total number of records in the table
-        $recordsTotal = DB::table('user_audit_history')->count();
         $requestEmail = $request->input('email') ?: $request->query('email');
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
@@ -3619,6 +3617,7 @@ class CustomController extends Controller
             $requestEmail,
             $this->intakeIdFromHistoryScope($historyIntakeScope)
         );
+        $recordsTotal = DB::table('user_audit_history')->count();
 
 
         $auditHistoryQuery = DB::table('user_audit_history')
@@ -3720,6 +3719,41 @@ class CustomController extends Controller
             'data' => $audit_history_array,
             'recordsFiltered' => $recordsFiltered,
             'recordsTotal' => $recordsTotal,
+        ], 200);
+    }
+
+    public function F0_VMD_delete_audit_history_records(Request $request)
+    {
+        $adminUser = $this->staffAdminFromRequest($request);
+
+        if (! $adminUser) {
+            return response()->json([
+                'message' => 'Permission Denied: Staff Admin access required to delete audit history records.',
+            ], 403);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'ids' => 'required|array|min:1',
+            'ids.*' => 'integer|min:1',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Select at least one audit history record to delete.',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $ids = array_values(array_unique(array_map('intval', $request->input('ids', []))));
+
+        $deleted = DB::table('user_audit_history')
+            ->whereIn('id', $ids)
+            ->delete();
+
+        return response()->json([
+            'outcome' => 'SUCCESS',
+            'deleted_count' => $deleted,
+            'message' => "{$deleted} audit history record(s) permanently deleted.",
         ], 200);
     }
 
