@@ -3702,7 +3702,7 @@ class CustomController extends Controller
                     "target_email" => $row->target_email ?: $permanentDeleteTarget['target_email'],
                     "target_role_name" => $row->target_role_name,
                     "actor_role_name" => $actorMask['role_name'] ?? $row->actor_role_name,
-                    "actor_profile_image" => $actorMask['profile_image'] ?? $row->actor_profile_image,
+                    "actor_profile_image" => $actorMask ? ($actorMask['profile_image'] ?? null) : $row->actor_profile_image,
                     "actor_appearance_applied" => (bool) $actorMask,
                     // "user_city" => $row->user_city,
                     // "user_region" => $row->user_region,

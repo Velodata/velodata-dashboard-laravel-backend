@@ -1596,6 +1596,11 @@ class VelodataRegressionTest extends TestCase
         $staffProtector = $this->createStaffUser('audit-mask-protector@example.test', 'Protector');
         $target = $this->createGameUser('audit-mask-target@example.test', 'Member', 'active', $intakeId);
         $maskedStudent = $this->createGameUser('audit-mask-student@example.test', 'Member', 'active', $intakeId);
+        $protectorAvatar = 'https://dashboard.velodata.org/storage/protector-real-avatar.png';
+
+        DB::table('users')
+            ->where('id', $staffProtector->id)
+            ->update(['profile_image' => $protectorAvatar]);
 
         $this->assignStaffToIntake($staffProtector->id, $intakeId, 'protector');
         $this->setIntakeGameSetting($intakeId, 'game_protector_actor_impersonation', '1', 'roles-spies');
@@ -1632,6 +1637,8 @@ class VelodataRegressionTest extends TestCase
         $this->assertSame($staffProtector->email, $row['attributes']['actual_created_by_email'] ?? null);
         $this->assertSame($staffProtector->name, $row['attributes']['actual_clerk_id'] ?? null);
         $this->assertTrue($row['attributes']['actor_appearance_applied'] ?? false);
+        $this->assertEmpty($row['attributes']['actor_profile_image'] ?? null);
+        $this->assertNotSame($protectorAvatar, $row['attributes']['actor_profile_image'] ?? null);
 
         $this->assertDatabaseHas('user_audit_history', [
             'id' => $auditHistoryId,
@@ -1652,6 +1659,7 @@ class VelodataRegressionTest extends TestCase
         $this->assertSame($staffProtector->email, $unmaskedRow['attributes']['created_by_email'] ?? null);
         $this->assertSame($staffProtector->name, $unmaskedRow['attributes']['clerk_id'] ?? null);
         $this->assertFalse($unmaskedRow['attributes']['actor_appearance_applied'] ?? true);
+        $this->assertSame($protectorAvatar, $unmaskedRow['attributes']['actor_profile_image'] ?? null);
     }
 
     public function test_online_users_response_displays_enabled_protector_actor_mask_for_requested_intake(): void
