@@ -150,12 +150,17 @@ Protectors can be Staff Protectors or Student Protectors. Both identities are al
 Week Four currently contains:
 
 - `01.04 User edits must originate from Australia`
-- `04.02 Winner is the last active eligible player`
-- `04.03 Banned players count as eliminated`
+- `04.01 Admins and Protectors can see Account Drill Downs`
+- `04.03 Admins and Protectors can Counterattack from Account Drill Downs`
+- `04.04 Banned players count as eliminated`
 
 `01.04` blocks covered User Management edits from outside Australia when active. Regression tests cover Role changes, Avatar changes, Basic Info changes, and Password changes for Staff and Student edit paths.
 
-The remaining Week Four controls support elimination logic and winner detection design.
+`04.01` allows eligible Admin and Protector users to open Account Drill Down for Student and fake-account ownership chains when the selected Class Intake has the setting enabled.
+
+`04.03` controls whether Account Drill Down is view-only or operational. When `04.01` is ON and `04.03` is OFF, eligible users can inspect the chain but cannot act from the drilldown window. When both are ON, eligible Admins and Protectors can counterattack from the selected/top Account Drill Down record using User Management-style actions such as Edit, Ban, Delete, Unban, or Restore where their permissions allow it. Laravel still enforces the final action permission checks.
+
+`04.04` currently uses the same underlying setting as `01.02 Banned players cannot log in`. Turning either checkbox on or off changes the same saved Class Intake setting. The active backend behaviour is login enforcement: when this setting is ON, banned Students are blocked from logging in. There is not yet a separate winner-detection or elimination-counting engine behind `04.04`.
 
 ## Week Five
 

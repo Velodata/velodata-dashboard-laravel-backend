@@ -94,6 +94,99 @@ class VelodataRegressionTest extends TestCase
         $this->assertSame('student_fake_account', json_decode($metadata, true)['source'] ?? null);
     }
 
+    public function test_students_cannot_nominate_admin_or_member_roles(): void
+    {
+        $intakeId = $this->createIntake('TEST-STUDENT-ROLE-NOMINATION');
+        $studentProtector = $this->createGameUser('student-role-protector@example.test', 'Protector', 'active', $intakeId);
+        $this->createSystemAdminAccount();
+        $staffTarget = $this->createStaffUser('student-role-staff-target@example.test', 'Trainer');
+        $studentTarget = $this->createGameUser('student-role-student-target@example.test', 'Creator', 'active', $intakeId);
+        $adminRoleId = $this->roleId('Admin');
+        $memberRoleId = $this->roleId('Member');
+
+        $this->postJson('/api/v2/VMD-updateUser', [
+            'id' => $staffTarget->id,
+            'custno' => $staffTarget->custno,
+            'email' => $staffTarget->email,
+            'name' => $staffTarget->name,
+            'role_id' => $adminRoleId,
+            'role_name' => 'Admin',
+            'updated_by' => $studentProtector->email,
+            'vmd_audit_reason' => 'Regression Student attempted Staff Admin assignment',
+            'vmd_user_name' => $studentProtector->display_name,
+            'vmd_user_email' => $studentProtector->email,
+        ])
+            ->assertForbidden()
+            ->assertJson([
+                'outcome' => 'FAIL',
+                'message' => 'Only Staff Admins can assign the Admin role.',
+            ]);
+
+        $this->assertDatabaseHas('users', [
+            'id' => $staffTarget->id,
+            'role_name' => 'Trainer',
+        ]);
+
+        $this->postJson('/api/v2/VMD-updateUser', [
+            'id' => $staffTarget->id,
+            'custno' => $staffTarget->custno,
+            'email' => $staffTarget->email,
+            'name' => $staffTarget->name,
+            'role_id' => $memberRoleId,
+            'role_name' => 'Member',
+            'updated_by' => $studentProtector->email,
+            'vmd_audit_reason' => 'Regression Student attempted Staff Member assignment',
+            'vmd_user_name' => $studentProtector->display_name,
+            'vmd_user_email' => $studentProtector->email,
+        ])
+            ->assertForbidden()
+            ->assertJson([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot assign the Member role.',
+            ]);
+
+        $this->assertDatabaseHas('users', [
+            'id' => $staffTarget->id,
+            'role_name' => 'Trainer',
+        ]);
+
+        $this->postJson('/api/v2/VMD-update-game-user-basic-info', [
+            'id' => $studentTarget->id,
+            'email' => $studentTarget->email,
+            'name' => $studentTarget->display_name,
+            'role_name' => 'Member',
+            'vmd_audit_reason' => 'Regression Student attempted Student Member assignment',
+            'vmd_user_email' => $studentProtector->email,
+            'vmd_user_name' => $studentProtector->display_name,
+        ])
+            ->assertForbidden()
+            ->assertJson([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot assign the Member role.',
+            ]);
+
+        $this->assertDatabaseHas('game_users', [
+            'id' => $studentTarget->id,
+            'game_role' => 'Creator',
+        ]);
+
+        $this->postJson('/api/v2/users', $this->studentCreateUserPayload(
+            $studentProtector,
+            'student-created-member@example.test',
+            'Student Created Member',
+            $memberRoleId
+        ))
+            ->assertForbidden()
+            ->assertJson([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot create Member accounts.',
+            ]);
+
+        $this->assertDatabaseMissing('game_users', [
+            'email' => 'student-created-member@example.test',
+        ]);
+    }
+
     public function test_staff_created_accounts_store_immediate_creator_email(): void
     {
         $staffAdmin = $this->createStaffUser('staff-account-creator@example.test', 'Admin');
@@ -190,6 +283,54 @@ class VelodataRegressionTest extends TestCase
         $this->assertSame($spy->email, $response->json('data.chain.1.email'));
         $this->assertSame('Spy', $response->json('data.chain.1.role_name'));
         $this->assertFalse((bool) $response->json('data.chain.1.redacted'));
+    }
+
+    public function test_staff_protector_can_use_account_drill_down_when_enabled(): void
+    {
+        $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN-STAFF-PROTECTOR');
+        $staffProtector = $this->createStaffUser('account-drill-down-staff-protector@example.test', 'Protector');
+        $creator = $this->createGameUser('account-drill-down-staff-protector-creator@example.test', 'Creator', 'active', $intakeId);
+        $fakeAccount = $this->createGameUser('account-drill-down-staff-protector-fake@example.test', 'Admin', 'active', $intakeId);
+        $this->setIntakeGameSetting($intakeId, 'game_account_drill_down_enabled', '1');
+
+        DB::table('game_users')
+            ->where('id', $fakeAccount->id)
+            ->update(['created_by_email' => $creator->email]);
+
+        $response = $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $staffProtector->email,
+            'target_identity_type' => 'student',
+            'target_id' => $fakeAccount->id,
+            'target_email' => $fakeAccount->email,
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-STAFF-PROTECTOR',
+        ])->assertOk();
+
+        $this->assertSame($fakeAccount->email, $response->json('data.chain.0.email'));
+        $this->assertSame($creator->email, $response->json('data.chain.1.email'));
+    }
+
+    public function test_student_protector_can_use_account_drill_down_when_enabled(): void
+    {
+        $intakeId = $this->createIntake('TEST-ACCOUNT-DRILL-DOWN-STUDENT-PROTECTOR');
+        $studentProtector = $this->createGameUser('account-drill-down-student-protector@example.test', 'Protector', 'active', $intakeId);
+        $creator = $this->createGameUser('account-drill-down-student-protector-creator@example.test', 'Creator', 'active', $intakeId);
+        $fakeAccount = $this->createGameUser('account-drill-down-student-protector-fake@example.test', 'Admin', 'active', $intakeId);
+        $this->setIntakeGameSetting($intakeId, 'game_account_drill_down_enabled', '1');
+
+        DB::table('game_users')
+            ->where('id', $fakeAccount->id)
+            ->update(['created_by_email' => $creator->email]);
+
+        $response = $this->postJson('/api/v2/VMD-get-account-drill-down', [
+            'vmd_user_email' => $studentProtector->email,
+            'target_identity_type' => 'student',
+            'target_id' => $fakeAccount->id,
+            'target_email' => $fakeAccount->email,
+            'game_intake_code' => 'TEST-ACCOUNT-DRILL-DOWN-STUDENT-PROTECTOR',
+        ])->assertOk();
+
+        $this->assertSame($fakeAccount->email, $response->json('data.chain.0.email'));
+        $this->assertSame($creator->email, $response->json('data.chain.1.email'));
     }
 
     public function test_admin_notification_recipient_can_drill_down_matching_actor_when_enabled(): void
@@ -312,7 +453,7 @@ class VelodataRegressionTest extends TestCase
             'context' => 'user_notifications',
         ])
             ->assertForbidden()
-            ->assertJsonPath('message', 'Permission Denied: account drill down requires Admin access.');
+            ->assertJsonPath('message', 'Permission Denied: account drill down requires Admin or Protector access.');
     }
 
     public function test_student_cannot_create_fake_account_for_existing_staff_user(): void
@@ -1770,6 +1911,7 @@ class VelodataRegressionTest extends TestCase
 
         $this->assertSame($maskedStudent->email, $notification['metadata']['actorEmail'] ?? null);
         $this->assertSame($maskedStudent->display_name, $notification['metadata']['actorName'] ?? null);
+        $this->assertSame('ACTIVE', $notification['metadata']['actorStatus'] ?? null);
         $this->assertSame('student', $notification['metadata']['actorIdentityType'] ?? null);
         $this->assertSame($staffProtector->email, $notification['metadata']['actualActorEmail'] ?? null);
         $this->assertStringContainsString("by {$maskedStudent->display_name}", $notification['message'] ?? '');
@@ -1792,6 +1934,7 @@ class VelodataRegressionTest extends TestCase
 
         $this->assertSame($staffProtector->email, $unmaskedNotification['metadata']['actorEmail'] ?? null);
         $this->assertSame($staffProtector->name, $unmaskedNotification['metadata']['actorName'] ?? null);
+        $this->assertSame('ACTIVE', $unmaskedNotification['metadata']['actorStatus'] ?? null);
         $this->assertStringContainsString("by {$staffProtector->name}", $unmaskedNotification['message'] ?? '');
     }
 

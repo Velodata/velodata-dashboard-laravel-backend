@@ -156,6 +156,28 @@ class UserController extends Controller
         return strcasecmp($this->staffRoleName($user), 'Admin') === 0;
     }
 
+    private function roleInputIsNamed(string $expectedRoleName, $roleName, $roleId = null): bool
+    {
+        if ($roleName && strcasecmp((string) $roleName, $expectedRoleName) === 0) {
+            return true;
+        }
+
+        if ($roleId) {
+            $role = DB::table('roles')->where('id', $roleId)->first();
+
+            return $role && strcasecmp((string) $role->name, $expectedRoleName) === 0;
+        }
+
+        return false;
+    }
+
+    private function actorIsStaffAdmin(?string $actorEmail): bool
+    {
+        $actorStaff = $actorEmail ? User::where('email', $actorEmail)->first() : null;
+
+        return $actorStaff && $this->isStaffAdmin($actorStaff);
+    }
+
     private function staffAssignedIntakeQuery(User $user)
     {
         $now = now();
@@ -526,6 +548,13 @@ class UserController extends Controller
             return $this->storeStudentCreatedGameUser($request, $attributes, $roleId, $creatorGameUser);
         }
 
+        if ($this->roleInputIsNamed('Admin', null, $roleId) && ! $this->actorIsStaffAdmin($createdByEmail)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Only Staff Admins can assign the Admin role.',
+            ], 403);
+        }
+
         // Check if email already exists
         if (User::where('email', $email)->exists()) {
             return response()->json([
@@ -613,6 +642,13 @@ class UserController extends Controller
         if ($this->intakeGameSettingBoolean((int) $creatorGameUser->intake_id, 'game_restrict_student_role_selection', false)) {
             $roleName = 'Creator';
             $roleId = DB::table('roles')->whereRaw('LOWER(name) = ?', [strtolower($roleName)])->value('id') ?: $roleId;
+        }
+
+        if ($this->roleInputIsNamed('Member', $roleName, $roleId)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot create Member accounts.',
+            ], 403);
         }
 
         if (strcasecmp((string) $roleName, 'Trainer') === 0) {

@@ -481,6 +481,7 @@ class CustomController extends Controller
             'name' => $displayName ?: $maskedStudent->email,
             'email' => $maskedStudent->email,
             'role_name' => $maskedStudent->game_role,
+            'status' => strtoupper((string) ($maskedStudent->game_status ?: 'ACTIVE')),
             'profile_image' => $maskedStudent->profile_image,
         ];
     }
@@ -501,13 +502,13 @@ class CustomController extends Controller
         }
 
         $user = User::where('email', $email)->first();
-        if ($user && strcasecmp($this->staffRoleName($user), 'Admin') === 0) {
+        if ($user && in_array(strtolower($this->staffRoleName($user)), ['admin', 'protector'], true)) {
             return true;
         }
 
         $gameUser = $this->actorGameUser($email);
 
-        return $gameUser && strcasecmp((string) $gameUser->game_role, 'Admin') === 0;
+        return $gameUser && in_array(strtolower((string) $gameUser->game_role), ['admin', 'protector'], true);
     }
 
     private function accountDrillDownIntakeId(Request $request, ?array $target): ?int
@@ -712,7 +713,7 @@ class CustomController extends Controller
         if (! $this->canViewAccountDrillDown($viewerEmail)) {
             return response()->json([
                 'outcome' => 'FAIL',
-                'message' => 'Permission Denied: account drill down requires Admin access.',
+                'message' => 'Permission Denied: account drill down requires Admin or Protector access.',
             ], 403);
         }
 
@@ -892,19 +893,24 @@ class CustomController extends Controller
         return strcasecmp($this->staffRoleName($user), 'Admin') === 0;
     }
 
-    private function roleInputIsAdmin($roleName, $roleId = null): bool
+    private function roleInputIsNamed(string $expectedRoleName, $roleName, $roleId = null): bool
     {
-        if ($roleName && strcasecmp((string) $roleName, 'Admin') === 0) {
+        if ($roleName && strcasecmp((string) $roleName, $expectedRoleName) === 0) {
             return true;
         }
 
         if ($roleId) {
             $role = Role::where('id', $roleId)->first();
 
-            return $role && strcasecmp((string) $role->name, 'Admin') === 0;
+            return $role && strcasecmp((string) $role->name, $expectedRoleName) === 0;
         }
 
         return false;
+    }
+
+    private function roleInputIsAdmin($roleName, $roleId = null): bool
+    {
+        return $this->roleInputIsNamed('Admin', $roleName, $roleId);
     }
 
     private function nonAdminStaffAssigningAdmin(?string $actorEmail, $roleId = null, $roleName = null): bool
@@ -915,7 +921,16 @@ class CustomController extends Controller
 
         $actorStaff = $actorEmail ? User::where('email', $actorEmail)->first() : null;
 
-        return $actorStaff && ! $this->isStaffAdmin($actorStaff);
+        return ! $actorStaff || ! $this->isStaffAdmin($actorStaff);
+    }
+
+    private function studentAssigningMember(?string $actorEmail, $roleId = null, $roleName = null): bool
+    {
+        if (! $this->roleInputIsNamed('Member', $roleName, $roleId)) {
+            return false;
+        }
+
+        return $actorEmail && GameUser::where('email', $actorEmail)->exists();
     }
 
     private function staffAssignedIntakeQuery(User $user)
@@ -2166,6 +2181,12 @@ class CustomController extends Controller
             $metadata['actorRole'] = $actorUser->role_name ?? $actorGameUser->game_role ?? '';
         }
 
+        if (($actorUser || $actorGameUser) && empty($metadata['actorStatus'])) {
+            $metadata['actorStatus'] = $actorUser
+                ? strtoupper((string) ($actorUser->status ?: 'ACTIVE'))
+                : strtoupper((string) ($actorGameUser->game_status ?: 'ACTIVE'));
+        }
+
         if (($actorUser || $actorGameUser) && empty($metadata['actorIdentityType'])) {
             $metadata['actorIdentityType'] = $actorUser ? 'staff' : 'student';
         }
@@ -2200,6 +2221,7 @@ class CustomController extends Controller
             $metadata['updatedBy'] = $actorMask['email'];
             $metadata['actorName'] = $actorMask['name'];
             $metadata['actorRole'] = $actorMask['role_name'];
+            $metadata['actorStatus'] = $actorMask['status'] ?? 'ACTIVE';
             $metadata['actorIdentityType'] = 'student';
             $metadata['actorImage'] = $actorMask['profile_image'] ?? '';
             $metadata['actor_appearance_applied'] = true;
@@ -3626,14 +3648,17 @@ class CustomController extends Controller
             ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
             ->leftJoin('users as actor_users', 'actor_users.email', '=', 'user_audit_history.created_by_email')
             ->leftJoin('game_users as actor_game_users', 'actor_game_users.email', '=', 'user_audit_history.created_by_email')
+            ->leftJoin('game_intakes as actor_game_intakes', 'actor_game_users.intake_id', '=', 'actor_game_intakes.id')
             ->select(
                 'user_audit_history.*',
                 DB::raw("COALESCE(users.name, game_users.display_name, TRIM(CONCAT(COALESCE(game_users.preferred_name, game_users.first_name, ''), ' ', COALESCE(game_users.surname, '')))) as target_name"),
                 DB::raw('COALESCE(users.email, game_users.email) as target_email'),
                 DB::raw('COALESCE(users.role_name, game_users.game_role) as target_role_name'),
                 DB::raw('COALESCE(actor_users.role_name, actor_game_users.game_role) as actor_role_name'),
+                DB::raw('COALESCE(actor_users.status, actor_game_users.game_status) as actor_status'),
                 DB::raw('COALESCE(actor_users.profile_image, actor_game_users.profile_image) as actor_profile_image'),
-                DB::raw('game_intakes.code as target_intake_code')
+                DB::raw('game_intakes.code as target_intake_code'),
+                DB::raw('actor_game_intakes.code as actor_intake_code')
             );
 
         $auditHistoryQuery = $this->applyHistoryIntakeScope($auditHistoryQuery, $historyIntakeScope);
@@ -3702,6 +3727,8 @@ class CustomController extends Controller
                     "target_email" => $row->target_email ?: $permanentDeleteTarget['target_email'],
                     "target_role_name" => $row->target_role_name,
                     "actor_role_name" => $actorMask['role_name'] ?? $row->actor_role_name,
+                    "actor_status" => $actorMask['status'] ?? strtoupper((string) ($row->actor_status ?: 'ACTIVE')),
+                    "actor_intake_code" => $row->actor_intake_code ?: ($row->target_intake_code ?: $scopeIntakeCode),
                     "actor_profile_image" => $actorMask ? ($actorMask['profile_image'] ?? null) : $row->actor_profile_image,
                     "actor_appearance_applied" => (bool) $actorMask,
                     // "user_city" => $row->user_city,
@@ -4028,6 +4055,13 @@ if ($validator->fails()) {
             ], 403);
         }
 
+        if ($this->studentAssigningMember($data['vmd_user_email'], $data['role_id'] ?? null, $data['role_name'] ?? null)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot assign the Member role.',
+            ], 403);
+        }
+
         // Update the user record based on ID
         $user = User::where('id', $data['id'])->first();
 
@@ -4248,6 +4282,13 @@ if ($validator->fails()) {
             return response()->json([
                 'outcome' => 'FAIL',
                 'message' => 'Only Staff Admins can assign the Admin role.',
+            ], 403);
+        }
+
+        if ($this->studentAssigningMember($data['vmd_user_email'], null, $data['role_name'] ?? null)) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Students cannot assign the Member role.',
             ], 403);
         }
 
@@ -5263,7 +5304,8 @@ if ($validator->fails()) {
             'game_protector_spy_visibility' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Protectors can identify spies', 'sort' => 155],
             'game_protector_actor_impersonation' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Protectors can now appear as other users', 'sort' => 157],
             'game_spy_audit_impersonation' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Spies can appear as other users in audit screens', 'sort' => 160],
-            'game_account_drill_down_enabled' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Admins can trace fake-account ownership', 'sort' => 165],
+            'game_account_drill_down_enabled' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Admins and Protectors can see Account Drill Downs', 'sort' => 165],
+            'game_account_drill_down_counterattack_enabled' => ['type' => 'boolean', 'group' => 'roles-spies', 'label' => 'Admins and Protectors can Counterattack from Account Drill Downs', 'sort' => 166],
             'game_last_man_standing_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Winner is the last active eligible player', 'sort' => 170],
             'game_auto_detect_winner' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Automatically detect a winner when one player remains', 'sort' => 180],
             'game_baseline_reset_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Class baseline reset is enabled', 'sort' => 190],
@@ -5285,6 +5327,7 @@ if ($validator->fails()) {
             'game_protector_actor_impersonation' => false,
             'game_spy_audit_impersonation' => false,
             'game_account_drill_down_enabled' => false,
+            'game_account_drill_down_counterattack_enabled' => false,
             'game_last_man_standing_enabled' => true,
             'game_auto_detect_winner' => false,
             'game_baseline_reset_enabled' => true,
@@ -5315,6 +5358,7 @@ if ($validator->fails()) {
                 'game_protector_spy_visibility' => true,
                 'game_protector_actor_impersonation' => true,
                 'game_account_drill_down_enabled' => true,
+                'game_account_drill_down_counterattack_enabled' => true,
                 'game_auto_detect_winner' => true,
             ],
             'week_5' => [
@@ -5329,6 +5373,7 @@ if ($validator->fails()) {
                 'game_protector_actor_impersonation' => true,
                 'game_spy_audit_impersonation' => true,
                 'game_account_drill_down_enabled' => true,
+                'game_account_drill_down_counterattack_enabled' => true,
                 'game_auto_detect_winner' => true,
             ],
             'week_6' => [
@@ -5344,6 +5389,7 @@ if ($validator->fails()) {
                 'game_protector_actor_impersonation' => true,
                 'game_spy_audit_impersonation' => true,
                 'game_account_drill_down_enabled' => true,
+                'game_account_drill_down_counterattack_enabled' => true,
                 'game_auto_detect_winner' => true,
             ],
         ];
