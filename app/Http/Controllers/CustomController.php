@@ -401,6 +401,26 @@ class CustomController extends Controller
             || (bool) $gameUser->is_spy;
     }
 
+    private function isStaffAdminEmail(?string $email): bool
+    {
+        if (! $email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+
+        return $user && $this->isStaffAdmin($user);
+    }
+
+    private function otherPasswordChangesRequireStaffAdmin(?int $intakeId): bool
+    {
+        return $this->intakeGameSettingBoolean(
+            $intakeId,
+            'game_staff_admin_only_other_password_changes',
+            false
+        );
+    }
+
     private function isProtectorEmail(?string $email): bool
     {
         if (! $email) {
@@ -3632,6 +3652,13 @@ class CustomController extends Controller
         $gameIntakeId = $request->input('game_intake_id') ?: $request->query('game_intake_id');
         $gameIntakeCode = $request->input('game_intake_code') ?: $request->query('game_intake_code');
         $ipAddressFilter = trim((string) ($request->input('ip_address') ?: $request->query('ip_address') ?: ''));
+        $searchTerm = trim((string) ($request->input('search') ?: $request->query('search') ?: ''));
+        $page = max(1, (int) ($request->input('page') ?: $request->query('page') ?: 1));
+        $perPage = (int) ($request->input('per_page') ?: $request->query('per_page') ?: 100);
+        $allowedPerPage = [25, 50, 100, 250];
+        if (! in_array($perPage, $allowedPerPage, true)) {
+            $perPage = 100;
+        }
         $viewer = $requestEmail ? DB::table('users')->where('email', $requestEmail)->first() : null;
         $canViewProtectedSecurityAudits = $viewer && in_array($viewer->role_name, ['Admin', 'Protector', 'Trainer'], true);
         $historyIntakeScope = $this->historyIntakeScope($requestEmail, $gameIntakeId, $gameIntakeCode);
@@ -3641,23 +3668,58 @@ class CustomController extends Controller
         );
         $recordsTotal = DB::table('user_audit_history')->count();
 
+        $latestGameUserBaselineSubquery = DB::table('game_baseline_users')
+            ->select('game_user_id', DB::raw('MAX(baseline_id) as latest_baseline_id'))
+            ->groupBy('game_user_id');
+        $targetCreatorEmailSql = "COALESCE(NULLIF(game_users.created_by_email, ''), NULLIF(JSON_UNQUOTE(JSON_EXTRACT(game_user_snapshots.metadata, '$.created_by_email')), ''), NULLIF(JSON_UNQUOTE(JSON_EXTRACT(game_user_snapshots.metadata, '$.created_by_student_email')), ''))";
 
         $auditHistoryQuery = DB::table('user_audit_history')
-            ->leftJoin('users', 'users.id', '=', DB::raw('user_audit_history.custno - 100000'))
-            ->leftJoin('game_users', 'game_users.id', '=', DB::raw('user_audit_history.custno - 900000'))
+            ->leftJoin('users', function ($join) {
+                $join->whereRaw('CAST(user_audit_history.custno AS UNSIGNED) = users.id + 100000');
+            })
+            ->leftJoin('game_users', function ($join) {
+                $join->whereRaw('CAST(user_audit_history.custno AS UNSIGNED) = game_users.id + 900000');
+            })
+            ->leftJoinSub($latestGameUserBaselineSubquery, 'latest_game_user_baselines', function ($join) {
+                $join->whereRaw('CAST(user_audit_history.custno AS UNSIGNED) = latest_game_user_baselines.game_user_id + 900000');
+            })
+            ->leftJoin('game_baseline_users as game_user_snapshots', function ($join) {
+                $join
+                    ->on('game_user_snapshots.game_user_id', '=', 'latest_game_user_baselines.game_user_id')
+                    ->on('game_user_snapshots.baseline_id', '=', 'latest_game_user_baselines.latest_baseline_id');
+            })
             ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
-            ->leftJoin('users as actor_users', 'actor_users.email', '=', 'user_audit_history.created_by_email')
-            ->leftJoin('game_users as actor_game_users', 'actor_game_users.email', '=', 'user_audit_history.created_by_email')
+            ->leftJoin('game_baselines as target_snapshot_baselines', 'target_snapshot_baselines.id', '=', 'game_user_snapshots.baseline_id')
+            ->leftJoin('game_intakes as target_snapshot_intakes', 'target_snapshot_intakes.id', '=', 'target_snapshot_baselines.intake_id')
+            ->leftJoin('users as target_creator_users', function ($join) use ($targetCreatorEmailSql) {
+                $join->whereRaw("LOWER(TRIM(target_creator_users.email)) = LOWER(TRIM($targetCreatorEmailSql))");
+            })
+            ->leftJoin('game_users as target_creator_game_users', function ($join) use ($targetCreatorEmailSql) {
+                $join->whereRaw("LOWER(TRIM(target_creator_game_users.email)) = LOWER(TRIM($targetCreatorEmailSql))");
+            })
+            ->leftJoin('game_intakes as target_creator_game_intakes', 'target_creator_game_users.intake_id', '=', 'target_creator_game_intakes.id')
+            ->leftJoin('users as actor_users', function ($join) {
+                $join->whereRaw('LOWER(TRIM(actor_users.email)) = LOWER(TRIM(user_audit_history.created_by_email))');
+            })
+            ->leftJoin('game_users as actor_game_users', function ($join) {
+                $join->whereRaw('LOWER(TRIM(actor_game_users.email)) = LOWER(TRIM(user_audit_history.created_by_email))');
+            })
             ->leftJoin('game_intakes as actor_game_intakes', 'actor_game_users.intake_id', '=', 'actor_game_intakes.id')
             ->select(
                 'user_audit_history.*',
-                DB::raw("COALESCE(users.name, game_users.display_name, TRIM(CONCAT(COALESCE(game_users.preferred_name, game_users.first_name, ''), ' ', COALESCE(game_users.surname, '')))) as target_name"),
-                DB::raw('COALESCE(users.email, game_users.email) as target_email'),
-                DB::raw('COALESCE(users.role_name, game_users.game_role) as target_role_name'),
+                DB::raw("COALESCE(NULLIF(users.name, ''), NULLIF(game_users.display_name, ''), NULLIF(game_user_snapshots.display_name, ''), NULLIF(TRIM(CONCAT(COALESCE(game_users.preferred_name, game_users.first_name, game_user_snapshots.preferred_name, game_user_snapshots.first_name, ''), ' ', COALESCE(game_users.surname, game_user_snapshots.surname, ''))), '')) as target_name"),
+                DB::raw("COALESCE(NULLIF(users.email, ''), NULLIF(game_users.email, ''), NULLIF(game_user_snapshots.email, '')) as target_email"),
+                DB::raw("COALESCE(NULLIF(users.role_name, ''), NULLIF(game_users.game_role, ''), NULLIF(game_user_snapshots.game_role, '')) as target_role_name"),
+                DB::raw("CASE WHEN users.id IS NOT NULL THEN 'staff' WHEN game_users.id IS NOT NULL OR game_user_snapshots.game_user_id IS NOT NULL THEN 'student' ELSE NULL END as target_identity_type"),
+                DB::raw("$targetCreatorEmailSql as target_created_by_email"),
+                DB::raw("COALESCE(NULLIF(target_creator_users.name, ''), NULLIF(target_creator_game_users.display_name, ''), $targetCreatorEmailSql) as target_created_by_name"),
+                DB::raw("COALESCE(NULLIF(target_creator_users.role_name, ''), NULLIF(target_creator_game_users.game_role, '')) as target_created_by_role_name"),
+                DB::raw("CASE WHEN target_creator_users.id IS NOT NULL THEN 'staff' WHEN target_creator_game_users.id IS NOT NULL THEN 'student' ELSE NULL END as target_created_by_identity_type"),
+                DB::raw('target_creator_game_intakes.code as target_created_by_intake_code'),
                 DB::raw('COALESCE(actor_users.role_name, actor_game_users.game_role) as actor_role_name'),
                 DB::raw('COALESCE(actor_users.status, actor_game_users.game_status) as actor_status'),
                 DB::raw('COALESCE(actor_users.profile_image, actor_game_users.profile_image) as actor_profile_image'),
-                DB::raw('game_intakes.code as target_intake_code'),
+                DB::raw('COALESCE(game_intakes.code, target_snapshot_intakes.code) as target_intake_code'),
                 DB::raw('actor_game_intakes.code as actor_intake_code')
             );
 
@@ -3665,6 +3727,29 @@ class CustomController extends Controller
 
         if ($ipAddressFilter !== '') {
             $auditHistoryQuery->where('user_audit_history.created_by_ip_address', $ipAddressFilter);
+        }
+
+        if ($searchTerm !== '') {
+            $searchLike = '%' . $searchTerm . '%';
+            $auditHistoryQuery->where(function ($query) use ($searchLike, $targetCreatorEmailSql) {
+                $query
+                    ->where('user_audit_history.comments', 'like', $searchLike)
+                    ->orWhere('user_audit_history.clerk_id', 'like', $searchLike)
+                    ->orWhere('user_audit_history.created_by_email', 'like', $searchLike)
+                    ->orWhere('user_audit_history.created_by_ip_address', 'like', $searchLike)
+                    ->orWhere('user_audit_history.custno', 'like', $searchLike)
+                    ->orWhereRaw("COALESCE(users.name, game_users.display_name, game_user_snapshots.display_name, TRIM(CONCAT(COALESCE(game_users.preferred_name, game_users.first_name, game_user_snapshots.preferred_name, game_user_snapshots.first_name, ''), ' ', COALESCE(game_users.surname, game_user_snapshots.surname, '')))) like ?", [$searchLike])
+                    ->orWhereRaw('COALESCE(users.email, game_users.email, game_user_snapshots.email) like ?', [$searchLike])
+                    ->orWhereRaw('COALESCE(users.role_name, game_users.game_role, game_user_snapshots.game_role) like ?', [$searchLike])
+                    ->orWhereRaw("$targetCreatorEmailSql like ?", [$searchLike])
+                    ->orWhereRaw('COALESCE(target_creator_users.name, target_creator_game_users.display_name) like ?', [$searchLike])
+                    ->orWhereRaw('COALESCE(target_creator_users.email, target_creator_game_users.email) like ?', [$searchLike])
+                    ->orWhereRaw('COALESCE(target_creator_users.role_name, target_creator_game_users.game_role) like ?', [$searchLike])
+                    ->orWhereRaw('COALESCE(actor_users.role_name, actor_game_users.game_role) like ?', [$searchLike])
+                    ->orWhere('game_intakes.code', 'like', $searchLike)
+                    ->orWhere('target_creator_game_intakes.code', 'like', $searchLike)
+                    ->orWhere('actor_game_intakes.code', 'like', $searchLike);
+            });
         }
 
         if (! $canViewProtectedSecurityAudits) {
@@ -3685,19 +3770,26 @@ class CustomController extends Controller
             });
         }
 
+        $recordsFiltered = (clone $auditHistoryQuery)
+            ->distinct()
+            ->count('user_audit_history.id');
+        $lastPage = max(1, (int) ceil($recordsFiltered / $perPage));
+        $page = min($page, $lastPage);
+
         $audit_history_list = $auditHistoryQuery
-            ->orderBy('user_audit_history.created_at', 'DESC')
-            ->limit(100)
+            ->orderByRaw('COALESCE(user_audit_history.dteprfmd, user_audit_history.created_at) DESC')
+            ->offset(($page - 1) * $perPage)
+            ->limit($perPage)
             ->get();
 
-
-        // Count filtered records
-        $recordsFiltered = $audit_history_list->count();
 
         if ($audit_history_list->isEmpty()) {
             return response()->json([
                 'data' => [],
-                'recordsFiltered' => 0,
+                'page' => $page,
+                'per_page' => $perPage,
+                'search' => $searchTerm,
+                'recordsFiltered' => $recordsFiltered,
                 'recordsTotal' => $recordsTotal,
             ], 200);
         }
@@ -3726,6 +3818,12 @@ class CustomController extends Controller
                     "target_name" => $row->target_name ?: $permanentDeleteTarget['target_name'],
                     "target_email" => $row->target_email ?: $permanentDeleteTarget['target_email'],
                     "target_role_name" => $row->target_role_name,
+                    "target_identity_type" => $row->target_identity_type,
+                    "target_created_by_email" => $row->target_created_by_email,
+                    "target_created_by_name" => $row->target_created_by_name,
+                    "target_created_by_role_name" => $row->target_created_by_role_name,
+                    "target_created_by_identity_type" => $row->target_created_by_identity_type,
+                    "target_created_by_intake_code" => $row->target_created_by_intake_code,
                     "actor_role_name" => $actorMask['role_name'] ?? $row->actor_role_name,
                     "actor_status" => $actorMask['status'] ?? strtoupper((string) ($row->actor_status ?: 'ACTIVE')),
                     "actor_intake_code" => $row->actor_intake_code ?: ($row->target_intake_code ?: $scopeIntakeCode),
@@ -3736,7 +3834,7 @@ class CustomController extends Controller
                     // "user_country" => $row->user_country,
                     // "user_ZipCode" => $row->user_ZipCode,
                     // "user_agent" => $row->user_agent,
-                    "created_at" => $row->created_at,
+                    "created_at" => $row->dteprfmd ?: $row->created_at,
                 ],
             ];
         });
@@ -3744,6 +3842,9 @@ class CustomController extends Controller
         // Return the response
         return response()->json([
             'data' => $audit_history_array,
+            'page' => $page,
+            'per_page' => $perPage,
+            'search' => $searchTerm,
             'recordsFiltered' => $recordsFiltered,
             'recordsTotal' => $recordsTotal,
         ], 200);
@@ -4067,6 +4168,24 @@ if ($validator->fails()) {
 
         if ($user) {
             $oldRoleName = (string) ($user->role_name ?: optional($user->roles()->first())->name);
+            $passwordWasChanged = isset($data['password']) && (string) $data['password'] !== '';
+            $isSelfPasswordChange = strcasecmp((string) $user->email, (string) $data['vmd_user_email']) === 0;
+            $passwordRuleIntakeId = isset($data['game_intake_code'])
+                ? (int) DB::table('game_intakes')->where('code', $data['game_intake_code'])->value('id')
+                : null;
+
+            if (
+                $passwordWasChanged &&
+                ! $isSelfPasswordChange &&
+                $this->otherPasswordChangesRequireStaffAdmin($passwordRuleIntakeId) &&
+                ! $this->isStaffAdminEmail($data['vmd_user_email'])
+            ) {
+                return response()->json([
+                    'outcome' => 'FAIL',
+                    'message' => 'Permission Denied: Only Staff Admins can change passwords on accounts which are not theirs.',
+                ], 403);
+            }
+
             $user->name         = $data['name'] ?? $user->name;
             $user->email        = $data['email'] ?? $user->email;
             $user->role_id      = $data['role_id'] ?? $user->role_id;
@@ -4081,7 +4200,6 @@ if ($validator->fails()) {
             $user->gender       = $data['gender'] ?? $user->gender;
             $user->location     = $data['location'] ?? $user->location;
             $user->phone_no     = $data['phone_no'] ?? $user->phone_no;
-            $passwordWasChanged = isset($data['password']) && (string) $data['password'] !== '';
             $user->password     = $passwordWasChanged ? bcrypt($data['password']) : $user->password;
 
             $user->address_1    = $data['address_1'] ?? $user->address_1;
@@ -4466,6 +4584,17 @@ if ($validator->fails()) {
             return response()->json([
                 'outcome' => 'FAIL',
                 'message' => 'Permission Denied: You can only change your own student password unless you are Admin, Protector, Trainer, or Spy.',
+            ], 403);
+        }
+
+        if (
+            ! $isSelfPasswordChange &&
+            $this->otherPasswordChangesRequireStaffAdmin($gameUser->intake_id ? intval($gameUser->intake_id) : null) &&
+            ! $this->isStaffAdminEmail($data['vmd_user_email'])
+        ) {
+            return response()->json([
+                'outcome' => 'FAIL',
+                'message' => 'Permission Denied: Only Staff Admins can change passwords on accounts which are not theirs.',
             ], 403);
         }
 
@@ -5295,6 +5424,7 @@ if ($validator->fails()) {
             'security_manual_login_requires_2fa' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Manual login requires 2FA', 'sort' => 10],
             'security_block_banned_login' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Banned players cannot log in', 'sort' => 20],
             'security_geo_lock_user_edits' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'User edits must originate from Australia', 'sort' => 40],
+            'game_staff_admin_only_other_password_changes' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Only Staff Admins can change passwords on accounts which are not theirs.', 'sort' => 50],
             'game_block_student_add_users' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Students can no longer Add Users', 'sort' => 90],
             'game_restrict_student_role_selection' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Students can no longer choose any role for new users.', 'sort' => 100],
             'game_delete_cooldown_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Students receive a lockdown when they Delete or Ban someone.', 'sort' => 120],
@@ -5318,6 +5448,7 @@ if ($validator->fails()) {
             'security_manual_login_requires_2fa' => false,
             'security_block_banned_login' => true,
             'security_geo_lock_user_edits' => false,
+            'game_staff_admin_only_other_password_changes' => false,
             'game_block_student_add_users' => false,
             'game_restrict_student_role_selection' => false,
             'game_delete_cooldown_enabled' => false,
@@ -5365,6 +5496,7 @@ if ($validator->fails()) {
                 'security_manual_login_requires_2fa' => true,
                 'security_block_banned_login' => true,
                 'security_geo_lock_user_edits' => true,
+                'game_staff_admin_only_other_password_changes' => true,
                 'game_block_student_add_users' => true,
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
@@ -5380,6 +5512,7 @@ if ($validator->fails()) {
                 'security_manual_login_requires_2fa' => true,
                 'security_block_banned_login' => true,
                 'security_geo_lock_user_edits' => true,
+                'game_staff_admin_only_other_password_changes' => true,
                 'game_block_student_add_users' => true,
                 'game_restrict_student_role_selection' => true,
                 'game_delete_cooldown_enabled' => true,
@@ -6215,6 +6348,167 @@ if ($validator->fails()) {
 
 
     // ***** end of PHP file  ****
+
+
+    public function F0_VMD_report_browser_trace(Request $request)
+    {
+        if (! Schema::hasTable('browser_identities') || ! Schema::hasTable('browser_identity_events')) {
+            return response()->json([
+                'ok' => true,
+                'recorded' => false,
+                'reason' => 'browser_trace_tables_missing',
+            ], 200);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'browser_uuid' => 'required|string|max:80',
+            'current_user.email' => 'nullable|email|max:255',
+            'current_user.custno' => 'nullable',
+            'current_user.identity_type' => 'nullable|string|max:30',
+            'current_user.is_game_user' => 'nullable|boolean',
+            'origin' => 'nullable|string|max:255',
+            'selected_game_intake_code' => 'nullable|string|max:80',
+            'notification_identities' => 'nullable|array|max:100',
+            'notification_identities.*.email' => 'required_with:notification_identities|email|max:255',
+            'notification_identities.*.notification_count' => 'nullable|integer|min:0|max:10000',
+            'timezone' => 'nullable|string|max:80',
+            'locale' => 'nullable|string|max:40',
+            'screen_size' => 'nullable|string|max:40',
+            'viewport_size' => 'nullable|string|max:40',
+            'client_sent_at' => 'nullable|string|max:80',
+            'vmd_ip_address_v4' => 'nullable|string|max:45',
+            'vmd_ip_address_v6' => 'nullable|string|max:45',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'ok' => false,
+                'recorded' => false,
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $validated = $validator->validated();
+        $browserUuid = trim((string) $validated['browser_uuid']);
+        $currentUser = $validated['current_user'] ?? [];
+        $currentUserEmail = isset($currentUser['email']) ? strtolower(trim((string) $currentUser['email'])) : null;
+        $currentUserCustno = isset($currentUser['custno']) && is_numeric($currentUser['custno'])
+            ? (int) $currentUser['custno']
+            : null;
+        $currentUserIdentityType = $currentUser['identity_type'] ?? ((bool) ($currentUser['is_game_user'] ?? false) ? 'student' : null);
+
+        $notificationIdentityMap = [];
+        foreach (($validated['notification_identities'] ?? []) as $identity) {
+            $email = strtolower(trim((string) ($identity['email'] ?? '')));
+            if ($email === '') {
+                continue;
+            }
+
+            $notificationIdentityMap[$email] = [
+                'email' => $email,
+                'notification_count' => (int) ($identity['notification_count'] ?? 0),
+            ];
+        }
+        ksort($notificationIdentityMap);
+        $notificationIdentities = array_values($notificationIdentityMap);
+        $notificationIdentityCount = count($notificationIdentities);
+
+        $clientIp = $this->resolveClientIpAddresses($request);
+        $ipAddressV4 = $clientIp['ip_address_v4'];
+        $ipAddressV6 = $clientIp['ip_address_v6'];
+
+        $clientReportedIpV4 = $this->normalizeIpAddress($request->input('vmd_ip_address_v4'));
+        if ($clientReportedIpV4 && $clientReportedIpV4['ip_address_v4']) {
+            $ipAddressV4 = $clientReportedIpV4['ip_address_v4'];
+        }
+
+        $clientReportedIpV6 = $this->normalizeIpAddress($request->input('vmd_ip_address_v6'));
+        if ($clientReportedIpV6 && $clientReportedIpV6['ip_address_v6']) {
+            $ipAddressV6 = $clientReportedIpV6['ip_address_v6'];
+        }
+
+        $ipAddress = $ipAddressV4 ?: $ipAddressV6 ?: $clientIp['ip_address'];
+        $clientSentAt = null;
+        if (! empty($validated['client_sent_at'])) {
+            try {
+                $clientSentAt = Carbon::parse($validated['client_sent_at']);
+            } catch (\Throwable $error) {
+                $clientSentAt = null;
+            }
+        }
+
+        $now = Carbon::now();
+        $userAgent = $request->header('User-Agent');
+        $existingIdentity = DB::table('browser_identities')
+            ->where('browser_uuid', $browserUuid)
+            ->first();
+
+        if ($existingIdentity) {
+            DB::table('browser_identities')
+                ->where('id', $existingIdentity->id)
+                ->update([
+                    'last_seen_at' => $now,
+                    'last_ip_address' => $ipAddress,
+                    'last_user_agent_hash' => $userAgent ? hash('sha256', $userAgent) : null,
+                    'last_current_user_email' => $currentUserEmail,
+                    'last_current_user_identity_type' => $currentUserIdentityType,
+                    'last_selected_game_intake_code' => $validated['selected_game_intake_code'] ?? null,
+                    'last_notification_identity_count' => $notificationIdentityCount,
+                    'updated_at' => $now,
+                ]);
+            $browserIdentityId = (int) $existingIdentity->id;
+        } else {
+            $browserIdentityId = (int) DB::table('browser_identities')->insertGetId([
+                'browser_uuid' => $browserUuid,
+                'first_seen_at' => $now,
+                'last_seen_at' => $now,
+                'first_ip_address' => $ipAddress,
+                'last_ip_address' => $ipAddress,
+                'first_user_agent_hash' => $userAgent ? hash('sha256', $userAgent) : null,
+                'last_user_agent_hash' => $userAgent ? hash('sha256', $userAgent) : null,
+                'last_current_user_email' => $currentUserEmail,
+                'last_current_user_identity_type' => $currentUserIdentityType,
+                'last_selected_game_intake_code' => $validated['selected_game_intake_code'] ?? null,
+                'last_notification_identity_count' => $notificationIdentityCount,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+        }
+
+        DB::table('browser_identity_events')->insert([
+            'browser_identity_id' => $browserIdentityId,
+            'browser_uuid' => $browserUuid,
+            'event_type' => 'local_notification_identity_report',
+            'current_user_email' => $currentUserEmail,
+            'current_user_custno' => $currentUserCustno,
+            'current_user_identity_type' => $currentUserIdentityType,
+            'selected_game_intake_code' => $validated['selected_game_intake_code'] ?? null,
+            'origin' => $validated['origin'] ?? null,
+            'ip_address' => $ipAddress,
+            'ip_address_v4' => $ipAddressV4,
+            'ip_address_v6' => $ipAddressV6,
+            'user_agent' => $userAgent,
+            'timezone' => $validated['timezone'] ?? null,
+            'locale' => $validated['locale'] ?? null,
+            'screen_size' => $validated['screen_size'] ?? null,
+            'viewport_size' => $validated['viewport_size'] ?? null,
+            'notification_identities' => json_encode($notificationIdentities),
+            'notification_identity_count' => $notificationIdentityCount,
+            'payload' => json_encode([
+                'notification_identity_emails' => array_column($notificationIdentities, 'email'),
+            ]),
+            'client_sent_at' => $clientSentAt,
+            'created_at' => $now,
+            'updated_at' => $now,
+        ]);
+
+        return response()->json([
+            'ok' => true,
+            'recorded' => true,
+            'browser_uuid' => $browserUuid,
+            'notification_identity_count' => $notificationIdentityCount,
+        ], 200);
+    }
 
 
     public function F0_VMD_user_heartbeat(Request $request)

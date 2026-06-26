@@ -1803,6 +1803,193 @@ class VelodataRegressionTest extends TestCase
         $this->assertSame($protectorAvatar, $unmaskedRow['attributes']['actor_profile_image'] ?? null);
     }
 
+    public function test_audit_history_uses_server_side_pagination_metadata(): void
+    {
+        $staffAdmin = $this->createStaffUser('audit-pagination-admin@example.test', 'Admin');
+        $target = $this->createStaffUser('audit-pagination-target@example.test', 'Member');
+
+        for ($index = 1; $index <= 130; $index++) {
+            DB::table('user_audit_history')->insert([
+                'custno' => 100000 + (int) $target->id,
+                'comments' => 'Audit pagination row ' . $index,
+                'clerk_id' => $staffAdmin->name,
+                'created_by_email' => $staffAdmin->email,
+                'created_by_ip_address' => '127.0.0.1',
+                'created_at' => now()->subMinutes($index),
+                'updated_at' => now()->subMinutes($index),
+            ]);
+        }
+
+        $response = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+            'page' => 2,
+            'per_page' => 25,
+        ])->assertOk();
+
+        $response->assertJsonPath('page', 2);
+        $response->assertJsonPath('per_page', 25);
+        $response->assertJsonPath('recordsTotal', 130);
+        $response->assertJsonPath('recordsFiltered', 130);
+        $this->assertCount(25, $response->json('data'));
+        $this->assertSame('Audit pagination row 26', $response->json('data.0.attributes.comments'));
+    }
+
+    public function test_audit_history_date_performed_uses_dteprfmd_before_row_timestamp(): void
+    {
+        $staffAdmin = $this->createStaffUser('audit-date-admin@example.test', 'Admin');
+        $target = $this->createStaffUser('audit-date-target@example.test', 'Member');
+
+        DB::table('user_audit_history')->insert([
+            'custno' => 100000 + (int) $target->id,
+            'comments' => 'Audit date performed regression row',
+            'clerk_id' => $staffAdmin->name,
+            'created_by_email' => $staffAdmin->email,
+            'created_by_ip_address' => '95.173.193.8',
+            'dteprfmd' => '2026-06-24 10:58:34',
+            'created_at' => '2026-06-24 20:58:34',
+            'updated_at' => '2026-06-24 20:58:34',
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+            'search' => '95.173.193.8',
+        ])->assertOk();
+
+        $this->assertSame('Audit date performed regression row', $response->json('data.0.attributes.comments'));
+        $this->assertSame('2026-06-24 10:58:34', $response->json('data.0.attributes.created_at'));
+    }
+
+    public function test_audit_history_resolves_game_user_target_and_creator_from_joins(): void
+    {
+        $staffAdmin = $this->createStaffUser('audit-target-admin@example.test', 'Admin');
+        $intakeId = $this->createIntake('TEST-AUDIT-TARGET-JOIN');
+        $creator = $this->createGameUser('audit-target-creator@example.test', 'Creator', 'active', $intakeId);
+        $target = $this->createGameUser('audit-target-created@example.test', 'Member', 'active', $intakeId);
+
+        DB::table('game_users')
+            ->where('id', $target->id)
+            ->update([
+                'display_name' => 'Joined Target',
+                'created_by_email' => $creator->email,
+            ]);
+
+        DB::table('user_audit_history')->insert([
+            'custno' => 900000 + (int) $target->id,
+            'comments' => 'Fake account created by Student via New User function',
+            'clerk_id' => $creator->display_name,
+            'created_by_email' => $creator->email,
+            'created_by_ip_address' => '95.173.193.8',
+            'dteprfmd' => '2026-06-24 10:58:34',
+            'created_at' => '2026-06-24 20:58:34',
+            'updated_at' => '2026-06-24 20:58:34',
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+            'search' => '95.173.193.8',
+        ])->assertOk();
+
+        $this->assertSame('Joined Target', $response->json('data.0.attributes.target_name'));
+        $this->assertSame($target->email, $response->json('data.0.attributes.target_email'));
+        $this->assertSame('Member', $response->json('data.0.attributes.target_role_name'));
+        $this->assertSame('student', $response->json('data.0.attributes.target_identity_type'));
+        $this->assertSame($creator->email, $response->json('data.0.attributes.target_created_by_email'));
+        $this->assertSame($creator->display_name, $response->json('data.0.attributes.target_created_by_name'));
+    }
+
+    public function test_audit_history_resolves_deleted_game_user_target_from_baseline_snapshot(): void
+    {
+        $staffAdmin = $this->createStaffUser('audit-snapshot-admin@example.test', 'Admin');
+        $intakeId = $this->createIntake('TEST-AUDIT-SNAPSHOT-JOIN');
+        $creator = $this->createGameUser('audit-snapshot-creator@example.test', 'Creator', 'active', $intakeId);
+        $deletedGameUserId = 7777;
+        $deletedCustno = 900000 + $deletedGameUserId;
+        $baselineId = DB::table('game_baselines')->insertGetId([
+            'intake_id' => $intakeId,
+            'name' => 'Deleted student audit lookup baseline',
+            'description' => 'Baseline row used to resolve an audit target after game_users deletion.',
+            'is_active' => true,
+            'created_by_user_id' => $staffAdmin->id,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        DB::table('game_baseline_users')->insert([
+            'baseline_id' => $baselineId,
+            'game_user_id' => $deletedGameUserId,
+            'first_name' => 'Deleted',
+            'surname' => 'Student',
+            'preferred_name' => 'Deleted Student',
+            'display_name' => 'Deleted Snapshot Student',
+            'email' => 'deleted-snapshot-student@example.test',
+            'game_role' => 'Member',
+            'game_status' => 'DELETED',
+            'is_spy' => false,
+            'is_protector' => false,
+            'metadata' => json_encode(['created_by_email' => $creator->email]),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        DB::table('user_audit_history')->insert([
+            'custno' => $deletedCustno,
+            'comments' => 'User password changed',
+            'clerk_id' => $creator->display_name,
+            'created_by_email' => $creator->email,
+            'created_by_ip_address' => '95.173.193.8',
+            'dteprfmd' => '2026-06-24 10:58:34',
+            'created_at' => '2026-06-24 20:58:34',
+            'updated_at' => '2026-06-24 20:58:34',
+        ]);
+
+        $response = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+            'search' => (string) $deletedCustno,
+        ])->assertOk();
+
+        $this->assertSame('Deleted Snapshot Student', $response->json('data.0.attributes.target_name'));
+        $this->assertSame('deleted-snapshot-student@example.test', $response->json('data.0.attributes.target_email'));
+        $this->assertSame('Member', $response->json('data.0.attributes.target_role_name'));
+        $this->assertSame('student', $response->json('data.0.attributes.target_identity_type'));
+        $this->assertSame($creator->email, $response->json('data.0.attributes.target_created_by_email'));
+        $this->assertSame($creator->display_name, $response->json('data.0.attributes.target_created_by_name'));
+    }
+
+    public function test_audit_history_search_filters_before_server_side_pagination(): void
+    {
+        $staffAdmin = $this->createStaffUser('audit-search-admin@example.test', 'Admin');
+        $target = $this->createStaffUser('audit-search-target@example.test', 'Member');
+
+        for ($index = 1; $index <= 130; $index++) {
+            DB::table('user_audit_history')->insert([
+                'custno' => 100000 + (int) $target->id,
+                'comments' => $index % 2 === 0
+                    ? 'Password audit row ' . $index
+                    : 'Profile audit row ' . $index,
+                'clerk_id' => $staffAdmin->name,
+                'created_by_email' => $staffAdmin->email,
+                'created_by_ip_address' => '127.0.0.1',
+                'created_at' => now()->subMinutes($index),
+                'updated_at' => now()->subMinutes($index),
+            ]);
+        }
+
+        $response = $this->postJson('/api/v2/VMD-get-audit-history', [
+            'email' => $staffAdmin->email,
+            'search' => 'password',
+            'page' => 2,
+            'per_page' => 25,
+        ])->assertOk();
+
+        $response->assertJsonPath('page', 2);
+        $response->assertJsonPath('per_page', 25);
+        $response->assertJsonPath('search', 'password');
+        $response->assertJsonPath('recordsTotal', 130);
+        $response->assertJsonPath('recordsFiltered', 65);
+        $this->assertCount(25, $response->json('data'));
+        $this->assertSame('Password audit row 52', $response->json('data.0.attributes.comments'));
+    }
+
     public function test_online_users_response_displays_enabled_protector_actor_mask_for_requested_intake(): void
     {
         $intakeCode = 'TEST-PROTECTOR-ONLINE-MASK';
@@ -2353,6 +2540,66 @@ class VelodataRegressionTest extends TestCase
             'https://dashboard.velodata.org/storage/student-avatar.png',
             $loginRow['attributes']['profile_image'] ?? null
         );
+    }
+
+    public function test_browser_trace_report_stores_local_notification_identities(): void
+    {
+        $intakeId = $this->createIntake('TEST-BROWSER-TRACE');
+        $student = $this->createGameUser('rafiki@king.com', 'Protector', 'active', $intakeId);
+
+        $response = $this
+            ->withHeaders([
+                'User-Agent' => 'Browser Trace Test Agent',
+            ])
+            ->postJson('/api/v2/VMD-report-browser-trace', [
+                'browser_uuid' => 'browser-trace-test-uuid',
+                'current_user' => [
+                    'email' => $student->email,
+                    'custno' => 900000 + (int) $student->id,
+                    'identity_type' => 'student',
+                    'is_game_user' => true,
+                ],
+                'origin' => 'https://dashboard.velodata.org',
+                'selected_game_intake_code' => 'TEST-BROWSER-TRACE',
+                'notification_identities' => [
+                    ['email' => 'creator@jsonapi.com', 'notification_count' => 2],
+                    ['email' => 'ivan@equinimcollege.com', 'notification_count' => 1],
+                    ['email' => 'creator@jsonapi.com', 'notification_count' => 2],
+                ],
+                'timezone' => 'Australia/Brisbane',
+                'locale' => 'en-AU',
+                'screen_size' => '1920x1080',
+                'viewport_size' => '1800x900',
+                'client_sent_at' => '2026-06-24T11:38:24.000Z',
+                'vmd_ip_address_v4' => '45.248.76.214',
+            ])
+            ->assertOk();
+
+        $response->assertJsonPath('recorded', true);
+        $response->assertJsonPath('notification_identity_count', 2);
+
+        $this->assertDatabaseHas('browser_identities', [
+            'browser_uuid' => 'browser-trace-test-uuid',
+            'last_current_user_email' => 'rafiki@king.com',
+            'last_current_user_identity_type' => 'student',
+            'last_selected_game_intake_code' => 'TEST-BROWSER-TRACE',
+            'last_notification_identity_count' => 2,
+        ]);
+
+        $event = DB::table('browser_identity_events')
+            ->where('browser_uuid', 'browser-trace-test-uuid')
+            ->first();
+
+        $this->assertNotNull($event);
+        $this->assertSame('local_notification_identity_report', $event->event_type);
+        $this->assertSame('rafiki@king.com', $event->current_user_email);
+        $this->assertSame('45.248.76.214', $event->ip_address_v4);
+
+        $reportedEmails = collect(json_decode($event->notification_identities, true))
+            ->pluck('email')
+            ->all();
+
+        $this->assertSame(['creator@jsonapi.com', 'ivan@equinimcollege.com'], $reportedEmails);
     }
 
     public function test_system_admin_user_id_one_can_never_be_edited(): void
