@@ -2584,22 +2584,123 @@ class VelodataRegressionTest extends TestCase
             'last_current_user_identity_type' => 'student',
             'last_selected_game_intake_code' => 'TEST-BROWSER-TRACE',
             'last_notification_identity_count' => 2,
+            'report_count' => 1,
         ]);
 
-        $event = DB::table('browser_identity_events')
+        $identity = DB::table('browser_identities')
             ->where('browser_uuid', 'browser-trace-test-uuid')
             ->first();
 
-        $this->assertNotNull($event);
-        $this->assertSame('local_notification_identity_report', $event->event_type);
-        $this->assertSame('rafiki@king.com', $event->current_user_email);
-        $this->assertSame('45.248.76.214', $event->ip_address_v4);
+        $this->assertNotNull($identity);
+        $this->assertSame('45.248.76.214', $identity->last_ip_address);
 
-        $reportedEmails = collect(json_decode($event->notification_identities, true))
+        $reportedEmails = collect(json_decode($identity->known_notification_identities, true))
             ->pluck('email')
             ->all();
 
         $this->assertSame(['creator@jsonapi.com', 'ivan@equinimcollege.com'], $reportedEmails);
+        $this->assertSame(0, DB::table('browser_identity_events')->where('browser_uuid', 'browser-trace-test-uuid')->count());
+    }
+
+    public function test_browser_trace_report_merges_repeated_uuid_reports_into_one_summary(): void
+    {
+        $intakeId = $this->createIntake('TEST-BROWSER-TRACE-MERGE');
+        $student = $this->createGameUser('browser-trace-merge-student@example.test', 'Creator', 'active', $intakeId);
+
+        $payload = [
+            'browser_uuid' => 'browser-trace-merge-uuid',
+            'current_user' => [
+                'email' => $student->email,
+                'custno' => 900000 + (int) $student->id,
+                'identity_type' => 'student',
+                'is_game_user' => true,
+            ],
+            'selected_game_intake_code' => 'TEST-BROWSER-TRACE-MERGE',
+            'notification_identities' => [
+                ['email' => 'creator@jsonapi.com', 'notification_count' => 2],
+            ],
+            'vmd_ip_address_v4' => '45.248.76.214',
+        ];
+
+        $this->postJson('/api/v2/VMD-report-browser-trace', $payload)->assertOk();
+        $this->postJson('/api/v2/VMD-report-browser-trace', array_merge($payload, [
+            'vmd_ip_address_v4' => '124.148.89.46',
+        ]))->assertOk();
+
+        $this->assertSame(1, DB::table('browser_identities')->where('browser_uuid', 'browser-trace-merge-uuid')->count());
+        $this->assertSame(0, DB::table('browser_identity_events')->where('browser_uuid', 'browser-trace-merge-uuid')->count());
+
+        $identity = DB::table('browser_identities')
+            ->where('browser_uuid', 'browser-trace-merge-uuid')
+            ->first();
+
+        $this->assertSame(2, (int) $identity->report_count);
+        $this->assertSame('124.148.89.46', $identity->last_ip_address);
+        $this->assertSame(
+            ['45.248.76.214', '124.148.89.46'],
+            collect(json_decode($identity->known_ip_addresses, true))->pluck('ip_address')->all()
+        );
+        $this->assertSame(
+            [$student->email],
+            collect(json_decode($identity->known_reporter_accounts, true))->pluck('email')->all()
+        );
+    }
+
+    public function test_staff_can_search_browser_trace_reports_and_see_student_staff_identity_flags(): void
+    {
+        $intakeId = $this->createIntake('TEST-BROWSER-TRACE-SEARCH');
+        $staffAdmin = $this->createStaffUser('browser-trace-admin@example.test', 'Admin');
+        $student = $this->createGameUser('browser-trace-student@example.test', 'Creator', 'active', $intakeId);
+        $staffCreator = $this->createStaffUser('creator@jsonapi.com', 'Admin');
+
+        $this
+            ->withHeaders(['User-Agent' => 'Browser Trace Search Test Agent'])
+            ->postJson('/api/v2/VMD-report-browser-trace', [
+                'browser_uuid' => 'browser-trace-search-uuid',
+                'current_user' => [
+                    'email' => $student->email,
+                    'custno' => 900000 + (int) $student->id,
+                    'identity_type' => 'student',
+                    'is_game_user' => true,
+                ],
+                'selected_game_intake_code' => 'TEST-BROWSER-TRACE-SEARCH',
+                'notification_identities' => [
+                    ['email' => $staffCreator->email, 'notification_count' => 3],
+                    ['email' => 'student-friend@example.test', 'notification_count' => 1],
+                ],
+                'vmd_ip_address_v4' => '45.248.76.214',
+            ])
+            ->assertOk();
+
+        $response = $this->postJson('/api/v2/VMD-search-browser-traces', [
+            'vmd_user_email' => $staffAdmin->email,
+            'traced_identity_email' => $staffCreator->email,
+            'current_reporter_email' => $student->email,
+            'browser_uuid' => 'browser-trace-search-uuid',
+            'game_intake_code' => 'TEST-BROWSER-TRACE-SEARCH',
+            'ip_address' => '45.248.76.214',
+            'page' => 1,
+            'per_page' => 25,
+        ])->assertOk();
+
+        $response->assertJsonPath('recordsFiltered', 1);
+        $response->assertJsonPath('data.0.attributes.browser_uuid', 'browser-trace-search-uuid');
+        $response->assertJsonPath('data.0.attributes.current_reporter_email', $student->email);
+        $response->assertJsonPath('data.0.attributes.current_reporter_identity_type', 'student');
+        $response->assertJsonPath('data.0.attributes.selected_game_intake_code', 'TEST-BROWSER-TRACE-SEARCH');
+        $response->assertJsonPath('data.0.attributes.student_reporter_has_staff_trace', true);
+        $response->assertJsonPath('data.0.attributes.student_reporter_has_protected_trace', true);
+        $response->assertJsonPath('data.0.attributes.notification_identities.0.email', $staffCreator->email);
+        $response->assertJsonPath('data.0.attributes.notification_identities.0.identity_type', 'staff');
+    }
+
+    public function test_student_cannot_search_browser_trace_reports(): void
+    {
+        $student = $this->createGameUser('browser-trace-denied-student@example.test', 'Protector');
+
+        $this->postJson('/api/v2/VMD-search-browser-traces', [
+            'vmd_user_email' => $student->email,
+        ])->assertForbidden();
     }
 
     public function test_system_admin_user_id_one_can_never_be_edited(): void

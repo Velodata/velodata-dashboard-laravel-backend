@@ -6350,9 +6350,326 @@ if ($validator->fails()) {
     // ***** end of PHP file  ****
 
 
+    public function F0_VMD_search_browser_traces(Request $request)
+    {
+        if (! Schema::hasTable('browser_identities') || ! Schema::hasTable('browser_identity_ip_addresses') || ! Schema::hasTable('browser_identity_notification_emails') || ! Schema::hasTable('browser_identity_login_accounts')) {
+            return response()->json([
+                'data' => [],
+                'page' => 1,
+                'per_page' => 50,
+                'recordsFiltered' => 0,
+                'recordsTotal' => 0,
+                'outcome' => 'browser_trace_tables_missing',
+            ], 200);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'vmd_user_email' => 'required|email',
+            'traced_identity_email' => 'nullable|string|max:255',
+            'current_reporter_email' => 'nullable|string|max:255',
+            'reporter_identity_type' => 'nullable|string|max:20',
+            'browser_uuid' => 'nullable|string|max:80',
+            'game_intake_code' => 'nullable|string|max:80',
+            'ip_address' => 'nullable|string|max:45',
+            'search' => 'nullable|string|max:255',
+            'page' => 'nullable|integer|min:1',
+            'per_page' => 'nullable|integer|min:1|max:250',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Browser trace search request is invalid.',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $validated = $validator->validated();
+        $viewerEmail = strtolower(trim((string) $validated['vmd_user_email']));
+        if (! $this->isStaffRoleEmail($viewerEmail, ['Admin', 'Protector'])) {
+            return response()->json([
+                'message' => 'Permission Denied: browser trace reporting requires Staff Admin or Staff Protector access.',
+            ], 403);
+        }
+
+        $page = max(1, (int) ($validated['page'] ?? 1));
+        $perPage = (int) ($validated['per_page'] ?? 50);
+        if (! in_array($perPage, [25, 50, 100, 250], true)) {
+            $perPage = 50;
+        }
+
+        $normalizeEmailFilter = fn ($value) => strtolower(trim((string) $value));
+        $tracedIdentityEmail = $normalizeEmailFilter($validated['traced_identity_email'] ?? '');
+        $currentReporterEmail = $normalizeEmailFilter($validated['current_reporter_email'] ?? '');
+        $reporterIdentityType = strtolower(trim((string) ($validated['reporter_identity_type'] ?? '')));
+        $browserUuid = trim((string) ($validated['browser_uuid'] ?? ''));
+        $gameIntakeCode = trim((string) ($validated['game_intake_code'] ?? ''));
+        $ipAddress = trim((string) ($validated['ip_address'] ?? ''));
+        $searchTerm = trim((string) ($validated['search'] ?? ''));
+
+        $baseQuery = DB::table('browser_identities');
+        $recordsTotal = (clone $baseQuery)->count('browser_identities.id');
+
+        if ($tracedIdentityEmail !== '') {
+            $baseQuery->whereExists(function ($query) use ($tracedIdentityEmail) {
+                $query->select(DB::raw(1))
+                    ->from('browser_identity_notification_emails')
+                    ->whereColumn('browser_identity_notification_emails.browser_identity_id', 'browser_identities.id')
+                    ->where('browser_identity_notification_emails.email', $tracedIdentityEmail);
+            });
+        }
+
+        if ($currentReporterEmail !== '') {
+            $baseQuery->whereExists(function ($query) use ($currentReporterEmail) {
+                $query->select(DB::raw(1))
+                    ->from('browser_identity_login_accounts')
+                    ->whereColumn('browser_identity_login_accounts.browser_identity_id', 'browser_identities.id')
+                    ->where('browser_identity_login_accounts.email', $currentReporterEmail);
+            });
+        }
+
+        if (in_array($reporterIdentityType, ['staff', 'student'], true)) {
+            $baseQuery->whereExists(function ($query) use ($reporterIdentityType) {
+                $query->select(DB::raw(1))
+                    ->from('browser_identity_login_accounts')
+                    ->whereColumn('browser_identity_login_accounts.browser_identity_id', 'browser_identities.id')
+                    ->where('browser_identity_login_accounts.identity_type', $reporterIdentityType);
+            });
+        }
+
+        if ($browserUuid !== '') {
+            $baseQuery->where('browser_identities.browser_uuid', $browserUuid);
+        }
+
+        if ($gameIntakeCode !== '') {
+            $baseQuery->where('browser_identities.last_selected_game_intake_code', $gameIntakeCode);
+        }
+
+        if ($ipAddress !== '') {
+            $baseQuery->whereExists(function ($query) use ($ipAddress) {
+                $query->select(DB::raw(1))
+                    ->from('browser_identity_ip_addresses')
+                    ->whereColumn('browser_identity_ip_addresses.browser_identity_id', 'browser_identities.id')
+                    ->where(function ($ipQuery) use ($ipAddress) {
+                        $ipQuery->where('browser_identity_ip_addresses.ip_address', $ipAddress)
+                            ->orWhere('browser_identity_ip_addresses.ip_address_v4', $ipAddress)
+                            ->orWhere('browser_identity_ip_addresses.ip_address_v6', $ipAddress);
+                    });
+            });
+        }
+
+        if ($searchTerm !== '') {
+            $searchLike = '%' . $searchTerm . '%';
+            $baseQuery->where(function ($query) use ($searchLike) {
+                $query
+                    ->where('browser_identities.browser_uuid', 'like', $searchLike)
+                    ->orWhere('browser_identities.first_ip_address', 'like', $searchLike)
+                    ->orWhere('browser_identities.last_ip_address', 'like', $searchLike)
+                    ->orWhere('browser_identities.last_current_user_email', 'like', $searchLike)
+                    ->orWhere('browser_identities.last_current_user_identity_type', 'like', $searchLike)
+                    ->orWhere('browser_identities.last_selected_game_intake_code', 'like', $searchLike)
+                    ->orWhereExists(function ($loginQuery) use ($searchLike) {
+                        $loginQuery->select(DB::raw(1))
+                            ->from('browser_identity_login_accounts')
+                            ->whereColumn('browser_identity_login_accounts.browser_identity_id', 'browser_identities.id')
+                            ->where(function ($nested) use ($searchLike) {
+                                $nested->where('browser_identity_login_accounts.email', 'like', $searchLike)
+                                    ->orWhere('browser_identity_login_accounts.name', 'like', $searchLike)
+                                    ->orWhere('browser_identity_login_accounts.role_name', 'like', $searchLike)
+                                    ->orWhere('browser_identity_login_accounts.intake_code', 'like', $searchLike);
+                            });
+                    })
+                    ->orWhereExists(function ($ipQuery) use ($searchLike) {
+                        $ipQuery->select(DB::raw(1))
+                            ->from('browser_identity_ip_addresses')
+                            ->whereColumn('browser_identity_ip_addresses.browser_identity_id', 'browser_identities.id')
+                            ->where(function ($nested) use ($searchLike) {
+                                $nested->where('browser_identity_ip_addresses.ip_address', 'like', $searchLike)
+                                    ->orWhere('browser_identity_ip_addresses.ip_address_v4', 'like', $searchLike)
+                                    ->orWhere('browser_identity_ip_addresses.ip_address_v6', 'like', $searchLike);
+                            });
+                    })
+                    ->orWhereExists(function ($emailQuery) use ($searchLike) {
+                        $emailQuery->select(DB::raw(1))
+                            ->from('browser_identity_notification_emails')
+                            ->whereColumn('browser_identity_notification_emails.browser_identity_id', 'browser_identities.id')
+                            ->where('browser_identity_notification_emails.email', 'like', $searchLike);
+                    });
+            });
+        }
+
+        $recordsFiltered = (clone $baseQuery)->count('browser_identities.id');
+        $lastPage = max(1, (int) ceil($recordsFiltered / $perPage));
+        $page = min($page, $lastPage);
+
+        $rows = $baseQuery
+            ->select('browser_identities.*')
+            ->orderBy('browser_identities.first_seen_at', 'DESC')
+            ->offset(($page - 1) * $perPage)
+            ->limit($perPage)
+            ->get();
+
+        $browserIdentityIds = $rows->pluck('id')->map(fn ($id) => (int) $id)->all();
+
+        $ipRowsByIdentity = empty($browserIdentityIds)
+            ? collect()
+            : DB::table('browser_identity_ip_addresses')
+                ->whereIn('browser_identity_id', $browserIdentityIds)
+                ->orderBy('updated_at', 'DESC')
+                ->get()
+                ->groupBy('browser_identity_id');
+
+        $notificationRowsByIdentity = empty($browserIdentityIds)
+            ? collect()
+            : DB::table('browser_identity_notification_emails')
+                ->whereIn('browser_identity_id', $browserIdentityIds)
+                ->orderBy('email')
+                ->get()
+                ->groupBy('browser_identity_id');
+
+        $loginRowsQuery = empty($browserIdentityIds)
+            ? null
+            : DB::table('browser_identity_login_accounts')->whereIn('browser_identity_id', $browserIdentityIds);
+
+        $loginRowsByIdentity = $loginRowsQuery
+            ? $loginRowsQuery->orderBy('email')->get()->groupBy('browser_identity_id')
+            : collect();
+
+        $identityEmails = $notificationRowsByIdentity
+            ->flatMap(fn ($group) => $group->pluck('email'))
+            ->map(fn ($email) => strtolower(trim((string) $email)))
+            ->filter()
+            ->unique()
+            ->values();
+
+        $reporterEmails = $loginRowsByIdentity
+            ->flatMap(fn ($group) => $group->pluck('email'))
+            ->map(fn ($email) => strtolower(trim((string) $email)))
+            ->filter()
+            ->unique()
+            ->values();
+
+        $allAccountEmails = $identityEmails
+            ->merge($reporterEmails)
+            ->unique()
+            ->values();
+
+        $staffIdentities = $allAccountEmails->isEmpty()
+            ? collect()
+            : DB::table('users')
+                ->whereIn(DB::raw('LOWER(email)'), $allAccountEmails->all())
+                ->get()
+                ->keyBy(fn ($user) => strtolower((string) $user->email));
+
+        $gameIdentities = $allAccountEmails->isEmpty()
+            ? collect()
+            : DB::table('game_users')
+                ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+                ->whereIn(DB::raw('LOWER(game_users.email)'), $allAccountEmails->all())
+                ->select('game_users.email', 'game_users.display_name', 'game_users.game_role', 'game_users.game_status', 'game_intakes.code as intake_code')
+                ->get()
+                ->keyBy(fn ($gameUser) => strtolower((string) $gameUser->email));
+
+        $protectedStaffEmails = collect($this->protectedStaffAccountEmails())
+            ->merge(['creator@jsonapi.com', 'ivan@equinimcollege.com', 'admin@jsonapi.com', 'admin@velodata.org', 'ivanvetsich@gmail.com', 'bradpitt@velodata.org'])
+            ->map(fn ($email) => strtolower(trim((string) $email)))
+            ->unique()
+            ->values()
+            ->all();
+
+        $data = $rows->map(function ($row) use ($ipRowsByIdentity, $notificationRowsByIdentity, $loginRowsByIdentity, $staffIdentities, $gameIdentities, $protectedStaffEmails) {
+            $notificationIdentities = collect($notificationRowsByIdentity->get($row->id, collect()))
+                ->map(function ($identity) use ($staffIdentities, $gameIdentities, $protectedStaffEmails) {
+                    $email = strtolower(trim((string) ($identity->email ?? '')));
+                    $staff = $staffIdentities->get($email);
+                    $gameUser = $gameIdentities->get($email);
+
+                    return [
+                        'email' => $email,
+                        'notification_count' => (int) ($identity->notification_count ?? 0),
+                        'identity_type' => $staff ? 'staff' : ($gameUser ? 'student' : null),
+                        'name' => $staff->name ?? $gameUser->display_name ?? null,
+                        'role_name' => $staff->role_name ?? $gameUser->game_role ?? null,
+                        'status' => $staff->status ?? $gameUser->game_status ?? null,
+                        'intake_code' => $gameUser->intake_code ?? null,
+                        'is_staff_identity' => (bool) $staff,
+                        'is_protected_identity' => in_array($email, $protectedStaffEmails, true),
+                    ];
+                })
+                ->filter(fn ($identity) => $identity['email'] !== '')
+                ->values();
+
+            $reporterAccounts = collect($loginRowsByIdentity->get($row->id, collect()))
+                ->map(function ($login) use ($staffIdentities, $gameIdentities) {
+                    $email = strtolower(trim((string) ($login->email ?? '')));
+                    $staff = $email !== '' ? $staffIdentities->get($email) : null;
+                    $gameUser = $email !== '' ? $gameIdentities->get($email) : null;
+                    $identityType = $staff ? 'staff' : ($gameUser ? 'student' : ($login->identity_type ?? null));
+
+                    return [
+                        'email' => $email,
+                        'custno' => null,
+                        'identity_type' => $identityType,
+                        'name' => $staff->name ?? $gameUser->display_name ?? $login->name ?? null,
+                        'role_name' => $staff->role_name ?? $gameUser->game_role ?? $login->role_name ?? null,
+                        'status' => $staff->status ?? $gameUser->game_status ?? null,
+                        'intake_code' => $gameUser->intake_code ?? $login->intake_code ?? null,
+                    ];
+                })
+                ->filter(fn ($reporter) => $reporter['email'] !== '')
+                ->values();
+
+            $knownIpAddresses = collect($ipRowsByIdentity->get($row->id, collect()))
+                ->map(fn ($ipRow) => [
+                    'ip_address' => $ipRow->ip_address,
+                    'ip_address_v4' => $ipRow->ip_address_v4,
+                    'ip_address_v6' => $ipRow->ip_address_v6,
+                ])
+                ->values();
+
+            $studentReporterSeen = $reporterAccounts->contains(fn ($reporter) => strtolower((string) ($reporter['identity_type'] ?? '')) === 'student');
+            $staffTraceCount = $notificationIdentities->filter(fn ($identity) => $identity['is_staff_identity'] || $identity['is_protected_identity'])->count();
+            $protectedTraceCount = $notificationIdentities->filter(fn ($identity) => $identity['is_protected_identity'])->count();
+            $knownIntakeCodes = $row->last_selected_game_intake_code ? [['code' => $row->last_selected_game_intake_code]] : [];
+
+            return [
+                'type' => 'browser_identity',
+                'id' => (int) $row->id,
+                'attributes' => [
+                    'browser_uuid' => $row->browser_uuid,
+                    'first_seen_at' => $row->first_seen_at,
+                    'last_seen_at' => $row->last_seen_at,
+                    'created_at' => $row->created_at,
+                    'report_count' => (int) ($row->report_count ?? 0),
+                    'current_reporter_email' => $row->last_current_user_email,
+                    'current_reporter_identity_type' => $row->last_current_user_identity_type,
+                    'selected_game_intake_code' => $row->last_selected_game_intake_code,
+                    'ip_address' => $row->last_ip_address,
+                    'known_ip_addresses' => $knownIpAddresses->all(),
+                    'known_reporter_accounts' => $reporterAccounts->all(),
+                    'known_intake_codes' => $knownIntakeCodes,
+                    'notification_identity_count' => (int) ($row->last_notification_identity_count ?? $notificationIdentities->count()),
+                    'notification_identities' => $notificationIdentities->all(),
+                    'staff_trace_count' => $staffTraceCount,
+                    'protected_trace_count' => $protectedTraceCount,
+                    'student_reporter_has_staff_trace' => $studentReporterSeen && $staffTraceCount > 0,
+                    'student_reporter_has_protected_trace' => $studentReporterSeen && $protectedTraceCount > 0,
+                ],
+            ];
+        });
+
+        return response()->json([
+            'data' => $data,
+            'page' => $page,
+            'per_page' => $perPage,
+            'search' => $searchTerm,
+            'recordsFiltered' => $recordsFiltered,
+            'recordsTotal' => $recordsTotal,
+        ], 200);
+    }
+
     public function F0_VMD_report_browser_trace(Request $request)
     {
-        if (! Schema::hasTable('browser_identities') || ! Schema::hasTable('browser_identity_events')) {
+        if (! Schema::hasTable('browser_identities') || ! Schema::hasTable('browser_identity_ip_addresses') || ! Schema::hasTable('browser_identity_notification_emails') || ! Schema::hasTable('browser_identity_login_accounts')) {
             return response()->json([
                 'ok' => true,
                 'recorded' => false,
@@ -6392,9 +6709,6 @@ if ($validator->fails()) {
         $browserUuid = trim((string) $validated['browser_uuid']);
         $currentUser = $validated['current_user'] ?? [];
         $currentUserEmail = isset($currentUser['email']) ? strtolower(trim((string) $currentUser['email'])) : null;
-        $currentUserCustno = isset($currentUser['custno']) && is_numeric($currentUser['custno'])
-            ? (int) $currentUser['custno']
-            : null;
         $currentUserIdentityType = $currentUser['identity_type'] ?? ((bool) ($currentUser['is_game_user'] ?? false) ? 'student' : null);
 
         $notificationIdentityMap = [];
@@ -6403,7 +6717,6 @@ if ($validator->fails()) {
             if ($email === '') {
                 continue;
             }
-
             $notificationIdentityMap[$email] = [
                 'email' => $email,
                 'notification_count' => (int) ($identity['notification_count'] ?? 0),
@@ -6428,34 +6741,22 @@ if ($validator->fails()) {
         }
 
         $ipAddress = $ipAddressV4 ?: $ipAddressV6 ?: $clientIp['ip_address'];
-        $clientSentAt = null;
-        if (! empty($validated['client_sent_at'])) {
-            try {
-                $clientSentAt = Carbon::parse($validated['client_sent_at']);
-            } catch (\Throwable $error) {
-                $clientSentAt = null;
-            }
-        }
-
         $now = Carbon::now();
         $userAgent = $request->header('User-Agent');
-        $existingIdentity = DB::table('browser_identities')
-            ->where('browser_uuid', $browserUuid)
-            ->first();
+        $existingIdentity = DB::table('browser_identities')->where('browser_uuid', $browserUuid)->first();
 
         if ($existingIdentity) {
-            DB::table('browser_identities')
-                ->where('id', $existingIdentity->id)
-                ->update([
-                    'last_seen_at' => $now,
-                    'last_ip_address' => $ipAddress,
-                    'last_user_agent_hash' => $userAgent ? hash('sha256', $userAgent) : null,
-                    'last_current_user_email' => $currentUserEmail,
-                    'last_current_user_identity_type' => $currentUserIdentityType,
-                    'last_selected_game_intake_code' => $validated['selected_game_intake_code'] ?? null,
-                    'last_notification_identity_count' => $notificationIdentityCount,
-                    'updated_at' => $now,
-                ]);
+            DB::table('browser_identities')->where('id', $existingIdentity->id)->update([
+                'last_seen_at' => $now,
+                'last_ip_address' => $ipAddress,
+                'last_user_agent_hash' => $userAgent ? hash('sha256', $userAgent) : null,
+                'last_current_user_email' => $currentUserEmail,
+                'last_current_user_identity_type' => $currentUserIdentityType,
+                'last_selected_game_intake_code' => $validated['selected_game_intake_code'] ?? null,
+                'last_notification_identity_count' => $notificationIdentityCount,
+                'report_count' => DB::raw('COALESCE(report_count, 0) + 1'),
+                'updated_at' => $now,
+            ]);
             $browserIdentityId = (int) $existingIdentity->id;
         } else {
             $browserIdentityId = (int) DB::table('browser_identities')->insertGetId([
@@ -6470,46 +6771,98 @@ if ($validator->fails()) {
                 'last_current_user_identity_type' => $currentUserIdentityType,
                 'last_selected_game_intake_code' => $validated['selected_game_intake_code'] ?? null,
                 'last_notification_identity_count' => $notificationIdentityCount,
+                'report_count' => 1,
                 'created_at' => $now,
                 'updated_at' => $now,
             ]);
         }
 
-        DB::table('browser_identity_events')->insert([
-            'browser_identity_id' => $browserIdentityId,
-            'browser_uuid' => $browserUuid,
-            'event_type' => 'local_notification_identity_report',
-            'current_user_email' => $currentUserEmail,
-            'current_user_custno' => $currentUserCustno,
-            'current_user_identity_type' => $currentUserIdentityType,
-            'selected_game_intake_code' => $validated['selected_game_intake_code'] ?? null,
-            'origin' => $validated['origin'] ?? null,
-            'ip_address' => $ipAddress,
-            'ip_address_v4' => $ipAddressV4,
-            'ip_address_v6' => $ipAddressV6,
-            'user_agent' => $userAgent,
-            'timezone' => $validated['timezone'] ?? null,
-            'locale' => $validated['locale'] ?? null,
-            'screen_size' => $validated['screen_size'] ?? null,
-            'viewport_size' => $validated['viewport_size'] ?? null,
-            'notification_identities' => json_encode($notificationIdentities),
-            'notification_identity_count' => $notificationIdentityCount,
-            'payload' => json_encode([
-                'notification_identity_emails' => array_column($notificationIdentities, 'email'),
-            ]),
-            'client_sent_at' => $clientSentAt,
-            'created_at' => $now,
-            'updated_at' => $now,
-        ]);
+        if ($currentUserEmail) {
+            $staffLogin = DB::table('users')->whereRaw('LOWER(email) = ?', [$currentUserEmail])->first();
+            $gameLogin = DB::table('game_users')
+                ->leftJoin('game_intakes', 'game_users.intake_id', '=', 'game_intakes.id')
+                ->whereRaw('LOWER(game_users.email) = ?', [$currentUserEmail])
+                ->select('game_users.email', 'game_users.display_name', 'game_users.game_role', 'game_intakes.code as intake_code')
+                ->first();
+            $loginIdentityType = $staffLogin ? 'staff' : ($gameLogin ? 'student' : $currentUserIdentityType);
+            $existingLogin = DB::table('browser_identity_login_accounts')
+                ->where('browser_identity_id', $browserIdentityId)
+                ->where('email', $currentUserEmail)
+                ->first();
+            $loginPayload = [
+                'browser_uuid' => $browserUuid,
+                'identity_type' => $loginIdentityType,
+                'name' => $staffLogin->name ?? $gameLogin->display_name ?? null,
+                'role_name' => $staffLogin->role_name ?? $gameLogin->game_role ?? null,
+                'intake_code' => $gameLogin->intake_code ?? ($validated['selected_game_intake_code'] ?? null),
+            ];
+            if ($existingLogin) {
+                DB::table('browser_identity_login_accounts')->where('id', $existingLogin->id)->update($loginPayload);
+            } else {
+                $loginPayload['browser_identity_id'] = $browserIdentityId;
+                $loginPayload['email'] = $currentUserEmail;
+                DB::table('browser_identity_login_accounts')->insert($loginPayload);
+            }
+        }
+
+        if ($ipAddress) {
+            $existingIp = DB::table('browser_identity_ip_addresses')
+                ->where('browser_identity_id', $browserIdentityId)
+                ->where('ip_address', $ipAddress)
+                ->first();
+
+            if ($existingIp) {
+                DB::table('browser_identity_ip_addresses')->where('id', $existingIp->id)->update([
+                    'browser_uuid' => $browserUuid,
+                    'ip_address_v4' => $ipAddressV4,
+                    'ip_address_v6' => $ipAddressV6,
+                    'updated_at' => $now,
+                ]);
+            } else {
+                DB::table('browser_identity_ip_addresses')->insert([
+                    'browser_identity_id' => $browserIdentityId,
+                    'browser_uuid' => $browserUuid,
+                    'ip_address' => $ipAddress,
+                    'ip_address_v4' => $ipAddressV4,
+                    'ip_address_v6' => $ipAddressV6,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            }
+        }
+
+        foreach ($notificationIdentities as $identity) {
+            $existingEmail = DB::table('browser_identity_notification_emails')
+                ->where('browser_identity_id', $browserIdentityId)
+                ->where('email', $identity['email'])
+                ->first();
+
+            if ($existingEmail) {
+                DB::table('browser_identity_notification_emails')->where('id', $existingEmail->id)->update([
+                    'browser_uuid' => $browserUuid,
+                    'notification_count' => (int) ($identity['notification_count'] ?? 0),
+                    'updated_at' => $now,
+                ]);
+            } else {
+                DB::table('browser_identity_notification_emails')->insert([
+                    'browser_identity_id' => $browserIdentityId,
+                    'browser_uuid' => $browserUuid,
+                    'email' => $identity['email'],
+                    'notification_count' => (int) ($identity['notification_count'] ?? 0),
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            }
+        }
 
         return response()->json([
             'ok' => true,
             'recorded' => true,
+            'storage' => 'browser_identity_summary',
             'browser_uuid' => $browserUuid,
             'notification_identity_count' => $notificationIdentityCount,
         ], 200);
     }
-
 
     public function F0_VMD_user_heartbeat(Request $request)
     {
