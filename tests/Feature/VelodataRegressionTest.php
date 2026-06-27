@@ -2594,7 +2594,9 @@ class VelodataRegressionTest extends TestCase
         $this->assertNotNull($identity);
         $this->assertSame('45.248.76.214', $identity->last_ip_address);
 
-        $reportedEmails = collect(json_decode($identity->known_notification_identities, true))
+        $reportedEmails = DB::table('browser_identity_notification_emails')
+            ->where('browser_uuid', 'browser-trace-test-uuid')
+            ->orderBy('email')
             ->pluck('email')
             ->all();
 
@@ -2636,13 +2638,19 @@ class VelodataRegressionTest extends TestCase
 
         $this->assertSame(2, (int) $identity->report_count);
         $this->assertSame('124.148.89.46', $identity->last_ip_address);
-        $this->assertSame(
+        $this->assertEqualsCanonicalizing(
             ['45.248.76.214', '124.148.89.46'],
-            collect(json_decode($identity->known_ip_addresses, true))->pluck('ip_address')->all()
+            DB::table('browser_identity_ip_addresses')
+                ->where('browser_uuid', 'browser-trace-merge-uuid')
+                ->pluck('ip_address')
+                ->all()
         );
         $this->assertSame(
             [$student->email],
-            collect(json_decode($identity->known_reporter_accounts, true))->pluck('email')->all()
+            DB::table('browser_identity_login_accounts')
+                ->where('browser_uuid', 'browser-trace-merge-uuid')
+                ->pluck('email')
+                ->all()
         );
     }
 
