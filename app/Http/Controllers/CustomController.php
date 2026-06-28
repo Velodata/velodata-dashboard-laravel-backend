@@ -6643,6 +6643,7 @@ if ($validator->fails()) {
                     'current_reporter_email' => $row->last_current_user_email,
                     'current_reporter_identity_type' => $row->last_current_user_identity_type,
                     'selected_game_intake_code' => $row->last_selected_game_intake_code,
+                    'user_agent' => property_exists($row, 'user_agent') ? $row->user_agent : null,
                     'ip_address' => $row->last_ip_address,
                     'known_ip_addresses' => $knownIpAddresses->all(),
                     'known_reporter_accounts' => $reporterAccounts->all(),
@@ -6749,6 +6750,7 @@ if ($validator->fails()) {
             DB::table('browser_identities')->where('id', $existingIdentity->id)->update([
                 'last_seen_at' => $now,
                 'last_ip_address' => $ipAddress,
+                'user_agent' => $userAgent,
                 'last_user_agent_hash' => $userAgent ? hash('sha256', $userAgent) : null,
                 'last_current_user_email' => $currentUserEmail,
                 'last_current_user_identity_type' => $currentUserIdentityType,
@@ -6765,6 +6767,7 @@ if ($validator->fails()) {
                 'last_seen_at' => $now,
                 'first_ip_address' => $ipAddress,
                 'last_ip_address' => $ipAddress,
+                'user_agent' => $userAgent,
                 'first_user_agent_hash' => $userAgent ? hash('sha256', $userAgent) : null,
                 'last_user_agent_hash' => $userAgent ? hash('sha256', $userAgent) : null,
                 'last_current_user_email' => $currentUserEmail,
