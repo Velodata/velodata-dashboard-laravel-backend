@@ -146,19 +146,40 @@ class SseController extends Controller
         return in_array($roleName, ['admin', 'protector', 'trainer'], true) || in_array($roleId, [1, 5], true);
     }
 
-    private function getLatestProtectedSecurityAudit()
+    private function canReceiveStudentPasswordAttemptSecurityEvents(string $email): bool
+    {
+        $user = DB::table('users')->where('email', $email)->first();
+
+        if (! $user) {
+            return false;
+        }
+
+        $roleName = strtolower((string) ($user->role_name ?? ''));
+
+        return $roleName === 'admin';
+    }
+
+    private function getLatestSecurityAudit(bool $includeProtectedEvents, bool $includeStudentPasswordAttemptEvents)
     {
         return DB::table('user_audit_history')
             ->leftJoin('users', 'users.id', '=', DB::raw('user_audit_history.custno - 100000'))
+            ->leftJoin('game_users', 'game_users.id', '=', DB::raw('user_audit_history.custno - 900000'))
             ->select(
                 'user_audit_history.*',
-                'users.name as target_name',
-                'users.email as target_email'
+                DB::raw('COALESCE(users.name, game_users.display_name) as target_name'),
+                DB::raw('COALESCE(users.email, game_users.email) as target_email')
             )
-            ->where(function ($query) {
-                $query
-                    ->where('user_audit_history.comments', 'like', 'Protected account edit blocked:%')
-                    ->orWhere('user_audit_history.comments', 'like', 'Protected account warning;%');
+            ->where(function ($query) use ($includeProtectedEvents, $includeStudentPasswordAttemptEvents) {
+                if ($includeProtectedEvents) {
+                    $query
+                        ->where('user_audit_history.comments', 'like', 'Protected account edit blocked:%')
+                        ->orWhere('user_audit_history.comments', 'like', 'Protected account warning;%');
+                }
+
+                if ($includeStudentPasswordAttemptEvents) {
+                    $method = $includeProtectedEvents ? 'orWhere' : 'where';
+                    $query->{$method}('user_audit_history.comments', 'like', 'Student password attempt warning;%');
+                }
             })
             ->orderBy('user_audit_history.id', 'DESC')
             ->first();
@@ -191,9 +212,13 @@ class SseController extends Controller
         return response()->stream(function () use ($email, $identityType, $gameUserId) {
             set_time_limit(0);
             $lastUpdated = null;
-            $canReceiveSecurityEvents = $identityType !== 'student'
+            $canReceiveProtectedSecurityEvents = $identityType !== 'student'
                 && $this->canReceiveProtectedSecurityEvents($email);
-            $lastSecurityAuditId = $canReceiveSecurityEvents ? optional($this->getLatestProtectedSecurityAudit())->id : null;
+            $canReceiveStudentPasswordAttemptSecurityEvents = $identityType !== 'student'
+                && $this->canReceiveStudentPasswordAttemptSecurityEvents($email);
+            $lastSecurityAuditId = ($canReceiveProtectedSecurityEvents || $canReceiveStudentPasswordAttemptSecurityEvents)
+                ? optional($this->getLatestSecurityAudit($canReceiveProtectedSecurityEvents, $canReceiveStudentPasswordAttemptSecurityEvents))->id
+                : null;
 
             while (true) {
                 if (connection_aborted()) {
@@ -273,8 +298,8 @@ class SseController extends Controller
                     }
                 }
 
-                if ($canReceiveSecurityEvents) {
-                    $latestSecurityAudit = $this->getLatestProtectedSecurityAudit();
+                if ($canReceiveProtectedSecurityEvents || $canReceiveStudentPasswordAttemptSecurityEvents) {
+                    $latestSecurityAudit = $this->getLatestSecurityAudit($canReceiveProtectedSecurityEvents, $canReceiveStudentPasswordAttemptSecurityEvents);
 
                     if ($latestSecurityAudit && $latestSecurityAudit->id !== $lastSecurityAuditId) {
                         echo "event: security.protected_edit_blocked\n";
@@ -285,6 +310,9 @@ class SseController extends Controller
                             'target_name' => $latestSecurityAudit->target_name,
                             'actor_email' => $latestSecurityAudit->created_by_email,
                             'actor_name' => $latestSecurityAudit->clerk_id,
+                            'title' => str_starts_with((string) $latestSecurityAudit->comments, 'Student password attempt warning;')
+                                ? 'Student password attempt warning'
+                                : 'Protected account warning',
                             'message' => $latestSecurityAudit->comments,
                             'created_at' => $latestSecurityAudit->created_at,
                             'created_by_ip_address' => $latestSecurityAudit->created_by_ip_address,

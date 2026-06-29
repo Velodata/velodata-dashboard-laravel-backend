@@ -719,6 +719,104 @@ class VelodataRegressionTest extends TestCase
         ]);
     }
 
+    public function test_staff_admins_are_notified_when_student_third_party_password_attempt_is_blocked_by_gmui_0502_and_0503(): void
+    {
+        $intakeId = $this->createIntake('TEST-GMUI-0503');
+        $staffAdmin = $this->createStaffUser('gmui-0503-admin@example.test', 'Admin');
+        $staffProtector = $this->createStaffUser('gmui-0503-protector@example.test', 'Protector');
+        $staffTrainer = $this->createStaffUser('gmui-0503-trainer@example.test', 'Trainer');
+        $studentActor = $this->createGameUser('gmui-0503-actor@example.test', 'Protector', 'active', $intakeId);
+        $studentTarget = $this->createGameUser('gmui-0503-target@example.test', 'Member', 'active', $intakeId);
+        $originalPasswordHash = $studentTarget->password;
+
+        $this->setIntakeGameSetting($intakeId, 'game_staff_admin_only_other_password_changes', '1', 'game-controls');
+        $this->setIntakeGameSetting($intakeId, 'game_notify_staff_admins_student_third_party_password_attempts', '1', 'game-controls');
+
+        $this->postJson('/api/v2/VMD-update-game-user-password', [
+            'id' => $studentTarget->id,
+            'password' => 'blocked-password-change',
+            'password_confirmation' => 'blocked-password-change',
+            'vmd_user_email' => $studentActor->email,
+            'vmd_user_name' => $studentActor->display_name,
+            'vmd_audit_reason' => 'Regression blocked student password attempt',
+        ])->assertForbidden();
+
+        $this->assertSame(
+            $originalPasswordHash,
+            DB::table('game_users')->where('id', $studentTarget->id)->value('password')
+        );
+
+        $this->assertDatabaseHas('user_audit_history', [
+            'custno' => 900000 + intval($studentTarget->id),
+            'created_by_email' => $studentActor->email,
+        ]);
+
+        $this->assertDatabaseHas('user_notifications', [
+            'recipient_email' => $staffAdmin->email,
+            'actor_email' => $studentActor->email,
+            'title' => 'Student password attempt warning',
+            'source' => 'security',
+        ]);
+
+        $this->assertDatabaseMissing('user_notifications', [
+            'recipient_email' => $staffProtector->email,
+            'title' => 'Student password attempt warning',
+        ]);
+
+        $this->assertDatabaseMissing('user_notifications', [
+            'recipient_email' => $staffTrainer->email,
+            'title' => 'Student password attempt warning',
+        ]);
+    }
+
+    public function test_student_third_party_password_attempt_blocked_by_gmui_0502_does_not_notify_when_0503_is_off(): void
+    {
+        $intakeId = $this->createIntake('TEST-GMUI-0503-OFF');
+        $staffAdmin = $this->createStaffUser('gmui-0503-off-admin@example.test', 'Admin');
+        $studentActor = $this->createGameUser('gmui-0503-off-actor@example.test', 'Protector', 'active', $intakeId);
+        $studentTarget = $this->createGameUser('gmui-0503-off-target@example.test', 'Member', 'active', $intakeId);
+
+        $this->setIntakeGameSetting($intakeId, 'game_staff_admin_only_other_password_changes', '1', 'game-controls');
+        $this->setIntakeGameSetting($intakeId, 'game_notify_staff_admins_student_third_party_password_attempts', '0', 'game-controls');
+
+        $this->postJson('/api/v2/VMD-update-game-user-password', [
+            'id' => $studentTarget->id,
+            'password' => 'blocked-password-change',
+            'password_confirmation' => 'blocked-password-change',
+            'vmd_user_email' => $studentActor->email,
+            'vmd_user_name' => $studentActor->display_name,
+        ])->assertForbidden();
+
+        $this->assertDatabaseMissing('user_notifications', [
+            'recipient_email' => $staffAdmin->email,
+            'title' => 'Student password attempt warning',
+        ]);
+    }
+
+    public function test_staff_blocked_by_gmui_0502_does_not_trigger_student_password_attempt_warning(): void
+    {
+        $intakeId = $this->createIntake('TEST-GMUI-0503-STAFF');
+        $staffAdmin = $this->createStaffUser('gmui-0503-staff-admin@example.test', 'Admin');
+        $staffProtector = $this->createStaffUser('gmui-0503-staff-protector@example.test', 'Protector');
+        $studentTarget = $this->createGameUser('gmui-0503-staff-target@example.test', 'Member', 'active', $intakeId);
+
+        $this->setIntakeGameSetting($intakeId, 'game_staff_admin_only_other_password_changes', '1', 'game-controls');
+        $this->setIntakeGameSetting($intakeId, 'game_notify_staff_admins_student_third_party_password_attempts', '1', 'game-controls');
+
+        $this->postJson('/api/v2/VMD-update-game-user-password', [
+            'id' => $studentTarget->id,
+            'password' => 'blocked-password-change',
+            'password_confirmation' => 'blocked-password-change',
+            'vmd_user_email' => $staffProtector->email,
+            'vmd_user_name' => $staffProtector->name,
+        ])->assertForbidden();
+
+        $this->assertDatabaseMissing('user_notifications', [
+            'recipient_email' => $staffAdmin->email,
+            'title' => 'Student password attempt warning',
+        ]);
+    }
+
     public function test_staff_and_student_users_receive_notifications_when_their_basic_info_is_changed(): void
     {
         $staffAdmin = $this->createStaffUser('basic-info-admin@example.test', 'Admin');

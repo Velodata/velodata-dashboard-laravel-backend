@@ -7,6 +7,13 @@ This VS Code setup commonly contains two separate codebases:
 
 Treat them as separate filesystem roots. Do not describe the frontend repo as "the workspace" when discussing backend files.
 
+## Permission And Flow Rules
+
+- Never request elevated permissions unless the user explicitly asks for elevated execution in the current task.
+- Elevated-permission prompts stop the entire processing flow until the user returns to the Codex window and answers. If the user is working in another window, answering email, or away from the keyboard, the task stalls completely. Treat that interruption as a workflow failure, not a normal confirmation step.
+- If a command fails because of sandboxing, report the blocked command and continue only with non-escalating, in-sandbox alternatives.
+- Do not run optional verification commands unless the user explicitly asks for them in the current task.
+
 ## Generated Files And Packages
 
 Never create deployment packages, zip files, temporary staging folders, logs, generated archives, or disposable scratch files inside any project repository unless the user explicitly requests that exact location.

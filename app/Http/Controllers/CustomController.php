@@ -421,6 +421,15 @@ class CustomController extends Controller
         );
     }
 
+    private function notifyStaffAdminsAboutStudentThirdPartyPasswordAttempts(?int $intakeId): bool
+    {
+        return $this->intakeGameSettingBoolean(
+            $intakeId,
+            'game_notify_staff_admins_student_third_party_password_attempts',
+            false
+        );
+    }
+
     private function isProtectorEmail(?string $email): bool
     {
         if (! $email) {
@@ -2160,6 +2169,68 @@ class CustomController extends Controller
                     'targetName' => $event['target_name'] ?? null,
                     'auditReason' => $event['message'] ?? null,
                     'ipAddress' => $event['ip_address'] ?? null,
+                ],
+            ]);
+        }
+    }
+
+    private function staffAdminNotificationRecipients()
+    {
+        return DB::table('users')
+            ->where(DB::raw('LOWER(role_name)'), 'admin')
+            ->where(function ($query) {
+                $query->whereNull('status')
+                    ->orWhereNotIn('status', ['BANNED', 'DELETED']);
+            })
+            ->get();
+    }
+
+    private function createStudentThirdPartyPasswordAttemptWarning(Request $request, object $actorGameUser, object $targetGameUser, array $data): void
+    {
+        $actorName = $data['vmd_user_name']
+            ?: ($actorGameUser->display_name ?: $actorGameUser->email);
+        $targetName = $targetGameUser->display_name
+            ?: trim(($targetGameUser->preferred_name ?: $targetGameUser->first_name) . ' ' . $targetGameUser->surname)
+            ?: $targetGameUser->email;
+        $intakeCode = $targetGameUser->intake_code ?? null;
+        $message = "Student password attempt warning; {$actorGameUser->email} attempted to change the password for {$targetName} ({$targetGameUser->email}) while GMUI 05.02 and 05.03 were enabled.";
+
+        $auditHistoryId = DB::table('user_audit_history')->insertGetId([
+            'custno' => 900000 + intval($targetGameUser->id),
+            'dteprfmd' => now(),
+            'comments' => $message,
+            'clerk_id' => $actorName,
+            'created_by_email' => $actorGameUser->email,
+            'created_by_ip_address' => $this->getRequestIpAddress($request),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        foreach ($this->staffAdminNotificationRecipients() as $recipient) {
+            $this->createPersistedNotification([
+                'recipient_email' => $recipient->email,
+                'actor_email' => $actorGameUser->email,
+                'type' => 'warning',
+                'title' => 'Student password attempt warning',
+                'message' => $message,
+                'source' => 'security',
+                'related_audit_history_id' => $auditHistoryId,
+                'dedupe_key' => "security-student-password-attempt-warning-{$auditHistoryId}",
+                'metadata' => [
+                    'actorEmail' => $actorGameUser->email,
+                    'updatedBy' => $actorGameUser->email,
+                    'actorName' => $actorName,
+                    'actorRole' => $actorGameUser->game_role ?? null,
+                    'actorIdentityType' => 'student',
+                    'targetEmail' => $targetGameUser->email,
+                    'targetName' => $targetName,
+                    'targetRole' => $targetGameUser->game_role ?? null,
+                    'targetIdentityType' => 'student',
+                    'intakeCode' => $intakeCode,
+                    'gmuiOption' => '05.03',
+                    'gmuiSettingKey' => 'game_notify_staff_admins_student_third_party_password_attempts',
+                    'auditReason' => $message,
+                    'ipAddress' => $this->getRequestIpAddress($request),
                 ],
             ]);
         }
@@ -4592,6 +4663,14 @@ if ($validator->fails()) {
             $this->otherPasswordChangesRequireStaffAdmin($gameUser->intake_id ? intval($gameUser->intake_id) : null) &&
             ! $this->isStaffAdminEmail($data['vmd_user_email'])
         ) {
+            $actorGameUser = GameUser::whereRaw('LOWER(email) = ?', [strtolower($data['vmd_user_email'])])->first();
+            if (
+                $actorGameUser &&
+                $this->notifyStaffAdminsAboutStudentThirdPartyPasswordAttempts($gameUser->intake_id ? intval($gameUser->intake_id) : null)
+            ) {
+                $this->createStudentThirdPartyPasswordAttemptWarning($request, $actorGameUser, $gameUser, $data);
+            }
+
             return response()->json([
                 'outcome' => 'FAIL',
                 'message' => 'Permission Denied: Only Staff Admins can change passwords on accounts which are not theirs.',
@@ -5425,6 +5504,7 @@ if ($validator->fails()) {
             'security_block_banned_login' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Banned players cannot log in', 'sort' => 20],
             'security_geo_lock_user_edits' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'User edits must originate from Australia', 'sort' => 40],
             'game_staff_admin_only_other_password_changes' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Only Staff Admins can change passwords on accounts which are not theirs.', 'sort' => 50],
+            'game_notify_staff_admins_student_third_party_password_attempts' => ['type' => 'boolean', 'group' => 'game-controls', 'label' => 'Notify Staff Admins when a Student tries to change 3rd Party passwords', 'sort' => 55],
             'game_block_student_add_users' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Students can no longer Add Users', 'sort' => 90],
             'game_restrict_student_role_selection' => ['type' => 'boolean', 'group' => 'game-vulnerabilities', 'label' => 'Students can no longer choose any role for new users.', 'sort' => 100],
             'game_delete_cooldown_enabled' => ['type' => 'boolean', 'group' => 'elimination-recovery', 'label' => 'Students receive a lockdown when they Delete or Ban someone.', 'sort' => 120],
@@ -5449,6 +5529,7 @@ if ($validator->fails()) {
             'security_block_banned_login' => true,
             'security_geo_lock_user_edits' => false,
             'game_staff_admin_only_other_password_changes' => false,
+            'game_notify_staff_admins_student_third_party_password_attempts' => false,
             'game_block_student_add_users' => false,
             'game_restrict_student_role_selection' => false,
             'game_delete_cooldown_enabled' => false,
@@ -5497,6 +5578,7 @@ if ($validator->fails()) {
                 'security_block_banned_login' => true,
                 'security_geo_lock_user_edits' => true,
                 'game_staff_admin_only_other_password_changes' => true,
+                'game_notify_staff_admins_student_third_party_password_attempts' => true,
                 'game_block_student_add_users' => true,
                 'game_delete_cooldown_enabled' => true,
                 'game_allow_undelete' => true,
@@ -5513,6 +5595,7 @@ if ($validator->fails()) {
                 'security_block_banned_login' => true,
                 'security_geo_lock_user_edits' => true,
                 'game_staff_admin_only_other_password_changes' => true,
+                'game_notify_staff_admins_student_third_party_password_attempts' => true,
                 'game_block_student_add_users' => true,
                 'game_restrict_student_role_selection' => true,
                 'game_delete_cooldown_enabled' => true,
