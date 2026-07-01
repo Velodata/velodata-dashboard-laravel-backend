@@ -368,6 +368,39 @@ class CustomController extends Controller
         return in_array($roleName, $allowedRoles, true);
     }
 
+    private function staffEmailHasPermission(?string $email, string $permissionName): bool
+    {
+        if (!$email) {
+            return false;
+        }
+
+        $user = User::where('email', $email)->first();
+
+        if (!$user) {
+            return false;
+        }
+
+        $role = null;
+
+        if ($user->role_id) {
+            $role = Role::where('id', $user->role_id)->first();
+        }
+
+        if (! $role && $user->role_name) {
+            $role = Role::whereRaw('LOWER(name) = ?', [strtolower($user->role_name)])->first();
+        }
+
+        if (! $role) {
+            return false;
+        }
+
+        return DB::table('role_has_permissions')
+            ->join('permissions', 'role_has_permissions.permission_id', '=', 'permissions.id')
+            ->where('role_has_permissions.role_id', $role->id)
+            ->where('permissions.name', $permissionName)
+            ->exists();
+    }
+
     private function canAccessGlobalManagement(?string $email): bool
     {
         return $this->isStaffRoleEmail($email, ['Admin', 'Trainer']);
@@ -2193,7 +2226,7 @@ class CustomController extends Controller
             ?: trim(($targetGameUser->preferred_name ?: $targetGameUser->first_name) . ' ' . $targetGameUser->surname)
             ?: $targetGameUser->email;
         $intakeCode = $targetGameUser->intake_code ?? null;
-        $message = "Student password attempt warning; {$actorGameUser->email} attempted to change the password for {$targetName} ({$targetGameUser->email}) while GMUI 05.02 and 05.03 were enabled.";
+        $message = "{$actorGameUser->email} attempted to change the password for {$targetGameUser->email}";
 
         $auditHistoryId = DB::table('user_audit_history')->insertGetId([
             'custno' => 900000 + intval($targetGameUser->id),
@@ -6455,6 +6488,8 @@ if ($validator->fails()) {
             'game_intake_code' => 'nullable|string|max:80',
             'ip_address' => 'nullable|string|max:45',
             'search' => 'nullable|string|max:255',
+            'online_only' => 'nullable|boolean',
+            'online_window_minutes' => 'nullable|integer|min:1|max:60',
             'page' => 'nullable|integer|min:1',
             'per_page' => 'nullable|integer|min:1|max:250',
         ]);
@@ -6468,7 +6503,10 @@ if ($validator->fails()) {
 
         $validated = $validator->validated();
         $viewerEmail = strtolower(trim((string) $validated['vmd_user_email']));
-        if (! $this->isStaffRoleEmail($viewerEmail, ['Admin', 'Protector'])) {
+        if (
+            ! $this->isStaffRoleEmail($viewerEmail, ['Admin', 'Protector']) ||
+            ! $this->staffEmailHasPermission($viewerEmail, 'view browser-trace-reports')
+        ) {
             return response()->json([
                 'message' => 'Permission Denied: browser trace reporting requires Staff Admin or Staff Protector access.',
             ], 403);
@@ -6488,6 +6526,8 @@ if ($validator->fails()) {
         $gameIntakeCode = trim((string) ($validated['game_intake_code'] ?? ''));
         $ipAddress = trim((string) ($validated['ip_address'] ?? ''));
         $searchTerm = trim((string) ($validated['search'] ?? ''));
+        $onlineOnly = (bool) ($validated['online_only'] ?? false);
+        $onlineWindowMinutes = max(1, min(60, (int) ($validated['online_window_minutes'] ?? 10)));
 
         $baseQuery = DB::table('browser_identities');
         $recordsTotal = (clone $baseQuery)->count('browser_identities.id');
@@ -6580,6 +6620,10 @@ if ($validator->fails()) {
             });
         }
 
+        if ($onlineOnly) {
+            $baseQuery->where('browser_identities.last_seen_at', '>=', Carbon::now()->subMinutes($onlineWindowMinutes));
+        }
+
         $recordsFiltered = (clone $baseQuery)->count('browser_identities.id');
         $lastPage = max(1, (int) ceil($recordsFiltered / $perPage));
         $page = min($page, $lastPage);
@@ -6612,6 +6656,10 @@ if ($validator->fails()) {
         $loginRowsQuery = empty($browserIdentityIds)
             ? null
             : DB::table('browser_identity_login_accounts')->whereIn('browser_identity_id', $browserIdentityIds);
+
+        if ($loginRowsQuery && in_array($reporterIdentityType, ['staff', 'student'], true)) {
+            $loginRowsQuery->where('identity_type', $reporterIdentityType);
+        }
 
         $loginRowsByIdentity = $loginRowsQuery
             ? $loginRowsQuery->orderBy('email')->get()->groupBy('browser_identity_id')
@@ -6659,7 +6707,7 @@ if ($validator->fails()) {
             ->values()
             ->all();
 
-        $data = $rows->map(function ($row) use ($ipRowsByIdentity, $notificationRowsByIdentity, $loginRowsByIdentity, $staffIdentities, $gameIdentities, $protectedStaffEmails) {
+        $data = $rows->map(function ($row) use ($ipRowsByIdentity, $notificationRowsByIdentity, $loginRowsByIdentity, $staffIdentities, $gameIdentities, $protectedStaffEmails, $onlineWindowMinutes) {
             $notificationIdentities = collect($notificationRowsByIdentity->get($row->id, collect()))
                 ->map(function ($identity) use ($staffIdentities, $gameIdentities, $protectedStaffEmails) {
                     $email = strtolower(trim((string) ($identity->email ?? '')));
@@ -6696,6 +6744,11 @@ if ($validator->fails()) {
                         'role_name' => $staff->role_name ?? $gameUser->game_role ?? $login->role_name ?? null,
                         'status' => $staff->status ?? $gameUser->game_status ?? null,
                         'intake_code' => $gameUser->intake_code ?? $login->intake_code ?? null,
+                        'first_seen_at' => $login->first_seen_at ?? null,
+                        'last_seen_at' => $login->last_seen_at ?? null,
+                        'first_ip_address_v4' => $login->first_ip_address_v4 ?? null,
+                        'last_ip_address_v4' => $login->last_ip_address_v4 ?? null,
+                        'report_count' => (int) ($login->report_count ?? 0),
                     ];
                 })
                 ->filter(fn ($reporter) => $reporter['email'] !== '')
@@ -6713,6 +6766,9 @@ if ($validator->fails()) {
             $staffTraceCount = $notificationIdentities->filter(fn ($identity) => $identity['is_staff_identity'] || $identity['is_protected_identity'])->count();
             $protectedTraceCount = $notificationIdentities->filter(fn ($identity) => $identity['is_protected_identity'])->count();
             $knownIntakeCodes = $row->last_selected_game_intake_code ? [['code' => $row->last_selected_game_intake_code]] : [];
+            $lastSeenAt = $row->last_seen_at ? Carbon::parse($row->last_seen_at) : null;
+            $minutesSinceSeen = $lastSeenAt ? $lastSeenAt->diffInMinutes(Carbon::now()) : null;
+            $isOnAir = $lastSeenAt ? $lastSeenAt->greaterThanOrEqualTo(Carbon::now()->subMinutes($onlineWindowMinutes)) : false;
 
             return [
                 'type' => 'browser_identity',
@@ -6722,11 +6778,17 @@ if ($validator->fails()) {
                     'first_seen_at' => $row->first_seen_at,
                     'last_seen_at' => $row->last_seen_at,
                     'created_at' => $row->created_at,
+                    'is_on_air' => $isOnAir,
+                    'minutes_since_seen' => $minutesSinceSeen,
+                    'online_window_minutes' => $onlineWindowMinutes,
                     'report_count' => (int) ($row->report_count ?? 0),
                     'current_reporter_email' => $row->last_current_user_email,
                     'current_reporter_identity_type' => $row->last_current_user_identity_type,
                     'selected_game_intake_code' => $row->last_selected_game_intake_code,
                     'user_agent' => property_exists($row, 'user_agent') ? $row->user_agent : null,
+                    'client_hints' => property_exists($row, 'client_hints') && $row->client_hints
+                        ? json_decode($row->client_hints, true)
+                        : null,
                     'ip_address' => $row->last_ip_address,
                     'known_ip_addresses' => $knownIpAddresses->all(),
                     'known_reporter_accounts' => $reporterAccounts->all(),
@@ -6779,6 +6841,7 @@ if ($validator->fails()) {
             'client_sent_at' => 'nullable|string|max:80',
             'vmd_ip_address_v4' => 'nullable|string|max:45',
             'vmd_ip_address_v6' => 'nullable|string|max:45',
+            'browser_client_hints' => 'nullable|array',
         ]);
 
         if ($validator->fails()) {
@@ -6827,10 +6890,12 @@ if ($validator->fails()) {
         $ipAddress = $ipAddressV4 ?: $ipAddressV6 ?: $clientIp['ip_address'];
         $now = Carbon::now();
         $userAgent = $request->header('User-Agent');
+        $clientHints = $validated['browser_client_hints'] ?? null;
+        $clientHintsJson = $clientHints ? json_encode($clientHints) : null;
         $existingIdentity = DB::table('browser_identities')->where('browser_uuid', $browserUuid)->first();
 
         if ($existingIdentity) {
-            DB::table('browser_identities')->where('id', $existingIdentity->id)->update([
+            $identityPayload = [
                 'last_seen_at' => $now,
                 'last_ip_address' => $ipAddress,
                 'user_agent' => $userAgent,
@@ -6841,10 +6906,14 @@ if ($validator->fails()) {
                 'last_notification_identity_count' => $notificationIdentityCount,
                 'report_count' => DB::raw('COALESCE(report_count, 0) + 1'),
                 'updated_at' => $now,
-            ]);
+            ];
+            if (Schema::hasColumn('browser_identities', 'client_hints')) {
+                $identityPayload['client_hints'] = $clientHintsJson;
+            }
+            DB::table('browser_identities')->where('id', $existingIdentity->id)->update($identityPayload);
             $browserIdentityId = (int) $existingIdentity->id;
         } else {
-            $browserIdentityId = (int) DB::table('browser_identities')->insertGetId([
+            $identityPayload = [
                 'browser_uuid' => $browserUuid,
                 'first_seen_at' => $now,
                 'last_seen_at' => $now,
@@ -6860,7 +6929,11 @@ if ($validator->fails()) {
                 'report_count' => 1,
                 'created_at' => $now,
                 'updated_at' => $now,
-            ]);
+            ];
+            if (Schema::hasColumn('browser_identities', 'client_hints')) {
+                $identityPayload['client_hints'] = $clientHintsJson;
+            }
+            $browserIdentityId = (int) DB::table('browser_identities')->insertGetId($identityPayload);
         }
 
         if ($currentUserEmail) {
@@ -6882,11 +6955,42 @@ if ($validator->fails()) {
                 'role_name' => $staffLogin->role_name ?? $gameLogin->game_role ?? null,
                 'intake_code' => $gameLogin->intake_code ?? ($validated['selected_game_intake_code'] ?? null),
             ];
+            if (Schema::hasColumn('browser_identity_login_accounts', 'last_seen_at')) {
+                $loginPayload['last_seen_at'] = $now;
+            }
+            if (Schema::hasColumn('browser_identity_login_accounts', 'first_seen_at')) {
+                $loginPayload['first_seen_at'] = DB::raw('COALESCE(first_seen_at, ' . DB::getPdo()->quote($now->toDateTimeString()) . ')');
+            }
+            if (Schema::hasColumn('browser_identity_login_accounts', 'last_ip_address_v4')) {
+                $loginPayload['last_ip_address_v4'] = $ipAddressV4;
+            }
+            if (Schema::hasColumn('browser_identity_login_accounts', 'first_ip_address_v4')) {
+                $quotedIpAddressV4 = $ipAddressV4 === null ? 'NULL' : DB::getPdo()->quote($ipAddressV4);
+                $loginPayload['first_ip_address_v4'] = DB::raw('COALESCE(first_ip_address_v4, ' . $quotedIpAddressV4 . ')');
+            }
+            if (Schema::hasColumn('browser_identity_login_accounts', 'report_count')) {
+                $loginPayload['report_count'] = DB::raw('COALESCE(report_count, 0) + 1');
+            }
             if ($existingLogin) {
                 DB::table('browser_identity_login_accounts')->where('id', $existingLogin->id)->update($loginPayload);
             } else {
                 $loginPayload['browser_identity_id'] = $browserIdentityId;
                 $loginPayload['email'] = $currentUserEmail;
+                if (Schema::hasColumn('browser_identity_login_accounts', 'first_seen_at')) {
+                    $loginPayload['first_seen_at'] = $now;
+                }
+                if (Schema::hasColumn('browser_identity_login_accounts', 'last_seen_at')) {
+                    $loginPayload['last_seen_at'] = $now;
+                }
+                if (Schema::hasColumn('browser_identity_login_accounts', 'first_ip_address_v4')) {
+                    $loginPayload['first_ip_address_v4'] = $ipAddressV4;
+                }
+                if (Schema::hasColumn('browser_identity_login_accounts', 'last_ip_address_v4')) {
+                    $loginPayload['last_ip_address_v4'] = $ipAddressV4;
+                }
+                if (Schema::hasColumn('browser_identity_login_accounts', 'report_count')) {
+                    $loginPayload['report_count'] = 1;
+                }
                 DB::table('browser_identity_login_accounts')->insert($loginPayload);
             }
         }

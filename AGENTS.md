@@ -13,6 +13,8 @@ Treat them as separate filesystem roots. Do not describe the frontend repo as "t
 - Elevated-permission prompts stop the entire processing flow until the user returns to the Codex window and answers. If the user is working in another window, answering email, or away from the keyboard, the task stalls completely. Treat that interruption as a workflow failure, not a normal confirmation step.
 - If a command fails because of sandboxing, report the blocked command and continue only with non-escalating, in-sandbox alternatives.
 - Do not run optional verification commands unless the user explicitly asks for them in the current task.
+- Never run Jest, including `npm test`, `npx jest`, `react-scripts test`, or targeted Jest test commands, unless the user explicitly gives permission for Jest in the current task. Adding or editing frontend tests does not imply permission to run Jest.
+- Never do any of the following again: run Jest without permission; attempt `npm run build` without permission; request elevated permissions, which the user has explicitly ruled out; make deployment-package judgment calls beyond the exact documented/live command shape instead of sticking strictly to the user's established process.
 
 ## Generated Files And Packages
 
